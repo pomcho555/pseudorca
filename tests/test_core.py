@@ -175,3 +175,22 @@ def test_safe_path_and_decode_text():
     assert safe_path("") == "_"
     assert decode_text(b"hello\n") == "hello\n"
     assert decode_text(b"\x00\xff\xfe") is None
+
+
+def test_register_notebook_merges_metadata(store: Store, tmp_path: Path):
+    from pseudorca.notebooks import register_file
+
+    store.append("idea.add", {"id": "i1", "title": "t"})
+    f = store.root.parent / "nbs" / "main.ipynb"
+    f.parent.mkdir()
+    f.write_bytes(b'{"cells": []}')
+    nb, created = register_file(store, f, tags=["a"])
+    assert created and nb.path == "nbs/main.ipynb" and nb.stored and store.has_blob(nb.id)
+    nb2, created2 = register_file(store, f, tags=["a", "b"], applies=["i1"])
+    assert not created2 and nb2.tags == ["a", "b"] and nb2.applies == ["i1"]
+    outside = tmp_path / "elsewhere.ipynb"
+    outside.write_bytes(b"other")
+    nb3, _ = register_file(store, outside, keep_bytes=False, parent=nb.id)
+    assert nb3.path == "elsewhere.ipynb" and not nb3.stored and nb3.parent == nb.id
+    with pytest.raises(LookupError):
+        register_file(store, outside, applies=["missing"])
