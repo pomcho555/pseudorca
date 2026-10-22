@@ -51,7 +51,7 @@ def test_events_are_one_file_each_and_replay(store: Store):
 
 def test_unreadable_and_unknown_events_become_warnings(store: Store):
     store.append("idea.add", {"id": "x"})
-    month = next((store.root / "events").iterdir())
+    month = next(d for d in (store.root / "events").iterdir() if d.is_dir())  # not .gitkeep
     (month / "broken.json").write_text("{not json")
     (month / "zzzz-future.json").write_text(
         json.dumps({"schema": 2, "id": "ZZZZ", "type": "idea.rename", "time": "t", "actor": "a", "data": {}})
@@ -257,7 +257,7 @@ def test_new_events_sort_after_everything_seen_even_with_a_slow_clock(store: Sto
     store.append("idea.add", {"id": "fast", "title": "t", "status": "testing"})
     future_ms = util.ulid_ms(store.events()[-1].id) + 10 * 60_000
     future_id = util.new_ulid(future_ms)
-    month = next((store.root / "events").iterdir())
+    month = next(d for d in (store.root / "events").iterdir() if d.is_dir())  # not .gitkeep
     (month / f"{future_id}-other.json").write_text(
         json.dumps(
             {
@@ -431,7 +431,7 @@ def test_a_future_store_does_not_leak_future_ids_into_other_stores(tmp_path: Pat
     ahead = Store.init(tmp_path / "ahead")
     ahead.append("idea.add", {"id": "x", "title": "t"})
     future_id = util.new_ulid(util.ulid_ms(ahead.events()[-1].id) + 30 * 60_000)
-    month = next((ahead.root / "events").iterdir())
+    month = next(d for d in (ahead.root / "events").iterdir() if d.is_dir())  # not .gitkeep
     (month / f"{future_id}-o.json").write_text(
         json.dumps(
             {

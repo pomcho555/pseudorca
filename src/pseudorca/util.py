@@ -91,7 +91,12 @@ def local_time(iso: str) -> str:
     if dt.tzinfo is not None:
         with contextlib.suppress(OverflowError, OSError, ValueError):  # a malformed time near year 1 or 9999
             dt = dt.astimezone()
-    return dt.strftime("%Y-%m-%d %H:%M")
+    return minute_text(dt)
+
+
+def minute_text(dt: datetime) -> str:
+    """A time as "2026-01-05 10:30". Not strftime: glibc's %Y does not pad years below 1000 to four digits."""
+    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}"
 
 
 def local_day(iso: str) -> str:

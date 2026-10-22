@@ -29,7 +29,7 @@ def _errors() -> Iterator[None]:
 
 def _local_time(iso: str) -> str:
     try:
-        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
+        return util.minute_text(datetime.fromisoformat(iso).astimezone())
     except ValueError:
         return iso
 
