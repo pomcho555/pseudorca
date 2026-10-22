@@ -107,82 +107,121 @@ stores contents under their sha256.
 |---|---|
 | `cells/cell_004.py` | code cell 4, with IPython magics turned into plain Python |
 | `cells/cell_004.sh` | a `%%bash` or `%%sh` cell |
+| `cells/cell_004.<magic>.txt` | any other cell magic |
 | `markdown/cell_000.md` | a markdown cell: context only, never evidence |
 | `files/<path>` | a file the notebook writes with a literal path and content |
 | `payloads/cell_004/<n>.<ext>` | a decoded embedded payload |
 | `payloads/cell_004/<n>/<member>` | a member of an embedded archive |
-| `script.py` | a script kernel |
+| `script.py`, `payloads/script/...` | a script kernel and its payloads |
 
 Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma > tar member src/a.py`.
 
-**Rules**
-- **`.ipynb`:** nbformat 4 (3 best effort). Code cells go to `cells/`, markdown cells to `markdown/`.
-  Outputs are ignored.
-- **Magics:**
-  - `%%writefile [-a] PATH` becomes `files/PATH`. `-a` appends.
-  - `%%bash`, `%%sh` and `%%script bash` become `.sh` files.
-  - Other cell magics become `.txt` files.
-  - The bodies of shell and other cell magics are scanned for payloads by pattern, not parsed.
-  - Line magics and `!cmd` are commented out, so the cell still parses. Inside an indented block the line
-    becomes `pass  # <line>`, so the block is not left empty. Line numbers are kept.
-  - Literal environment settings are collected in `tree.meta["env"]` as `[{cell, key, value}]`. These
-    come from `%env K=V`, `%set_env K V` and `os.environ["K"] = "V"`.
-- **File writes:** a literal path written with literal text becomes `files/<path>`. This covers
-  `Path(p).write_text(s)`, `open(p, "w").write(s)` and `with open(p, "w") as f: f.write(s)`.
-- **Payloads:** every `str` or `bytes` constant of at least `min_payload_chars` is tried.
+**Format**
+- Only a name ending in `.ipynb` (notebook) or `.py` (script) picks the format, and the registered path is
+  tried before the name.
+- Any other suffix is a label: `v1.5`, `qwen2.5-7b`, `solver v2.1`. In that case the bytes decide: a JSON
+  object with `cells` or `worksheets` is a notebook, anything else is a script.
+- nbformat 4 is read fully, and nbformat 3 on a best-effort basis. Code cells go to `cells/`, markdown
+  cells to `markdown/`, and outputs are ignored.
+
+**Magics**
+- A cell magic receives its body the way IPython passes it, ending with a newline even when the cell's
+  last line has none.
+- `%%writefile [-a] PATH` becomes `files/PATH`, and `-a` appends.
+- Lines in `files/` are numbered as in the written file. An append continues from that file's last line
+  break.
+- `%%bash`, `%%sh` and `%%script bash` become `.sh` files. Other cell magics become `.txt` files.
+  - In both, the lines up to and including the magic line are kept, the magic line as `# %%bash`. Line N
+    of the file is therefore line N of the cell.
+  - Their bodies are scanned for payloads by pattern, not parsed.
+- Line magics and `!cmd` are commented out so the cell still parses. Inside an indented block the line
+  becomes `pass  # <line>`, so the block is not left empty. Line numbers are kept.
+- Literal environment settings are collected in `tree.meta["env"]` as `[{cell, key, value}]`. They come
+  from `%env K=V`, `%set_env K V` and `os.environ["K"] = "V"`.
+
+**File writes**
+- A literal path written with literal text becomes `files/<path>`.
+- This covers `Path(p).write_text(s)`, `open(p, "w").write(s)` and `with open(p, "w") as f: f.write(s)`.
+
+**Payloads**
+- Every `str` or `bytes` constant of at least `min_payload_chars` is tried in three steps:
   1. Text decoding: base64 (standard or urlsafe, whitespace ignored), base85, ascii85 or hex.
   2. Decompression, chosen by magic bytes: zlib, gzip, xz or lzma-alone, or bz2.
   3. Archives: tar (any compression) or zip.
-  - Text results become files.
-  - Binary results are recorded without content.
-  - A pickle is recorded as binary and never loaded.
-  - Limits are enforced while decompressing. `Limits` caps bytes per payload (`max_payload_bytes`),
-    bytes per notebook (`max_total_bytes`), decode steps (`max_depth`) and archive members
-    (`max_members`).
-  - Decoded or written Python is searched again for payloads and writes, up to `max_nesting` times.
-    Python longer than `max_parse_chars` is searched by pattern instead of parsed.
-  - Origins name the xz container step `lzma`.
-- **Never:** `exec`, `eval`, importing notebook code, `pickle.loads`, or writing tree paths to disk.
-- **Line numbers** count only `\n`, `\r\n` and `\r` (`tree.split_lines`), as Python's tokenizer does.
-- **`tree_for(store, nb)`:** caches in `cache/trees/<nb.id>/`. The cache is valid while
-  `meta["extractor_version"] == EXTRACTOR_VERSION`.
-  - The bytes come from the blob.
-  - If the notebook was added with `--no-store`, the bytes come from `nb.path`, but only if that file
-    still has the same sha256.
+- Text results become files. Binary results are recorded without content.
+- A pickle is recorded as binary and never loaded.
+- **Limits** are enforced while decompressing. `Limits` caps:
+  - bytes per payload (`max_payload_bytes`);
+  - bytes per notebook (`max_total_bytes`);
+  - decode steps (`max_depth`);
+  - archive members (`max_members`).
+- Up to 64 concatenated compressed streams are followed per payload. A stream that decodes to nothing
+  ends the payload. Input is fed in 64 KiB windows, so time stays linear.
+- Decoded or written Python is searched again for payloads and writes, up to `max_nesting` times. Python
+  longer than `max_parse_chars` is searched by pattern instead of parsed.
+- The pattern scan for quoted strings runs in linear time. It is used for code that does not parse, for
+  shell and other cell magics, and for written files that are not `.py`. A one-quote string ends at a line
+  end that no backslash escapes, as in Python's tokenizer.
+- Origins name the xz container step `lzma`.
+
+**Never:** `exec`, `eval`, importing notebook code, `pickle.loads`, or writing tree paths to disk.
+
+**Line numbers** count only `\n`, `\r\n` and `\r` (`tree.split_lines`), as Python's tokenizer does.
+
+**`tree_for(store, nb)`** caches in `cache/trees/<nb.id>/`.
+- The cache is valid while `meta["extractor_version"] == EXTRACTOR_VERSION` (now 2).
+- The bytes come from the blob.
+- If the notebook was added with `--no-store`, the bytes come from `nb.path`, but only if that file still
+  has the same sha256.
 
 ## Audit (`pseudorca.audit`)
 
 ### Fingerprints
 - **Syntax:**
-  - `text`: the substring must be present.
-  - `re:<regex>`: the regex must match a line.
-  - `!text` and `!re:<regex>`: must be absent.
+  - `text` must be present. Text that spans lines must occur in consecutive lines, ignoring whitespace
+    differences and blank lines. Its first line may be the end of a line, and its last line the start of
+    one.
+  - `re:<regex>` must match a line. A regex containing a line break (typed, or written `\n` or `\r`) or
+    the `(?m)` flag is searched over each whole file with `re.MULTILINE`.
+  - `!text` and `!re:<regex>` must be absent.
 - **Scope:** only evidence paths (no markdown, no binary files).
-- **Status with positives** (positive = must be present):
-  - all positives found and no negative found: `present`;
-  - no positive found: `absent`;
-  - anything else: `partial`.
+- **Evidence** records `col`, where the match starts in its quote, so tables can show a window around
+  the match.
+- **Status with positives** (a positive is something that must be present):
+  - `present` when all positives are found and no negative is;
+  - `absent` when no positive is found;
+  - `partial` otherwise.
 - **Status with only negatives:**
-  - none found: `present`;
-  - all found: `absent`;
-  - anything else: `partial`.
+  - `present` when none is found;
+  - `absent` when all are found;
+  - `partial` otherwise.
 
 ### Patch
-- **Input:** a unified diff (git or plain).
-- **Blocks:**
-  - each hunk splits into added blocks (runs of `+` lines) and removed blocks (runs of `-` lines);
-  - lines are compared after whitespace normalisation;
-  - blank and trivial lines are ignored (`pass`, `else:`, lone brackets, under 4 characters).
-- **Matching:** blocks are matched as whole lines with `Tree.find_snippet(partial_ends=False)`. The
-  candidate files are tried in this order:
+- **Input:** a unified diff (git or plain), read as UTF-8. A leading byte order mark is ignored.
+- **Lines:** they are compared after whitespace normalisation. Blank and trivial lines are ignored
+  (`pass`, `else:`, lone brackets, and lines under 4 characters).
+- **Candidate files**, tried in this order:
   1. paths ending with the diff's path;
   2. the same basename;
   3. all evidence paths.
+- **Matching:**
+  - A hunk's non-trivial context lines split it into changes. Each change is anchored by the nearest
+    non-trivial context line before it and after it.
+  - **New side in place:** the added lines sit next to an anchor. For a change that only removes lines,
+    the two anchors are adjacent instead.
+  - **Old side in place:** the removed lines sit between both anchors. For a change that only adds lines,
+    the two anchors are adjacent instead.
+  - A lone anchor at a hunk edge must be the first or last line of its file.
 - **Hunk state:**
-  - `applied`: every non-trivial added block is found. A removal-only hunk counts as applied when its
-    removed blocks are gone and a context line is still found.
-  - `reverted`: no added block is found, and every removed block is.
-  - `unknown`: anything else.
+  - `applied`: every change's new side is in place (and, for a pure removal, its old side is not);
+  - `reverted`: every change's old side is in place and its new side is not;
+  - `unknown`: anything else, including added lines found only away from their context.
+- **Hunks without context** (a new or deleted file, or a `-U0` diff) are matched by their blocks alone:
+  - `applied` when every added block is found;
+  - `reverted` when every removed block is found and no added block is;
+  - for a hunk that only adds or only removes lines, "not there" when at most 20% of its distinct
+    non-trivial lines are found. For a new or deleted file this counts lines found anywhere, as long as
+    no file of that name exists; otherwise it counts lines in the file itself.
 - **Patch status:**
   - every hunk applied: `present`;
   - every hunk reverted: `absent`;
@@ -191,14 +230,31 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 - **`detail`** holds the counts and the files.
 
 ### Orchestration
-1. For each selected idea, run the deterministic methods it supports.
-2. Call the LLM when `llm = "always"`, or when `llm = "auto"` and the deterministic result is not
-   conclusive (no single agreed `present`/`absent`). Never call it when `llm = "never"`.
-3. A method is skipped when an equal verdict already exists, unless `--force` is given. "Equal" means the
-   same notebook, idea, rev and method. For deterministic methods it also means the same
-   `detail.extractor_version`, so an extractor upgrade re-runs them. For the LLM it also means the same
-   model and `detail.prompt_version`.
-4. Every finding is written as one `audit.verdict` event.
+1. An audit reads the ledger once. Effective verdicts are computed at the end, from that snapshot plus
+   the run's own findings.
+2. For each selected idea, the deterministic methods it supports run first.
+3. When the LLM is called:
+   - never with `llm = "never"`;
+   - always with `llm = "always"`;
+   - with `llm = "auto"`, only when the deterministic result is inconclusive: there is no single agreed
+     `present`/`absent`, and a fingerprint/patch conflict also counts as inconclusive. The LLM's verified
+     verdict then settles it, and audit and check show its quote.
+4. A method is skipped, unless `--force` is given, when the verdict that counts for it
+   (`State.current_records`) is at least as new as what this run would record:
+   - for fingerprint and patch, `detail.extractor_version >= EXTRACTOR_VERSION`;
+   - for the LLM, the same model with `detail.prompt_version >= PROMPT_VERSION`, or any model with a newer
+     prompt version.
+
+   Versions compare as integers. An older Pseudorca never redoes a newer one's verdicts, and an upgrade
+   redoes older ones.
+5. Every finding is written as one `audit.verdict` event.
+
+**`audit NB_REF`**
+- When `NB_REF` is a notebook file, the registered version with that file's sha256 is audited, whatever
+  its name.
+- A file whose version is not registered is an error. If its name resolves to another registered
+  version, it is a warning instead. Both suggest `pseudorca nb add FILE` or `pseudorca check FILE`.
+- `audit` and `check` take `--json`.
 
 ### LLM judge (`pseudorca.llm`)
 - **Tools:**
@@ -206,23 +262,37 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
   - `grep(text, path_glob, ignore_case)` (substrings only, never regex);
   - `read_file(path, start_line, end_line)`;
   - `submit_verdict(status, evidence[{path, line, quote}], reasoning)`.
-- **Limits:** `max_steps` tool calls. Each output is cut to `max_tool_chars`.
+- **Limits:** `max_steps` tool calls. Each tool output is cut to `max_tool_chars`.
 - **Prompt:**
   - tree content is untrusted data, and instructions found in it are ignored;
   - markdown is a claim, not evidence;
-  - quotes must be verbatim.
+  - quotes must be verbatim;
+  - each prompt piece is redacted before it is cut to its length limit, and the whole message is redacted
+    again.
 - **Verification:**
-  - each quote must be found by `Tree.find_snippet` in the cited file, and unverified quotes are dropped;
+  - each quote must be found by `Tree.find_snippet` in the cited file (never under `markdown/`);
+    unverified quotes are dropped;
   - `present` or `partial` with no verified quote becomes `unknown`;
   - `absent` needs at least one tool call.
 - **Remote guard:**
-  - Local hosts are `localhost`, `*.localhost`, `127.0.0.0/8`, `::1` and `0.0.0.0`.
-  - Every other host is remote. `anthropic` is always remote.
-  - Remote endpoints need `allow_remote`. `ensure_allowed` raises `LLMError` before any network use.
-- **Redaction:**
-  - common key formats are replaced by `[REDACTED]`: OpenAI, Anthropic, GitHub, Hugging Face, AWS,
-    Slack, Google, Kaggle, and generic `key/token/secret = "..."` assignments;
-  - verification runs on the same redacted text.
+  - Local hosts are `localhost`, `*.localhost`, `127.0.0.0/8`, `::1` and `0.0.0.0`. Every other host is
+    remote, and `anthropic` is always remote.
+  - A remote endpoint needs `allow_remote`. `ensure_allowed` raises `LLMError` before any network use.
+  - A local endpoint is reached directly. Its client ignores proxy settings from the environment and
+    does not follow redirects, so its requests cannot be carried to another host.
+  - A remote endpoint keeps the environment's proxy settings.
+- **Redaction:** these are replaced by `[REDACTED]` before anything is sent:
+  - OpenAI, Anthropic, GitHub, Hugging Face, Slack, Google and Kaggle keys;
+  - AWS access key ids and secret access keys, including credentials files and `aws configure set`;
+  - JWTs, Bearer and Basic credentials, private key blocks, and passwords in URLs;
+  - values assigned to secret-like names (key, token, secret, credential, password, passwd, pwd,
+    passphrase):
+    - quoted values with any string prefix, or in triple quotes;
+    - passwords of 6 or more characters, spaces included;
+    - unquoted secret-looking values on YAML, INI, `.env` or properties lines.
+- **What is not redacted:** environment variable names, templates, booleans, numbers and code-like names.
+- **Linear time:** redaction runs in time linear in the text.
+- Verification runs on the same redacted text.
 - **Transcripts:** saved in `cache/llm/`.
 - **Fallback:** for endpoints without tool calling, a single prompt with retrieved snippets, answered as
   JSON.
@@ -233,12 +303,17 @@ the result with expectations:
 - **Expected:** ideas whose status is in `[audit].expect_status` (default `adopted`), plus any `--expect ID`.
 - **Forbidden:** ideas whose status is in `[audit].forbid_status` (default `rejected`).
 
+Both settings must be idea statuses (`idea`, `testing`, `adopted`, `rejected`, `parked`); any other
+value is an error.
+
 | exit code | meaning |
 |---|---|
 | 0 | every expected idea is present, and no forbidden idea is |
 | 1 | an expected idea is not fully present, a forbidden idea is present, or `--strict` is on and an expected idea is unknown |
+| 2 | the check could not run: any error, including a usage error |
 
-It also lists ideas the notebook claims (`applies`) that the audit found absent.
+`check` also lists ideas the notebook claims (`applies`) that the audit found absent. `--json` carries
+the sections and `passed`.
 
 ## Kaggle (`pseudorca.kaggle_api`), read-only
 - **API calls:** only listing submissions and pulling kernel sources. Credentials are the `kaggle`
@@ -246,7 +321,8 @@ It also lists ideas the notebook claims (`applies`) that the audit found absent.
 - **`kaggle sync`** upserts a submission only when something changed. A submission links to a notebook
   in two ways:
   - an explicit `sub link`;
-  - its description contains a registered notebook's name, or a sha prefix of 8 or more characters.
+  - its description contains a registered notebook's name (4 or more characters) or a sha prefix (8 or
+    more characters). The match must be unambiguous.
 - **`kaggle pull OWNER/SLUG`** downloads the latest source into `cache/kaggle/` and registers it with
   `kernel = OWNER/SLUG`.
 
@@ -256,18 +332,37 @@ It also lists ideas the notebook claims (`applies`) that the audit found absent.
   - `draw` is optional. Without it, a repeated item gets draws 0, 1, 2… in file order.
   - Numeric columns are metrics. The default metric is `score`.
 - **`compare A B`:**
-  - **Inputs:** each side is a run, or all runs of a notebook under one protocol. The protocols must
-    match, unless `--force` is given.
+  - **Inputs:**
+    - Each side is a run, a run label, or all runs of a notebook.
+    - The protocols must match, unless `--force` is given.
+    - An arm pools each results table (blob) once. A repeated table, for example one imported twice by
+      two teammates, is left out with a warning.
   - **Per item:** only items present in both arms count. Draws are averaged per item, and
     `d_i = mean_B,i − mean_A,i`.
   - **Estimate:** the mean of `d`.
-  - **95% interval:** a two-stage bootstrap: resample items with replacement, then draws within each
-    item. 10,000 resamples, fixed seed.
-  - **Also reported:** wins, losses and ties; a sign-flip permutation p-value; and MDE80 ≈ 2.8·SE.
+  - **95% interval:** a two-stage bootstrap. Items are resampled with replacement, then draws within each
+    item; 10,000 resamples with a fixed seed.
+  - **Also reported:**
+    - wins, losses and ties;
+    - a sign-flip permutation p-value: exact up to 16 items, otherwise random flips (at least 20,000, and
+      enough to resolve the confidence asked for);
+    - MDE80 ≈ 2.8·SE.
+  - **Verdict:**
+    - `B better` or `A better` only when the interval excludes 0 and p < 1 − confidence;
+    - `too few items` with fewer items than `min_items(confidence)` (6 at 95%), because then no outcome
+      could be significant;
+    - `within noise` otherwise.
   - **A/A check:** when an arm has 2 or more draws on 5 or more items, its draws are split into halves
-    and compared the same way, as a check on the noise.
-- **LB noise:** scored submissions are grouped by notebook. The pooled SD comes from groups with at
-  least 2 scored submissions.
+    and compared the same way, as a check on the noise. It is judged by the same verdict rule.
+- **LB noise:** scored submissions are grouped by notebook. The pooled SD comes from groups with at least
+  2 scored submissions. Scores that are not finite numbers are skipped.
+
+## Display conventions
+- Times are shown in the viewer's time zone. A bare date stays as written. Times are compared as instants,
+  never as strings.
+- `-n N` means the latest N, and `-n 0` means all.
+- `--json` keeps the stored ISO times.
+- `log --json` prints events as stored, plus a one-line summary.
 
 ## Module map
 

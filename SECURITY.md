@@ -14,9 +14,14 @@ that reading them is safe and that a team's code and results stay private.
   stores contents under their sha256.
 - **Code leaves your machine only when you allow it.** The LLM audit is off until you configure a model.
   Any endpoint that is not on localhost needs `allow_remote = true`, including the Anthropic API.
-  - Before any text goes to an LLM, common secret formats are replaced with `[REDACTED]`: API keys and
-    tokens for OpenAI, Anthropic, GitHub, Hugging Face, AWS, Google, Slack and Kaggle, private keys, and
-    `password = "..."`-style assignments.
+  - A localhost endpoint is always contacted directly. It is never reached through a proxy configured in
+    your environment, and never by a redirect, so its requests cannot be carried to another host.
+  - Before any text goes to an LLM, common secret formats are replaced with `[REDACTED]`:
+    - API keys and tokens for OpenAI, Anthropic, GitHub, Hugging Face, Google, Slack and Kaggle;
+    - AWS access keys and secret keys, including credentials files;
+    - JWTs, Bearer and Basic credentials, private key blocks, and passwords in URLs;
+    - values assigned to secret-like names (`key`, `token`, `secret`, `credential`, `password`, `pwd`,
+      `passphrase`), quoted or on YAML, INI and `.env` lines.
   - Redaction is best effort. Do not rely on it as your only protection.
 - **LLM answers are not trusted.** Notebook text is treated as untrusted data in the prompt. Any quote the
   LLM gives as evidence must be found in the notebook; otherwise the verdict becomes `unknown`. The LLM

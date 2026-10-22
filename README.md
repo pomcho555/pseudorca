@@ -51,7 +51,7 @@ cd ~/pseudorca-demo && git init
 pseudorca init --competition word-problems
 ```
 
-`bash pseudorca/examples/demo.sh ~/pseudorca-demo` runs the whole tour at once.
+Alternatively, `bash pseudorca/examples/demo.sh <a new folder>` runs the whole tour at once.
 
 ### 1. Write down the ideas
 
@@ -67,7 +67,8 @@ pseudorca idea add temp-06      --title "Sampling temperature 0.6"      --status
 ```
 
 An idea is checked in one or both of two ways:
-- **Fingerprints:** text that must appear, or with `!` must not appear. Use `re:` for a regex.
+- **Fingerprints:** text that must appear, or with `!` must not appear. Use `re:` for a regex. Text may
+  span lines.
 - **A patch:** a unified diff. Pseudorca checks whether each hunk is applied or reverted.
 
 Ideas move through the statuses `idea` → `testing` → `adopted`, `rejected` or `parked`.
@@ -80,7 +81,18 @@ pseudorca nb add next.ipynb --parent base.ipynb --applies short-cot --applies re
 pseudorca nb tree next.ipynb
 ```
 
-<!-- OUTPUT:tree -->
+```text
+PATH                                SIZE   ORIGIN
+----------------------------------  -----  ---------------------------------------------------------------
+cells/cell_001.py                   98 B   cell 1
+cells/cell_002.py                   44 B   cell 2
+cells/cell_003.py                   623 B  cell 3
+cells/cell_004.py                   205 B  cell 4
+files/solver.py                     495 B  cell 2 > %%writefile solver.py
+markdown/cell_000.md                54 B   cell 0
+payloads/cell_003/0/utils/io.py     109 B  cell 3 > line 3 str > base64 > lzma > tar member utils/io.py
+payloads/cell_003/0/utils/timer.py  171 B  cell 3 > line 3 str > base64 > lzma > tar member utils/timer.py
+```
 
 `nb tree` shows what the audit sees:
 - the code cells;
@@ -95,16 +107,48 @@ None of it was run.
 pseudorca audit latest
 ```
 
-<!-- OUTPUT:audit -->
+```text
+audit of next.ipynb (ecadc54857)
+
+IDEA          STATUS    VERDICT    METHOD       EVIDENCE/NOTE
+------------  --------  ---------  -----------  ------------------------------------------------------------
+prefix-cache  testing   ✓ present  fingerprint  cells/cell_004.py:3 …eights", enable_prefix_caching=True, g…
+retry-parse   adopted   ✓ present  patch        files/solver.py:11 def solve(llm, problem, sampling, retrie…
+short-cot     adopted   ✓ present  fingerprint  files/solver.py:3 …d problems. Think step by step, briefly."
+temp-06       rejected  ✗ absent   fingerprint  found 0/1 (missing: re:temperature\s*=\s*0\.6)
+
+3 present, 1 absent; 4 new verdicts recorded
+✓ present  ◐ partial  ✗ absent  ? unknown  ! methods disagree  c claimed, not audited  · none  * stale
+```
 
 ### 4. Check before you submit
 
 ```bash
 pseudorca check next.ipynb    # exit code 0
-pseudorca check base.ipynb    # exit code 1: adopted ideas are missing
+pseudorca check base.ipynb    # exit code 1: adopted ideas are missing (2 would mean the check could not run)
 ```
 
-<!-- OUTPUT:check -->
+```text
+$ pseudorca check next.ipynb
+check of next.ipynb (ecadc54857), already registered
+
+OK (2)
+  retry-parse  adopted  ✓ present  patch        files/solver.py:11 def solve(llm, problem, sampling, retrie…
+  short-cot    adopted  ✓ present  fingerprint  files/solver.py:3 …d problems. Think step by step, briefly."
+
+check passed
+(exit code 0)
+
+$ pseudorca check base.ipynb
+check of base.ipynb (61a5a1c1b5), already registered
+
+MISSING (2)
+  retry-parse  adopted  ✗ absent  patch        0/1 hunks applied, 1 reverted
+  short-cot    adopted  ✗ absent  fingerprint  found 0/1 (missing: Think step by step, briefly.)
+
+check failed: 2 missing
+(exit code 1)
+```
 
 ### 5. The board
 
@@ -112,7 +156,20 @@ pseudorca check base.ipynb    # exit code 1: adopted ideas are missing
 pseudorca status
 ```
 
-<!-- OUTPUT:status -->
+```text
+IDEA          STATUS    1 base.ipynb  2 next.ipynb
+------------  --------  ------------  ------------
+prefix-cache  testing   ✗             ✓
+retry-parse   adopted   ✗             ✓
+short-cot     adopted   ✗             ✓
+temp-06       rejected  ✗             ✗
+
+✓ present  ◐ partial  ✗ absent  ? unknown  ! methods disagree  c claimed, not audited  · none  * stale
+#  NOTEBOOK    SHA         ADDED
+-  ----------  ----------  ----------
+1  base.ipynb  61a5a1c1b5  2026-10-22
+2  next.ipynb  ecadc54857  2026-10-22
+```
 
 ### 6. Does it beat the noise?
 
@@ -122,7 +179,18 @@ pseudorca run add runs/next.csv --nb next.ipynb --label next --protocol p60x3
 pseudorca compare base next
 ```
 
-<!-- OUTPUT:compare -->
+```text
+A  label base: 60 items, 3 draws per item
+B  label next: 60 items, 3 draws per item
+items compared: 60 (only in A: 0, only in B: 0)
+mean score: A 0.51  B 0.58
+B − A: +0.07  95% CI [−0.04, +0.19]
+B wins/losses/ties: 20/13/27  p = 0.137 (sign-flip permutation)
+SE 0.06  MDE80 0.16
+A/A on A (draws split in halves): +0.03  95% CI [−0.12, +0.19]  ok
+A/A on B (draws split in halves): 0.00  95% CI [−0.15, +0.16]  ok
+verdict: within noise (the 95% CI includes 0)
+```
 
 A gain of 0.07 on 60 problems with 3 draws each is not distinguishable from noise. The output also gives
 the smallest effect this setup can detect (MDE80). That tells you how many more draws or problems you
@@ -140,7 +208,13 @@ pseudorca sub add 1003 --nb next.ipynb --score 0.437 --date 2026-01-07
 pseudorca lb --diff 1001 1003   # is this LB gap bigger than the LB noise?
 ```
 
-<!-- OUTPUT:lb -->
+```text
+A  1001  base.ipynb  public 0.412  (2026-01-05)
+B  1003  next.ipynb  public 0.437  (2026-01-07)
+B − A: +0.025 (public score)
+z = +1.79 against the LB noise (pooled SD 0.0099 from 1 notebook and 2 submissions; z = diff / (SD·√2))
+verdict: within LB noise
+```
 
 ### 8. Share
 
@@ -214,6 +288,7 @@ allow_remote = true                      # notebook code will be sent to this pr
 - Pseudorca checks every quote against the notebook. A quote that is not found is dropped. A `present`
   verdict with no verified quote becomes `unknown`.
 - Before anything is sent, common secret formats are replaced with `[REDACTED]`.
+- A local server is always contacted directly, even when your shell has a proxy configured.
 
 **When the LLM is asked**
 - By default (`--llm auto`), only for ideas the deterministic checks could not settle.
@@ -245,6 +320,9 @@ allow_remote = true                      # notebook code will be sent to this pr
   - wins, losses and ties with a sign-flip permutation p-value;
   - the smallest effect detectable at 80% power;
   - an A/A check that splits each arm's draws in half.
+- `compare` names a winner only when the interval excludes 0 and the permutation p-value is below
+  1 − confidence. With fewer than 6 items (at 95%) it says `too few items`.
+- Each results table is pooled once, even if it was imported twice.
 - Runs from different protocols are not compared unless you pass `--force`.
 
 **`lb`** estimates leaderboard noise from notebooks submitted more than once, and `lb --diff` tells you
@@ -254,7 +332,7 @@ whether a gap is bigger than that noise.
 
 | command | what it does |
 |---|---|
-| `init` | create `.pseudorca/` in the current repository |
+| `init` | create `.pseudorca/` in the current repository, or complete a partial one |
 | `idea add / update / list / show` | the ideas |
 | `nb add / update / list / show / tree` | notebooks, and what the audit sees in them |
 | `audit [NB]` | decide which ideas are in a notebook |
@@ -265,6 +343,9 @@ whether a gap is bigger than that noise.
 | `run add / list / show`, `compare`, `lb` | results and noise |
 | `report` | a single-file HTML report |
 | `log` | recent changes and who made them |
+
+`audit`, `check`, `status`, `log`, `lb` and the `list` commands take `--json` for scripts. `-n N` limits
+lists to the latest N, and `-n 0` shows all. Times are shown in your time zone.
 
 Every command has `--help`. The design and the exact rules are in [DESIGN.md](DESIGN.md), and the safety
 model is in [SECURITY.md](SECURITY.md).

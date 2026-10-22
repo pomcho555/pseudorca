@@ -48,7 +48,7 @@ cd ~/pseudorca-demo && git init
 pseudorca init --competition word-problems
 ```
 
-`bash pseudorca/examples/demo.sh ~/pseudorca-demo` を使うと、以下を一度に通しで実行できます。
+または `bash pseudorca/examples/demo.sh <新しいフォルダ>` で、以下を一度に通しで実行できます。
 
 ### 1. 改善を登録する
 
@@ -64,7 +64,7 @@ pseudorca idea add temp-06      --title "温度 0.6"                --status rej
 ```
 
 改善の判定方法は 2 つあり、片方だけでも両方でも使えます。
-- **目印の文字列（fingerprint）**：入っているべき文字列を書きます。先頭に `!` を付けると「入っていてはいけない」文字列、`re:` を付けると正規表現になります。
+- **目印の文字列（fingerprint）**：入っているべき文字列を書きます。先頭に `!` を付けると「入っていてはいけない」文字列、`re:` を付けると正規表現になります。複数行の文字列も書けます。
 - **パッチ**：unified diff です。各 hunk が当たっているか、元に戻っているかを調べます。
 
 状態は `idea` → `testing` → `adopted`／`rejected`／`parked` と進みます。
@@ -77,7 +77,18 @@ pseudorca nb add next.ipynb --parent base.ipynb --applies short-cot --applies re
 pseudorca nb tree next.ipynb
 ```
 
-<!-- OUTPUT:tree -->
+```text
+PATH                                SIZE   ORIGIN
+----------------------------------  -----  ---------------------------------------------------------------
+cells/cell_001.py                   98 B   cell 1
+cells/cell_002.py                   44 B   cell 2
+cells/cell_003.py                   623 B  cell 3
+cells/cell_004.py                   205 B  cell 4
+files/solver.py                     495 B  cell 2 > %%writefile solver.py
+markdown/cell_000.md                54 B   cell 0
+payloads/cell_003/0/utils/io.py     109 B  cell 3 > line 3 str > base64 > lzma > tar member utils/io.py
+payloads/cell_003/0/utils/timer.py  171 B  cell 3 > line 3 str > base64 > lzma > tar member utils/timer.py
+```
 
 `nb tree` で、反映チェックが実際に読む中身を確認できます。
 - コードセル
@@ -92,16 +103,48 @@ pseudorca nb tree next.ipynb
 pseudorca audit latest
 ```
 
-<!-- OUTPUT:audit -->
+```text
+audit of next.ipynb (ecadc54857)
+
+IDEA          STATUS    VERDICT    METHOD       EVIDENCE/NOTE
+------------  --------  ---------  -----------  ------------------------------------------------------------
+prefix-cache  testing   ✓ present  fingerprint  cells/cell_004.py:3 …eights", enable_prefix_caching=True, g…
+retry-parse   adopted   ✓ present  patch        files/solver.py:11 def solve(llm, problem, sampling, retrie…
+short-cot     adopted   ✓ present  fingerprint  files/solver.py:3 …d problems. Think step by step, briefly."
+temp-06       rejected  ✗ absent   fingerprint  found 0/1 (missing: re:temperature\s*=\s*0\.6)
+
+3 present, 1 absent; 4 new verdicts recorded
+✓ present  ◐ partial  ✗ absent  ? unknown  ! methods disagree  c claimed, not audited  · none  * stale
+```
 
 ### 4. 提出前チェック
 
 ```bash
 pseudorca check next.ipynb    # 終了コード 0
-pseudorca check base.ipynb    # 終了コード 1：adopted の改善が入っていない
+pseudorca check base.ipynb    # 終了コード 1：adopted の改善が入っていない（2 はチェック自体が実行できなかったとき）
 ```
 
-<!-- OUTPUT:check -->
+```text
+$ pseudorca check next.ipynb
+check of next.ipynb (ecadc54857), already registered
+
+OK (2)
+  retry-parse  adopted  ✓ present  patch        files/solver.py:11 def solve(llm, problem, sampling, retrie…
+  short-cot    adopted  ✓ present  fingerprint  files/solver.py:3 …d problems. Think step by step, briefly."
+
+check passed
+(exit code 0)
+
+$ pseudorca check base.ipynb
+check of base.ipynb (61a5a1c1b5), already registered
+
+MISSING (2)
+  retry-parse  adopted  ✗ absent  patch        0/1 hunks applied, 1 reverted
+  short-cot    adopted  ✗ absent  fingerprint  found 0/1 (missing: Think step by step, briefly.)
+
+check failed: 2 missing
+(exit code 1)
+```
 
 ### 5. 改善 × ノートブックの表
 
@@ -109,7 +152,20 @@ pseudorca check base.ipynb    # 終了コード 1：adopted の改善が入っ�
 pseudorca status
 ```
 
-<!-- OUTPUT:status -->
+```text
+IDEA          STATUS    1 base.ipynb  2 next.ipynb
+------------  --------  ------------  ------------
+prefix-cache  testing   ✗             ✓
+retry-parse   adopted   ✗             ✓
+short-cot     adopted   ✗             ✓
+temp-06       rejected  ✗             ✗
+
+✓ present  ◐ partial  ✗ absent  ? unknown  ! methods disagree  c claimed, not audited  · none  * stale
+#  NOTEBOOK    SHA         ADDED
+-  ----------  ----------  ----------
+1  base.ipynb  61a5a1c1b5  2026-10-22
+2  next.ipynb  ecadc54857  2026-10-22
+```
 
 ### 6. ノイズを超えているか
 
@@ -119,7 +175,18 @@ pseudorca run add runs/next.csv --nb next.ipynb --label next --protocol p60x3
 pseudorca compare base next
 ```
 
-<!-- OUTPUT:compare -->
+```text
+A  label base: 60 items, 3 draws per item
+B  label next: 60 items, 3 draws per item
+items compared: 60 (only in A: 0, only in B: 0)
+mean score: A 0.51  B 0.58
+B − A: +0.07  95% CI [−0.04, +0.19]
+B wins/losses/ties: 20/13/27  p = 0.137 (sign-flip permutation)
+SE 0.06  MDE80 0.16
+A/A on A (draws split in halves): +0.03  95% CI [−0.12, +0.19]  ok
+A/A on B (draws split in halves): 0.00  95% CI [−0.15, +0.16]  ok
+verdict: within noise (the 95% CI includes 0)
+```
 
 この例では、60 問 × 3 試行での +0.07 はノイズと区別できません。
 - 出力には、この条件で検出できる最小の効果（MDE80）も出ます。
@@ -136,7 +203,13 @@ pseudorca sub add 1003 --nb next.ipynb --score 0.437 --date 2026-01-07
 pseudorca lb --diff 1001 1003   # この LB の差は LB のブレより大きいか
 ```
 
-<!-- OUTPUT:lb -->
+```text
+A  1001  base.ipynb  public 0.412  (2026-01-05)
+B  1003  next.ipynb  public 0.437  (2026-01-07)
+B − A: +0.025 (public score)
+z = +1.79 against the LB noise (pooled SD 0.0099 from 1 notebook and 2 submissions; z = diff / (SD·√2))
+verdict: within LB noise
+```
 
 ### 8. 共有する
 
@@ -208,6 +281,7 @@ LLM の判定は次のように動きます。
 - LLM は答えに引用を付ける必要があります。
 - 引用はノートブック内に実在するかを照合します。見つからない引用は捨て、照合できる引用のない `present` は `unknown` にします。
 - 送る前に、よくある形式の秘密情報を `[REDACTED]` に置き換えます。
+- ローカルのサーバーには、シェルにプロキシが設定されていても必ず直接つなぎます。
 
 LLM に聞く範囲と費用については次のとおりです。
 - 既定（`--llm auto`）では、機械的な判定で決まらなかった改善だけを LLM に聞きます。
@@ -233,6 +307,8 @@ LLM に聞く範囲と費用については次のとおりです。
   - 勝ち／負け／引き分けと、符号反転の並べ替え検定の p 値
   - 検出力 80% で見つけられる最小の効果
   - 各 arm の試行を半分に分けて比べる A/A のチェック
+- 勝ち負けを判定するのは、区間が 0 を含まず、かつ並べ替え検定の p 値が 1 − 信頼度 より小さいときだけです。問題が 6 個未満（95% の場合）なら `too few items` と出ます。
+- 同じ結果表が 2 回取り込まれていても、1 回分として数えます。
 - protocol の違う run どうしは、`--force` を付けない限り比べません。
 - `lb` は同じノートブックの再提出から LB のブレを推定し、`lb --diff` はある差がそのブレより大きいかを判定します。
 
@@ -240,7 +316,7 @@ LLM に聞く範囲と費用については次のとおりです。
 
 | コマンド | 内容 |
 |---|---|
-| `init` | 今のリポジトリに `.pseudorca/` を作る |
+| `init` | 今のリポジトリに `.pseudorca/` を作る（途中まであるなら補う） |
 | `idea add / update / list / show` | 改善の登録と表示 |
 | `nb add / update / list / show / tree` | ノートブックと、反映チェックが読む中身 |
 | `audit [NB]` | ノートブックに各改善が入っているかを判定する |
@@ -251,6 +327,8 @@ LLM に聞く範囲と費用については次のとおりです。
 | `run add / list / show`、`compare`、`lb` | 結果とノイズ |
 | `report` | 1 ファイルの HTML レポート |
 | `log` | 最近の変更と、誰が変更したか |
+
+`audit`・`check`・`status`・`log`・`lb` と各 `list` コマンドは、スクリプト用に `--json` を受け付けます。`-n N` で最新 N 件、`-n 0` で全件を表示します。時刻は自分のタイムゾーンで表示されます。
 
 各コマンドで `--help` が使えます。設計と細かい規則は [DESIGN.md](DESIGN.md)、安全面の考え方は [SECURITY.md](SECURITY.md) にあります。
 
