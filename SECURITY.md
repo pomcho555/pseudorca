@@ -37,4 +37,5 @@ that reading them is safe and that a team's code and results stay private.
 ## Reporting a vulnerability
 
 Please use GitHub's private vulnerability reporting ("Report a vulnerability" under the repository's
-Security tab) rather than a public issue.
+Security tab) rather than a public issue. If that button is not there, open an issue that asks for a private
+contact and leave out every detail of the problem.

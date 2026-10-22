@@ -74,9 +74,12 @@ def run_add(
         st = store.state()
         nb = st.resolve_nb(nb_ref) if nb_ref else None
         sha = util.sha256_bytes(data)
-        for other in sorted(st.runs.values(), key=lambda r: r.id):
-            if other.results == sha:
-                warn(f"this table was already added as run {_run_name(other)}; pooling both counts it twice")
+        same = [r for r in _runs_by_id(st) if r.results == sha]
+        if same:
+            warn(
+                f"this table was already added as {'runs' if len(same) > 1 else 'run'} {_run_names(same)}; "
+                "compare pools each table once"
+            )
         store.put_blob(data)
         run_id = util.new_ulid()
         store.append(
@@ -104,30 +107,54 @@ def run_add(
 
 @run_group.command("list")
 @click.option("--nb", "nb_ref", metavar="REF", help="Only the runs of this notebook.")
+@click.option(
+    "-n",
+    "count",
+    type=click.IntRange(min=0),
+    default=0,
+    metavar="N",
+    help="Show only the latest N (0 = all).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Print JSON.")
 @pass_ctx
-def run_list(ctx: Ctx, nb_ref: str | None, as_json: bool) -> None:
+def run_list(ctx: Ctx, nb_ref: str | None, count: int, as_json: bool) -> None:
     """List runs, oldest first."""
+    from pseudorca.results import distinct_runs
+
     store = ctx.store()
     with user_errors():
         st = store.state()
-        runs = sorted(st.runs.values(), key=lambda r: r.id)
+        runs = _runs_by_id(st)
         if nb_ref:
             nb = st.resolve_nb(nb_ref)
             runs = [r for r in runs if r.nb == nb.id]
+    shown = runs[-count:] if count else runs
     if as_json:
-        click.echo(json.dumps([dataclasses.asdict(r) for r in runs], ensure_ascii=False, indent=1))
+        _echo_json([dataclasses.asdict(r) for r in shown])
         return
-    if not runs:
+    if not shown:
         click.echo(
             "no runs" + (" for that notebook" if nb_ref else "") + " (add one with `pseudorca run add FILE`)"
         )
     else:
         rows = [
-            [r.id[:10], r.label, _nb_label(st, r.nb), r.protocol, r.n_rows, _when(r.added), r.added_by]
-            for r in runs
+            [
+                r.id[:10],
+                r.label,
+                _nb_label(st, r.nb),
+                r.protocol,
+                r.n_rows,
+                util.local_time(r.added),
+                r.added_by,
+            ]
+            for r in shown
         ]
         click.echo(util.format_table(["ID", "LABEL", "NOTEBOOK", "PROTOCOL", "ROWS", "ADDED", "BY"], rows))
+        if len(runs) > len(shown):
+            click.echo(f"({_plural(len(runs) - len(shown), 'older run')} not shown)")
+    repeats = distinct_runs(runs)[1]
+    if repeats:
+        warn(f"{_repeats_text(repeats)}; compare pools each table once")
     show_warnings(store)
 
 
@@ -148,13 +175,15 @@ def run_show(ctx: Ctx, run_ref: str) -> None:
         st = store.state()
         run = _resolve_run(st, run_ref)
         table = _load(store, run)
+    same = [r for r in _runs_by_id(st) if r.results == run.results and r.id != run.id]
+    also = f", also in {'runs' if len(same) > 1 else 'run'} {_run_names(same)}" if same else ""
     fields = [
         ("label", run.label),
         ("notebook", _nb_long(st, run.nb)),
         ("protocol", run.protocol),
         ("note", run.note),
-        ("added", f"{_when(run.added)} by {run.added_by}"),
-        ("table", f"{run.format}, {len(table)} rows, blob {util.short(run.results, 12)}"),
+        ("added", f"{util.local_time(run.added)} by {run.added_by}"),
+        ("table", f"{run.format}, {len(table)} rows, blob {util.short(run.results, 12)}{also}"),
     ]
     click.echo(f"run {run.id}")
     for key, value in fields:
@@ -194,6 +223,7 @@ class _Arm:
     ref: str
     name: str  # how the output names the arm
     runs: list[Run]
+    duplicates: list[Run] = dataclasses.field(default_factory=list)  # left out: their table repeats a run's
 
 
 @click.command("compare")
@@ -236,10 +266,11 @@ def compare_cmd(
     """Does B beat A beyond the noise?
 
     A and B are each a run id (or a unique prefix of 6+ characters), else a run label (all its runs),
-    else a notebook (all its runs). Runs in one arm are pooled. Items are paired across the arms, each
-    item's draws are averaged, and the mean per-item difference B − A gets a two-stage bootstrap interval
-    (items, then draws within items), a sign-flip permutation p-value, and the minimum detectable effect
-    at 80% power (MDE80).
+    else a notebook (all its runs). Runs in one arm are pooled, each results table once. Items are paired
+    across the arms, each item's draws are averaged, and the mean per-item difference B − A gets a
+    two-stage bootstrap interval (items, then draws within items), a sign-flip permutation p-value, and the
+    minimum detectable effect at 80% power (MDE80). The verdict names a winner only when the interval
+    excludes 0 and p is below 1 − confidence; with fewer than 6 items (at 95%) it is "too few items".
     """
     from pseudorca.results import per_item, pool
     from pseudorca.stats import compare
@@ -251,9 +282,13 @@ def compare_cmd(
         if protocol is not None:
             arm_a, arm_b = _with_protocol(arm_a, protocol), _with_protocol(arm_b, protocol)
         _check_protocols(arm_a, arm_b, force)
-        shared = {r.id for r in arm_a.runs} & {r.id for r in arm_b.runs}
+        arm_a, arm_b = _each_table_once(arm_a), _each_table_once(arm_b)
+        shared = {r.results for r in arm_a.runs} & {r.results for r in arm_b.runs}
         if shared:
-            warn(f"the arms share {len(shared)} run(s)")
+            warn(
+                f"A and B share {_plural(len(shared), 'results table')}; "
+                f"{'its' if len(shared) == 1 else 'their'} rows are compared with themselves"
+            )
         tables_a = [_load(store, r) for r in arm_a.runs]
         tables_b = [_load(store, r) for r in arm_b.runs]
         _check_metric(
@@ -272,15 +307,15 @@ def compare_cmd(
     if as_json:
         payload = {
             "metric": metric,
-            "arm_a": {"ref": arm_a.ref, "name": arm_a.name, "runs": [r.id for r in arm_a.runs]},
-            "arm_b": {"ref": arm_b.ref, "name": arm_b.name, "runs": [r.id for r in arm_b.runs]},
+            "arm_a": _arm_json(arm_a),
+            "arm_b": _arm_json(arm_b),
             **dataclasses.asdict(result),
         }
-        click.echo(json.dumps(_jsonable(payload), ensure_ascii=False, indent=1))
+        _echo_json(payload)
         return
     for line in _render_compare(result, metric, (arm_a, values_a), (arm_b, values_b)):
         click.echo(line)
-    if result.n_items < 10:
+    if result.small_n:
         warn(f"only {result.n_items} item(s) compared: the interval and p-value are rough")
     show_warnings(store)
 
@@ -288,6 +323,8 @@ def compare_cmd(
 def _render_compare(
     res: CompareResult, metric: str, arm_a: tuple[_Arm, dict[str, Any]], arm_b: tuple[_Arm, dict[str, Any]]
 ) -> list[str]:
+    from pseudorca.stats import TOO_FEW, WITHIN_NOISE
+
     dec = _decimals(res)
     conf = f"{res.confidence * 100:g}% CI"
 
@@ -305,14 +342,53 @@ def _render_compare(
     ]
     for side, check in (("A", res.aa_a), ("B", res.aa_b)):
         if check is not None:
-            ok = check.ci_low <= 0 <= check.ci_high
-            note = "ok" if ok else "excludes 0: the draws may not be independent repeats"
+            if check.verdict == TOO_FEW:
+                note = f"too few items to judge (it needs {check.min_items} or more)"
+            elif check.verdict == WITHIN_NOISE:
+                note = "ok"
+            else:
+                note = "excludes 0: the draws may not be independent repeats"
             lines.append(f"A/A on {side} (draws split in halves): {interval(check)}  {note}")
     if res.aa_a is None and res.aa_b is None:
         lines.append("A/A check: needs an arm with 2+ draws on 5+ items")
-    reason = "includes 0" if res.verdict == "within noise" else "excludes 0"
-    lines.append(f"verdict: {res.verdict} (the {conf} {reason})")
+    lines.append(f"verdict: {res.verdict} ({_verdict_reason(res, conf)})")
     return lines
+
+
+def _verdict_reason(res: CompareResult, conf: str) -> str:
+    from pseudorca.stats import TOO_FEW, WITHIN_NOISE
+
+    alpha = f"{1 - res.confidence:g}"
+    if res.verdict == TOO_FEW:
+        return (
+            f"{_plural(res.n_items, 'item')} cannot reach p < {alpha} in the sign-flip test; "
+            f"it needs {res.min_items} or more"
+        )
+    if res.verdict != WITHIN_NOISE:
+        return f"the {conf} excludes 0 and p < {alpha}"
+    if res.ci_low <= 0 <= res.ci_high:
+        return f"the {conf} includes 0"
+    return f"the {conf} excludes 0, but p = {res.p_value:.3g} is not below {alpha}"
+
+
+def _arm_json(arm: _Arm) -> dict[str, Any]:
+    return {
+        "ref": arm.ref,
+        "name": arm.name,
+        "runs": [r.id for r in arm.runs],
+        "duplicates": [r.id for r in arm.duplicates],
+    }
+
+
+def _each_table_once(arm: _Arm) -> _Arm:
+    """The arm with each results table once: a run whose table repeats an earlier run's is left out."""
+    from pseudorca.results import distinct_runs
+
+    runs, repeats = distinct_runs(arm.runs)
+    if not repeats:
+        return arm
+    warn(f"{arm.name}: {_repeats_text(repeats)}; each table is pooled once")
+    return dataclasses.replace(arm, runs=runs, duplicates=[r for r, _ in repeats])
 
 
 def _describe_arm(arm: _Arm, values: dict[str, Any]) -> str:
@@ -323,7 +399,7 @@ def _describe_arm(arm: _Arm, values: dict[str, Any]) -> str:
     else:
         draws = f"{lo}–{hi} draws per item (median {med:g})"
     runs = f"{len(arm.runs)} runs, " if len(arm.runs) > 1 else ""
-    return f"{arm.name}: {runs}{len(counts)} items, {draws}"
+    return f"{arm.name}: {runs}{_plural(len(counts), 'item')}, {draws}"
 
 
 def _check_protocols(arm_a: _Arm, arm_b: _Arm, force: bool) -> None:
@@ -361,9 +437,8 @@ def _check_metric(metric: str, loaded: list[tuple[Run, Table]]) -> None:
     available = ", ".join(everywhere) or "none"
     if len(missing) == len(loaded):
         raise ValueError(f"no metric {metric!r} in these runs (metrics: {available})")
-    names = ", ".join(_run_name(r) for r in missing[:3]) + (", …" if len(missing) > 3 else "")
     raise ValueError(
-        f"metric {metric!r} is missing from {len(missing)} of {len(loaded)} runs ({names}); "
+        f"metric {metric!r} is missing from {len(missing)} of {len(loaded)} runs ({_run_names(missing)}); "
         f"metrics in every run: {available}"
     )
 
@@ -379,7 +454,8 @@ def _check_metric(metric: str, loaded: list[tuple[Run, Table]]) -> None:
     type=click.IntRange(min=0),
     default=20,
     show_default=True,
-    help="Show the newest N (0: all).",
+    metavar="N",
+    help="Show only the latest N (0 = all).",
 )
 @click.option(
     "--diff",
@@ -388,8 +464,11 @@ def _check_metric(metric: str, loaded: list[tuple[Run, Table]]) -> None:
     metavar="SUB_A SUB_B",
     help="Compare two submissions' public scores against the LB noise.",
 )
+@click.option("--json", "as_json", is_flag=True, help="Print JSON.")
 @pass_ctx
-def lb_cmd(ctx: Ctx, nb_ref: str | None, limit: int, diff_refs: tuple[str, str] | None) -> None:
+def lb_cmd(
+    ctx: Ctx, nb_ref: str | None, limit: int, diff_refs: tuple[str, str] | None, as_json: bool
+) -> None:
     """Leaderboard submissions and the LB noise.
 
     Submissions are listed newest last. The LB noise is the pooled SD of the public scores of notebooks
@@ -400,18 +479,34 @@ def lb_cmd(ctx: Ctx, nb_ref: str | None, limit: int, diff_refs: tuple[str, str] 
     store = ctx.store()
     with user_errors():
         st = store.state()
-        subs = sorted(st.subs.values(), key=lambda s: (s.date or s.updated, s.id.zfill(20)))
+        subs = sorted(st.subs.values(), key=lambda s: (str(s.date or s.updated or ""), s.id.zfill(20)))
         noise = lb_noise(subs)
         if diff_refs:
             sub_a, sub_b = (_resolve_sub(st, ref) for ref in diff_refs)
-            for line in _render_diff(st, sub_a, sub_b, noise):
-                click.echo(line)
-            show_warnings(store)
+            diff, z, verdict = _lb_verdict(sub_a, sub_b, noise)
+        else:
+            shown = subs
+            if nb_ref:
+                nb = st.resolve_nb(nb_ref)
+                shown = [s for s in subs if s.nb == nb.id]
+    noise_json = dataclasses.asdict(noise) if noise else None
+    if diff_refs:
+        if as_json:
+            a, b = dataclasses.asdict(sub_a), dataclasses.asdict(sub_b)
+            _echo_json({"a": a, "b": b, "diff": diff, "z": z, "verdict": verdict, "noise": noise_json})
             return
-        shown = subs
-        if nb_ref:
-            nb = st.resolve_nb(nb_ref)
-            shown = [s for s in subs if s.nb == nb.id]
+        for line in _render_diff(st, (sub_a, sub_b), diff, z, verdict, noise):
+            click.echo(line)
+        show_warnings(store)
+        return
+    total = len(shown)
+    if limit:
+        shown = shown[-limit:]
+    if as_json:
+        _echo_json(
+            {"submissions": [dataclasses.asdict(s) for s in shown], "total": total, "noise": noise_json}
+        )
+        return
     if not shown:
         click.echo(
             "no submissions of that notebook"
@@ -419,13 +514,10 @@ def lb_cmd(ctx: Ctx, nb_ref: str | None, limit: int, diff_refs: tuple[str, str] 
             else "no submissions yet (record them with `pseudorca sub` or `pseudorca kaggle sync`)"
         )
     else:
-        total = len(shown)
-        if limit:
-            shown = shown[-limit:]
         rows = [
             [
                 s.id,
-                _when(s.date),
+                util.local_time(s.date),
                 _nb_label(st, s.nb),
                 _score(s.public_score),
                 _score(s.private_score),
@@ -454,31 +546,42 @@ def lb_cmd(ctx: Ctx, nb_ref: str | None, limit: int, diff_refs: tuple[str, str] 
     show_warnings(store)
 
 
-def _render_diff(st: State, a: Submission, b: Submission, noise: LbNoise | None) -> list[str]:
-    from pseudorca.stats import lb_diff
+def _lb_verdict(a: Submission, b: Submission, noise: LbNoise | None) -> tuple[float, float | None, str]:
+    """(B − A in public score, z against the LB noise or None, verdict)."""
+    from pseudorca.stats import finite, lb_diff
 
-    score_a, score_b = a.public_score, b.public_score
+    score_a, score_b = finite(a.public_score), finite(b.public_score)
     if score_a is None or score_b is None:
         raise ValueError(f"submission {(a if score_a is None else b).id} has no public score yet")
+    if noise is None:
+        return score_b - score_a, None, "unknown"
+    diff, z = lb_diff(score_a, score_b, noise.sd)
+    if abs(z) < Z_BEYOND:
+        return diff, z, "within LB noise"
+    return diff, z, f"{'B' if z > 0 else 'A'} higher, beyond LB noise"
+
+
+def _render_diff(
+    st: State,
+    pair: tuple[Submission, Submission],
+    diff: float,
+    z: float | None,
+    verdict: str,
+    noise: LbNoise | None,
+) -> list[str]:
     lines = [
         f"{side}  {s.id}  {_nb_label(st, s.nb) or '(no notebook)'}  public {_score(s.public_score)}"
-        + (f"  ({_when(s.date)})" if s.date else "")
-        for side, s in (("A", a), ("B", b))
+        + (f"  ({util.local_time(s.date)})" if s.date else "")
+        for side, s in zip("AB", pair, strict=True)
     ]
-    if noise is None:
-        lines.append(f"B − A: {_signed_g(score_b - score_a)} (public score)")
+    lines.append(f"B − A: {_signed_g(diff)} (public score)")
+    if noise is None or z is None:
         lines.append("verdict: unknown, no LB noise estimate yet (submit a notebook at least twice)")
         return lines
-    diff, z = lb_diff(score_a, score_b, noise.sd)
-    lines.append(f"B − A: {_signed_g(diff)} (public score)")
     lines.append(
         f"z = {_signed(z, 2)} against the LB noise (pooled SD {noise.sd:.3g} from "
         f"{_plural(noise.n_groups, 'notebook')} and {_plural(noise.n_subs, 'submission')}; z = diff / (SD·√2))"
     )
-    if abs(z) < Z_BEYOND:
-        verdict = "within LB noise"
-    else:
-        verdict = f"{'B' if z > 0 else 'A'} higher, beyond LB noise"
     lines.append(f"verdict: {verdict}")
     return lines
 
@@ -585,7 +688,8 @@ def _table_overview(table: Table) -> list[str]:
         item_means = [v.mean() for v in per_item(table, name).values() if v.size]
         means.append(f"{name} {_num(float(np.mean(item_means))) if item_means else 'n/a'}")
     lines = [
-        f"{len(table)} rows, {len(counts)} items, draws per item: min {lo}, median {med:g}, max {hi}",
+        f"{_plural(len(table), 'row')}, {_plural(len(counts), 'item')}, "
+        f"draws per item: min {lo}, median {med:g}, max {hi}",
         f"metrics (mean over items): {', '.join(means)}",
     ]
     if table.ignored:
@@ -603,8 +707,20 @@ def _run_name(run: Run) -> str:
     return f"{run.id[:10]} ({run.label})" if run.label else run.id[:10]
 
 
+def _run_names(runs: list[Run], limit: int = 3) -> str:
+    return ", ".join(_run_name(r) for r in runs[:limit]) + (", …" if len(runs) > limit else "")
+
+
+def _repeats_text(repeats: list[tuple[Run, Run]]) -> str:
+    """'2 runs repeat the results table of an earlier run (X = Y, Z = Y)'."""
+    pairs = [f"{_run_name(r)} = {_run_name(first)}" for r, first in repeats]
+    shown = ", ".join(pairs[:3]) + (", …" if len(pairs) > 3 else "")
+    verb = "repeats" if len(repeats) == 1 else "repeat"
+    return f"{_plural(len(repeats), 'run')} {verb} the results table of an earlier run ({shown})"
+
+
 def _nb_label(st: State, nb_id: str | None) -> str:
-    if not nb_id:
+    if not nb_id or not isinstance(nb_id, str):  # not a notebook id: a hand-edited event
         return ""
     nb = st.notebooks.get(nb_id)
     return nb.label if nb else util.short(nb_id)
@@ -612,15 +728,11 @@ def _nb_label(st: State, nb_id: str | None) -> str:
 
 def _nb_long(st: State, nb_id: str | None) -> str:
     label = _nb_label(st, nb_id)
-    return label if not nb_id or label == util.short(nb_id) else f"{label} ({util.short(nb_id)})"
+    return label if not label or label == util.short(nb_id) else f"{label} ({util.short(nb_id)})"
 
 
 def _protocol_tag(protocol: str) -> str:
     return f"protocol {protocol}" if protocol else ""
-
-
-def _when(stamp: str) -> str:
-    return (stamp or "")[:16].replace("T", " ")
 
 
 def _plural(n: int, word: str) -> str:
@@ -631,8 +743,14 @@ def _num(x: float) -> str:
     return f"{x:.4g}"
 
 
-def _score(x: float | None) -> str:
-    return "" if x is None else f"{x:.6g}"
+def _score(x: object) -> str:
+    """A leaderboard score for a table: blank when missing, and as written when it is not a number."""
+    from pseudorca.stats import finite
+
+    if x is None:
+        return ""
+    value = finite(x)
+    return str(x) if value is None else f"{value:.6g}"
 
 
 def _decimals(res: CompareResult) -> int:
@@ -678,3 +796,7 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+def _echo_json(value: Any) -> None:
+    click.echo(json.dumps(_jsonable(value), ensure_ascii=False, indent=1))

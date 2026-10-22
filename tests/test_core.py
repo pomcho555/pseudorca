@@ -250,7 +250,7 @@ def test_blob_ids_must_be_sha256_and_bytes_must_match(store: Store):
     store.append("idea.add", {"id": "evil", "title": "t", "patch": "../../outside/marker.txt"})
     state = Store.at(store.root).state()
     assert state.ideas["evil"].patch is None
-    assert any("invalid patch id" in w for w in state.warnings)
+    assert any("invalid patch=" in w for w in state.warnings)
 
 
 def test_new_events_sort_after_everything_seen_even_with_a_slow_clock(store: Store, monkeypatch):
@@ -321,3 +321,39 @@ def test_llm_settles_a_deterministic_conflict(store: Store):
     _verdict(store, nb, "i", "present", "llm", model="m")
     eff = store.state().effective_verdict(nb, "i")
     assert (eff.status, eff.method) == ("present", "llm")
+
+
+def test_excerpt_keeps_a_wide_character_match_visible():
+    q = 'PROMPT = "あなたは数学の文章題を解きます。手順を短く考えてください。答えだけを書いてください。"'
+    out = util.excerpt(q, q.index("手順"), 40)
+    assert "手順を短く" in out and util.display_width(out) <= 40
+
+
+def test_times_from_many_zones_and_bad_values():
+    assert util.instant("2026-01-05T11:30:00+02:00") > util.instant("2026-01-05T18:29:00+09:00")
+    assert util.instant(None) < util.instant("2026-01-05")
+    assert util.local_time("0001-01-01T00:00:00+05:00")  # no OverflowError
+    assert util.local_time("2026-01-05") == "2026-01-05"
+
+
+def test_event_fields_of_the_wrong_kind_are_dropped_with_a_warning(store: Store):
+    sha = store.put_blob(b"x")
+    store.append("nb.add", {"id": sha, "name": "a.ipynb"})
+    store.append(
+        "sub.upsert", {"id": "1004", "nb": ["x"], "date": None, "public_score": 0.5, "status": {"a": 1}}
+    )
+    store.append("idea.add", {"id": "i", "title": "t", "tags": "not-a-list"})
+    st = Store.at(store.root).state()
+    sub = st.subs["1004"]
+    assert (sub.nb, sub.date, sub.public_score, sub.status) == (None, "", 0.5, "")
+    assert st.ideas["i"].tags == []
+    assert sum("ignored invalid" in w for w in st.warnings) == 3
+
+
+def test_deeply_nested_json_is_not_a_notebook(tmp_path: Path, store: Store):
+    from pseudorca.notebooks import register_file
+
+    deep = tmp_path / "deep.ipynb"
+    deep.write_bytes(b"[" * 100_000 + b"]" * 100_000)
+    with pytest.raises(ValueError, match="not notebook JSON"):
+        register_file(store, deep)

@@ -16,9 +16,17 @@ from pseudorca.commands._common import Ctx, pass_ctx, show_warnings, user_errors
     type=click.Path(dir_okay=False, path_type=Path),
     help="Where to write the HTML (default: .pseudorca/cache/report.html, which git ignores).",
 )
-@click.option("--nb", "nb_refs", multiple=True, metavar="REF", help="Notebooks to show as board columns.")
 @click.option(
-    "-n", "last", type=click.IntRange(1, 100), default=8, show_default=True, help="Latest notebooks to show."
+    "--nb", "nb_refs", multiple=True, metavar="REF", help="A notebook to show as a board column (repeatable)."
+)
+@click.option(
+    "-n",
+    "last",
+    type=click.IntRange(min=0),
+    default=8,
+    show_default=True,
+    metavar="N",
+    help="Latest notebooks to show (0 = all).",
 )
 @click.option("--all", "include_parked", is_flag=True, help="Include parked ideas.")
 @pass_ctx
@@ -32,7 +40,10 @@ def report_cmd(
     store = ctx.store()
     with user_errors():
         state = store.state()
-        notebooks = [state.resolve_nb(r) for r in nb_refs] if nb_refs else state.notebooks_in_order()[-last:]
+        ordered = state.notebooks_in_order()
+        notebooks = (
+            [state.resolve_nb(r) for r in nb_refs] if nb_refs else (ordered[-last:] if last else ordered)
+        )
         try:
             from pseudorca import stats
 

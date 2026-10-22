@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -78,12 +79,37 @@ def local_time(iso: str) -> str:
     except ValueError:
         return iso[:16].replace("T", " ")
     if dt.tzinfo is not None:
-        dt = dt.astimezone()
+        with contextlib.suppress(OverflowError, OSError, ValueError):  # a malformed time near year 1 or 9999
+            dt = dt.astimezone()
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def local_day(iso: str) -> str:
     return local_time(iso)[:10]
+
+
+_EARLIEST = datetime.min.replace(tzinfo=UTC)
+
+
+def instant(iso: object) -> datetime:
+    """A ledger time as an aware datetime, for ordering. No offset means the viewer's local time; anything
+    unparseable sorts first. (Times written in different zones must never be compared as strings.)"""
+    if not isinstance(iso, str) or not iso:
+        return _EARLIEST
+    try:
+        dt = datetime.fromisoformat(iso)
+        return dt if dt.tzinfo is not None else dt.astimezone()
+    except (OverflowError, OSError, ValueError):
+        return _EARLIEST
+
+
+INSTALL_SOURCE = "git+https://github.com/pomcho555/pseudorca"
+
+
+def install_hint(extra: str) -> str:
+    """How to add an optional extra, for both pip and uv tool installs."""
+    spec = f'"pseudorca[{extra}] @ {INSTALL_SOURCE}"'
+    return f"add the {extra} extra: pip install {spec}, or uv tool install --reinstall {spec}"
 
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -134,7 +160,16 @@ def excerpt(text: str, col: int | None, width: int, match_len: int = 0) -> str:
     line = " ".join(text.split()) if col is None else text
     if col is None or display_width(line) <= width:
         return clip(" ".join(line.split()), width)
-    start = max(0, min(col - width // 4, len(line) - width + 2))
+    # start about a quarter of the width before the match, counted in display columns (wide characters
+    # count twice), then move back while the rest of the line still fits
+    start, used = max(0, min(col, len(line))), 0
+    while start > 0 and used + _char_width(line[start - 1]) <= width // 4:
+        start -= 1
+        used += _char_width(line[start])
+    tail = display_width(line[start:])
+    while start > 0 and tail + _char_width(line[start - 1]) <= width - 1:
+        start -= 1
+        tail += _char_width(line[start])
     window = line[start:]
     out = clip(" ".join(window.split()), width - (1 if start else 0))
     return ("…" + out) if start else out

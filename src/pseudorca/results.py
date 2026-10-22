@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import numpy as np
 
+    from pseudorca.model import Run
+
 FORMATS = ("csv", "jsonl")
 ITEM, DRAW = "item", "draw"
 DEFAULT_METRIC = "score"
@@ -94,10 +96,28 @@ def per_item(table: Table, metric: str) -> dict[str, np.ndarray]:
     return out
 
 
+def distinct_runs(runs: Sequence[Run]) -> tuple[list[Run], list[tuple[Run, Run]]]:
+    """Each results table once: (the first run of each table, [(a later run, the earlier run it repeats)]).
+
+    Two runs share a table when the same file was imported twice, for example by two teammates before they
+    pulled. Pooling both would count every draw twice: a narrower interval, and an A/A check that compares
+    a table with itself. Pass runs oldest first.
+    """
+    first: dict[str, Run] = {}
+    repeats: list[tuple[Run, Run]] = []
+    for run in runs:
+        earlier = first.get(run.results)
+        if earlier is None:
+            first[run.results] = run
+        else:
+            repeats.append((run, earlier))
+    return list(first.values()), repeats
+
+
 def pool(tables: Sequence[Table]) -> Table:
     """Several runs' tables as one: rows in run order, draws renumbered 0, 1, 2... per item across runs.
 
-    A metric missing from a run is NaN in that run's rows.
+    A metric missing from a run is NaN in that run's rows. Pass each table once (see `distinct_runs`).
     """
     import numpy as np
 

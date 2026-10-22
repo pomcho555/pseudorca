@@ -12,7 +12,7 @@ import re
 import shlex
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import IO, Any, NoReturn
 
@@ -31,13 +31,16 @@ from pseudorca.commands._common import (
 )
 from pseudorca.model import IDEA_STATUSES, NOTEBOOK_FIELDS, Effective, Idea, Notebook, State, Submission
 from pseudorca.notebooks import register_file
-from pseudorca.store import EVENT_TYPES, Event, Store, StoreError
+from pseudorca.store import EVENT_TYPES, STORE_DIR, Event, Store, StoreError
 
 SHOW_LATEST = 10  # notebooks listed by `idea show`
 MAX_GREP_HITS = 500
+EVIDENCE_WIDTH = 50  # display columns of the EVIDENCE cells in `idea show` and `nb show`
 _KERNEL_RE = re.compile(r"[^/\s]+/[^/\s]+")
 _HUNK_RE = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 _ID_HELP = "1-64 letters, digits, '.', '_' or '-', starting with a letter or digit"
+_FP_HELP = "text (may span lines), re:REGEX, !text or !re:REGEX (the last two must be absent)"
+_EARLIEST = datetime.min.replace(tzinfo=UTC)
 
 # ----- small helpers -------------------------------------------------------------------------------
 
@@ -46,12 +49,32 @@ def _echo_json(obj: Any) -> None:
     click.echo(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
-def _day(iso: str) -> str:
-    return iso[:10] if iso else "-"
-
-
 def _minute(iso: str) -> str:
-    return iso[:16].replace("T", " ") if iso else "-"
+    """A ledger time as "YYYY-MM-DD HH:MM" in the viewer's time zone; a bare date stays a date."""
+    if not iso:
+        return "-"
+    try:
+        return util.local_time(iso)
+    except (OverflowError, OSError, ValueError):  # near year 1 or 9999 the conversion leaves the range
+        return str(iso)[:16].replace("T", " ")
+
+
+def _day(iso: str) -> str:
+    """A ledger time as the viewer's local date."""
+    return _minute(iso)[:10]
+
+
+def _instant(iso: object) -> datetime:
+    """A ledger time as an aware datetime, so times written with different UTC offsets compare correctly.
+
+    A time without an offset (or a bare date) is taken as the viewer's local time; what does not parse
+    sorts first.
+    """
+    try:
+        dt = datetime.fromisoformat(str(iso or "").strip())
+        return dt if dt.tzinfo is not None else dt.astimezone()
+    except (ValueError, OverflowError, OSError):
+        return _EARLIEST
 
 
 def _csv(items: Iterable[str]) -> str:
@@ -86,11 +109,18 @@ def _clean(values: Iterable[str], what: str) -> list[str]:
 
 
 def _kv(pairs: list[tuple[str, Any]]) -> str:
-    """Aligned `key  value` lines. Lists and multi-line strings continue on indented lines."""
+    """Aligned `key  value` lines. Lists and multi-line strings continue on indented lines; a list item
+    that spans lines (a multi-line fingerprint) continues two columns further in."""
     width = max(len(k) for k, _ in pairs)
     lines: list[str] = []
     for key, value in pairs:
-        items = [str(v) for v in value] if isinstance(value, list) else str(value).splitlines()
+        if isinstance(value, list):
+            items = []
+            for v in value:
+                first, *rest = str(v).splitlines() or [""]
+                items += [first, *("  " + line for line in rest)]
+        else:
+            items = str(value).splitlines()
         items = items or ["-"]
         lines.append(f"{key:<{width}}  {items[0]}")
         lines.extend(" " * (width + 2) + item for item in items[1:])
@@ -139,19 +169,27 @@ def _verdict_text(eff: Effective | None, claimed: bool) -> str:
 
 
 def _when(eff: Effective | None) -> str:
-    return _minute(max(r.time for r in eff.records)) if eff and eff.records else "-"
+    """When the newest record behind a verdict was made (compared as instants, shown in local time)."""
+    if eff is None or not eff.records:
+        return "-"
+    return _minute(max(eff.records, key=lambda r: _instant(r.time)).time)
 
 
-def _evidence(eff: Effective | None, width: int = 50) -> str:
-    """The first evidence quote of a verdict (else its note), on one clipped line."""
+def _evidence(eff: Effective | None, width: int = EVIDENCE_WIDTH) -> str:
+    """The first evidence quote of a verdict (else its note) on one line, cut to `width` around the match
+    when the evidence says where the match starts (`col`), else from the start."""
     if eff is None:
         return "-"
-    for rec in eff.records:
+    # the records behind the verdict first (an LLM that settled a conflict, not the losing method)
+    backing = [r for r in eff.records if r.status == eff.status] or eff.records
+    for rec in backing:
         for ev in rec.evidence:
             quote = str(ev.get("quote") or "") if isinstance(ev, dict) else ""
             if quote.strip():
-                return util.clip(" ".join(quote.split()), width)
-    notes = [r.note for r in eff.records if r.note.strip()]
+                col = ev.get("col")
+                usable = isinstance(col, int) and not isinstance(col, bool) and 0 <= col < len(quote)
+                return util.excerpt(quote, col if usable else None, width)
+    notes = [r.note for r in backing if r.note.strip()]
     return util.clip(" ".join(notes[0].split()), width) if notes else "-"
 
 
@@ -163,7 +201,8 @@ def _verdict_json(eff: Effective | None) -> dict[str, Any] | None:
 
 
 def _check_fingerprint(fp: str) -> str:
-    """Validate a fingerprint: `text`, `re:<regex>`, `!text` or `!re:<regex>`."""
+    """Validate a fingerprint: `text`, `re:<regex>`, `!text` or `!re:<regex>`. Each may span lines (the
+    audit then matches the text as consecutive lines, or searches the regex over whole files)."""
     body = fp[1:] if fp.startswith("!") else fp
     pattern = body[3:] if body.startswith("re:") else None
     if not (body if pattern is None else pattern).strip():
@@ -337,8 +376,8 @@ def _value_text(key: str, value: Any, st: State) -> str:
         return _nb_label(st, value)
     if key in ("patch", "results"):
         return util.short(str(value))
-    if isinstance(value, list):
-        return ",".join(str(v) for v in value) or "[]"
+    if isinstance(value, list):  # items on one line, so a multi-line fingerprint does not break the summary
+        return ",".join(" ".join(str(v).split()) for v in value) or "[]"
     if isinstance(value, dict):
         return util.clip(json.dumps(value, ensure_ascii=False), 40)
     text = " ".join(str(value).split())
@@ -384,32 +423,58 @@ def _in_git_work_tree(directory: Path) -> bool:
     return any((d / ".git").exists() for d in (directory, *directory.parents))
 
 
+def _has_entries(directory: Path) -> bool:
+    try:
+        return directory.is_dir() and any(directory.iterdir())
+    except OSError:
+        return False
+
+
+_STORE_PARTS = {  # what `init` can create, in the order it lists them
+    "config.toml": "settings: commit it, and never put secrets in it",
+    "events/": "the ledger itself, one JSON file per change",
+    "blobs/": "stored notebooks, patches and result tables",
+    "cache/": "local only, ignored by git",
+    ".gitignore": "keeps cache/ out of git",
+    ".gitattributes": "stops git from converting blob bytes (line endings)",
+}
+
+
 @click.command("init")
 @click.argument(
     "directory", metavar="[DIR]", required=False, type=click.Path(file_okay=False, path_type=Path)
 )
-@click.option("--name", default="", help="Name of the ledger (default: the directory's name).")
+@click.option("--name", default="", metavar="NAME", help="Ledger name (default: the directory's name).")
 @click.option("--competition", default="", metavar="SLUG", help="Kaggle competition slug, for `kaggle sync`.")
 def init_cmd(directory: Path | None, name: str, competition: str) -> None:
-    """Create a ledger (.pseudorca/).
+    """Create a ledger (.pseudorca/), or complete one that misses some of its parts.
 
     It goes in DIR, by default the current directory: the top of your team's private git repository.
+    Existing files, such as a committed config.toml, are never overwritten.
     """
     target = Path(directory or Path.cwd()).expanduser().resolve()
+    existed = _has_entries(target / STORE_DIR)
     with user_errors():
         store = Store.init(target, name=name, competition=competition)
     if not _in_git_work_tree(target):
         warn(
             f"{target} is not inside a git repository; create one (git init) so the team can share the ledger"
         )
-    click.echo(f"created {store.root}")
-    for path, what in (
-        ("config.toml", "settings: commit it, and never put secrets in it"),
-        ("events/", "the ledger itself, one JSON file per change"),
-        ("blobs/", "stored notebooks, patches and result tables"),
-        ("cache/", "local only, ignored by git"),
-    ):
-        click.echo(f"  {path:<12} {what}")
+    if existed:
+        click.echo(f"completed {store.root}, keeping its existing files; added:")
+    else:
+        click.echo(f"created {store.root}")
+    order = list(_STORE_PARTS)
+    created = sorted(store.created, key=lambda p: order.index(p) if p in order else len(order))
+    width = max((len(p) for p in created), default=0)
+    for path in created:
+        click.echo(f"  {path:<{width}}  {_STORE_PARTS.get(path, '')}".rstrip())
+    unused = [opt for opt, value in (("--name", name), ("--competition", competition)) if value]
+    if unused and "config.toml" not in store.created:
+        warn(
+            f"{' and '.join(unused)} {'was' if len(unused) == 1 else 'were'} not applied: the existing "
+            "config.toml was kept; edit it if needed"
+        )
     cd = "" if target == Path.cwd().resolve() else f"cd {shlex.quote(str(target))} && "
     click.echo("\nnext steps:")
     click.echo(f'  {cd}git add .pseudorca && git commit -m "Add Pseudorca ledger"')
@@ -435,7 +500,7 @@ def idea_group() -> None:
     metavar="PATH",
     help="Read the description from a file (- for stdin).",
 )
-@click.option("--owner", help="Who drives it (default: you).")
+@click.option("--owner", metavar="NAME", help="Who drives it (default: you).")
 @click.option("--status", type=click.Choice(IDEA_STATUSES), default="idea", show_default=True)
 @click.option("--tag", "tags", multiple=True, metavar="TAG", help="A tag (repeatable).")
 @click.option("--link", "links", multiple=True, metavar="URL", help="A related link (repeatable).")
@@ -443,9 +508,8 @@ def idea_group() -> None:
     "--fingerprint",
     "fingerprints",
     multiple=True,
-    metavar="F",
-    help="Text that shows the idea is in a notebook: `text`, `re:<regex>`, `!text` or `!re:<regex>` "
-    "(must be absent). Repeatable.",
+    metavar="FINGERPRINT",
+    help=f"Code that shows the idea is in a notebook: {_FP_HELP}. Repeatable.",
 )
 @click.option(
     "--patch",
@@ -505,14 +569,24 @@ def idea_add(
     metavar="PATH",
     help="Read the description from a file (- for stdin).",
 )
-@click.option("--owner")
-@click.option("--status", type=click.Choice(IDEA_STATUSES))
-@click.option("--add-tag", multiple=True, metavar="TAG")
-@click.option("--remove-tag", multiple=True, metavar="TAG")
-@click.option("--add-link", multiple=True, metavar="URL")
-@click.option("--remove-link", multiple=True, metavar="URL")
-@click.option("--add-fingerprint", multiple=True, metavar="F")
-@click.option("--remove-fingerprint", multiple=True, metavar="F")
+@click.option("--owner", metavar="NAME", help="New owner.")
+@click.option("--status", type=click.Choice(IDEA_STATUSES), help="New status.")
+@click.option("--add-tag", multiple=True, metavar="TAG", help="Add a tag (repeatable).")
+@click.option("--remove-tag", multiple=True, metavar="TAG", help="Remove a tag (repeatable).")
+@click.option("--add-link", multiple=True, metavar="URL", help="Add a link (repeatable).")
+@click.option("--remove-link", multiple=True, metavar="URL", help="Remove a link (repeatable).")
+@click.option(
+    "--add-fingerprint",
+    multiple=True,
+    metavar="FINGERPRINT",
+    help=f"Add a fingerprint: {_FP_HELP}. Repeatable.",
+)
+@click.option(
+    "--remove-fingerprint",
+    multiple=True,
+    metavar="FINGERPRINT",
+    help="Remove a fingerprint, given exactly as it was added (repeatable).",
+)
 @click.option(
     "--patch",
     "patch_file",
@@ -596,8 +670,8 @@ def idea_update(
     type=click.Choice(IDEA_STATUSES),
     help="Only ideas with this status (repeatable).",
 )
-@click.option("--tag", help="Only ideas with this tag.")
-@click.option("--owner", help="Only ideas with this owner.")
+@click.option("--tag", metavar="TAG", help="Only ideas with this tag.")
+@click.option("--owner", metavar="NAME", help="Only ideas with this owner.")
 @click.option("--all", "show_all", is_flag=True, help="Include parked ideas.")
 @click.option("--json", "as_json", is_flag=True, help="Print JSON.")
 @pass_ctx
@@ -701,15 +775,18 @@ def _check_kernel(kernel: str | None) -> str | None:
 
 @nb_group.command("add")
 @click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--name", help="Name to refer to it by (default: the file name).")
+@click.option("--name", metavar="NAME", help="Name to refer to it by (default: the file name).")
 @click.option("--parent", metavar="REF", help="The notebook it was derived from.")
 @click.option("--applies", multiple=True, metavar="ID", help="An idea its author says is in it (repeatable).")
 @click.option("--tag", "tags", multiple=True, metavar="TAG", help="A tag such as `candidate` (repeatable).")
 @click.option("--kernel", metavar="OWNER/SLUG", help="Its Kaggle kernel.")
 @click.option("--version", help="Its Kaggle kernel version.")
-@click.option("--note", metavar="TEXT")
+@click.option("--note", metavar="TEXT", help="Free text.")
 @click.option(
-    "--no-store", is_flag=True, help="Record its hash and path only; do not copy the bytes into the store."
+    "--no-store",
+    is_flag=True,
+    help="Record only its hash and path, not its bytes. The file must be inside the repository: audits "
+    "read it there while it keeps this content.",
 )
 @pass_ctx
 def nb_add(
@@ -726,7 +803,8 @@ def nb_add(
 ) -> None:
     """Register a notebook (.ipynb) or script (.py) version.
 
-    Adding the same bytes again merges the new metadata into the existing entry.
+    Adding the same bytes again merges the new metadata into the existing entry (and restores its stored
+    bytes if they went missing). An .ipynb must be notebook JSON, not a Git LFS pointer.
     """
     store = ctx.store()
     st = store.state()
@@ -740,6 +818,7 @@ def nb_add(
     sha = util.sha256_file(file)
     before = st.notebooks.get(sha)
     old = asdict(before) if before else None
+    had_bytes = store.has_blob(sha)
     with user_errors():
         nb, created = register_file(
             store,
@@ -756,23 +835,25 @@ def nb_add(
     ref = f"{nb.label} {util.short(nb.id)}"
     if created:
         click.echo(f"registered {ref}")
-        if no_store:
-            click.echo(f"  bytes not stored: audits will read {nb.path} while it keeps this content")
+        if no_store:  # register_file refuses a file outside the repository: audits could not find it again
+            where = f"{nb.path} in the repository"
+            click.echo(f"  bytes not stored: audits read {where} while it keeps this content")
         return
     if name and name.strip() != nb.name:
         warn(
             f"kept the name {nb.name!r}; rename it with `pseudorca nb update {util.short(nb.id)} --name ...`"
         )
     new = asdict(nb)
-    changed = [k for k in NOTEBOOK_FIELDS if old is not None and old[k] != new[k]]
-    if changed:
-        click.echo(f"already registered as {ref}; updated {', '.join(changed)}")
-    else:
-        click.echo(f"already registered as {ref} (no changes)")
+    changed = [k for k in NOTEBOOK_FIELDS if k != "stored" and old is not None and old[k] != new[k]]
+    done = [f"updated {', '.join(changed)}"] if changed else []
+    if not no_store and not had_bytes and store.has_blob(nb.id):  # register_file stored or restored them
+        missing = old is not None and old["stored"]
+        done.append("stored its bytes, which were missing" if missing else "stored its bytes")
+    click.echo(f"already registered as {ref}" + (f"; {'; '.join(done)}" if done else " (no changes)"))
 
 
 @nb_group.command("list")
-@click.option("--tag", help="Only notebooks with this tag.")
+@click.option("--tag", metavar="TAG", help="Only notebooks with this tag.")
 @click.option(
     "-n",
     "count",
@@ -901,16 +982,18 @@ def _parent_loop(st: State, nb_id: str, parent_id: str) -> bool:
 
 @nb_group.command("update")
 @click.argument("ref", metavar="REF")
-@click.option("--name", help="New name.")
+@click.option("--name", metavar="NAME", help="New name.")
 @click.option("--parent", metavar="REF", help="The notebook it was derived from.")
 @click.option("--no-parent", is_flag=True, help="Remove the parent.")
-@click.option("--add-applies", multiple=True, metavar="ID", help="An idea its author says is in it.")
-@click.option("--remove-applies", multiple=True, metavar="ID")
-@click.option("--add-tag", multiple=True, metavar="TAG")
-@click.option("--remove-tag", multiple=True, metavar="TAG")
+@click.option(
+    "--add-applies", multiple=True, metavar="ID", help="An idea its author says is in it (repeatable)."
+)
+@click.option("--remove-applies", multiple=True, metavar="ID", help="Remove a claimed idea (repeatable).")
+@click.option("--add-tag", multiple=True, metavar="TAG", help="Add a tag (repeatable).")
+@click.option("--remove-tag", multiple=True, metavar="TAG", help="Remove a tag (repeatable).")
 @click.option("--kernel", metavar="OWNER/SLUG", help='Its Kaggle kernel ("" clears it).')
 @click.option("--version", help="Its Kaggle kernel version.")
-@click.option("--note", metavar="TEXT")
+@click.option("--note", metavar="TEXT", help="Free text.")
 @pass_ctx
 def nb_update(
     ctx: Ctx,
@@ -1033,11 +1116,11 @@ def nb_tree(ctx: Ctx, ref: str, needle: str | None, glob: str, ignore_case: bool
 @click.option(
     "-n",
     "count",
-    type=click.IntRange(min=1),
+    type=click.IntRange(min=0),
     default=5,
     show_default=True,
     metavar="N",
-    help="Show the latest N notebooks.",
+    help="Show the latest N notebooks (0 = all).",
 )
 @click.option(
     "--status",
@@ -1046,7 +1129,7 @@ def nb_tree(ctx: Ctx, ref: str, needle: str | None, glob: str, ignore_case: bool
     type=click.Choice(IDEA_STATUSES),
     help="Only ideas with this status (repeatable).",
 )
-@click.option("--tag", help="Only ideas with this tag.")
+@click.option("--tag", metavar="TAG", help="Only ideas with this tag.")
 @click.option("--all", "show_all", is_flag=True, help="Include parked ideas.")
 @click.option("--json", "as_json", is_flag=True, help="Print JSON.")
 @pass_ctx
@@ -1069,7 +1152,8 @@ def status_cmd(
         with user_errors():
             cols = list({nb.id: nb for nb in (st.resolve_nb(r) for r in nb_refs)}.values())
     else:
-        cols = st.notebooks_in_order()[-count:]
+        ordered = st.notebooks_in_order()
+        cols = ordered[-count:] if count else ordered
     ideas, hidden = _select_ideas(st, statuses, tag, None, show_all)
     grid = [[(st.effective_verdict(nb.id, idea.id), idea.id in nb.applies) for nb in cols] for idea in ideas]
     if as_json:
@@ -1119,8 +1203,9 @@ def status_cmd(
 # ----- sub -----------------------------------------------------------------------------------------
 
 
-def _sub_order(s: Submission) -> tuple[str, int, str]:
-    return (str(s.date or ""), int(s.id) if s.id.isascii() and s.id.isdigit() else -1, s.id)
+def _sub_order(s: Submission) -> tuple[datetime, int, str]:
+    """By date (as instants: Kaggle writes UTC, `sub add` a local date), then by numeric id."""
+    return (_instant(s.date), int(s.id) if s.id.isascii() and s.id.isdigit() else -1, s.id)
 
 
 @click.group("sub")
@@ -1133,9 +1218,9 @@ def sub_group() -> None:
 @click.option("--nb", "nb_ref", metavar="REF", help="The notebook it was made from.")
 @click.option("--score", type=float, help="Public leaderboard score.")
 @click.option("--private-score", type=float, help="Private leaderboard score.")
-@click.option("--desc", "description", metavar="TEXT")
+@click.option("--desc", "description", metavar="TEXT", help="Its description.")
 @click.option("--date", "when", metavar="DATE", help="When it was submitted, YYYY-MM-DD (default: today).")
-@click.option("--status", help="Submission status, e.g. complete or error.")
+@click.option("--status", metavar="TEXT", help="Its Kaggle status (free text): complete, pending or error.")
 @click.option("--competition", metavar="SLUG", help="Default: [store].competition in config.toml.")
 @pass_ctx
 def sub_add(
@@ -1247,11 +1332,11 @@ def sub_list(ctx: Ctx, count: int, nb_ref: str | None, as_json: bool) -> None:
 
 
 @sub_group.command("link")
-@click.argument("sub_id")
-@click.argument("nb_ref")
+@click.argument("sub_id", metavar="ID")
+@click.argument("nb_ref", metavar="REF")
 @pass_ctx
 def sub_link(ctx: Ctx, sub_id: str, nb_ref: str) -> None:
-    """Link submission SUB_ID to the notebook NB_REF it was made from."""
+    """Link submission ID to the notebook REF it was made from."""
     store = ctx.store()
     st = store.state()
     sub = st.subs.get(sub_id)
@@ -1287,9 +1372,10 @@ def sub_link(ctx: Ctx, sub_id: str, nb_ref: str) -> None:
     help="Only this event type (e.g. idea.update) or family (e.g. idea).",
 )
 @click.option("--actor", metavar="NAME", help="Only events by this author.")
+@click.option("--json", "as_json", is_flag=True, help="Print JSON (the events as stored, plus a summary).")
 @pass_ctx
-def log_cmd(ctx: Ctx, count: int, event_type: str | None, actor: str | None) -> None:
-    """Recent changes to the ledger, newest first."""
+def log_cmd(ctx: Ctx, count: int, event_type: str | None, actor: str | None, as_json: bool) -> None:
+    """Recent changes to the ledger, newest first. Times are in your time zone."""
     store = ctx.store()
     st = store.state()
     events = store.events()
@@ -1301,6 +1387,9 @@ def log_cmd(ctx: Ctx, count: int, event_type: str | None, actor: str | None) -> 
     if actor:
         events = [e for e in events if e.actor == actor]
     events = events[::-1][:count] if count else events[::-1]
+    if as_json:
+        _echo_json([{**e.to_json(), "summary": _event_summary(e, st)} for e in events])
+        return
     if not events:
         click.echo("no events")
         return

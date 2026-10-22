@@ -32,8 +32,8 @@ def test_fingerprint_all_positives_found_is_present():
         "forbidden_found": [],
     }
     assert f.evidence == [
-        Evidence("cells/cell_000.py", 3, "temperature = 0.2"),
-        Evidence("files/src/agent.py", 1, "SYSTEM = 'Be brief.'"),
+        Evidence("cells/cell_000.py", 3, "temperature = 0.2", col=0),
+        Evidence("files/src/agent.py", 1, "SYSTEM = 'Be brief.'", col=0),
     ]
 
 
@@ -53,7 +53,7 @@ def test_fingerprint_negatives():
     assert (f.status, f.note) == ("present", "0/1 forbidden found")
     f = fingerprint.check(["!DEBUG = False"], t)
     assert f.status == "absent" and f.detail["forbidden_found"] == ["!DEBUG = False"]
-    assert f.evidence == [Evidence("files/src/agent.py", 2, "DEBUG = False")]
+    assert f.evidence == [Evidence("files/src/agent.py", 2, "DEBUG = False", col=0)]
     assert fingerprint.check(["!DEBUG = False", "!re:TRACE"], t).status == "partial"
     # every positive found but a forbidden one too: partial
     f = fingerprint.check(["temperature = 0.2", "!re:DEBUG\\s*="], t)
@@ -287,8 +287,8 @@ def test_patch_partial_and_drifted():
 
 def test_patch_matching_ignores_whitespace_differences():
     inlined = (
-        "class Agent:\n"
-        '    SYSTEM  =  "Be brief. Answer with one number."\n'
+        "import  os\n"
+        '\tSYSTEM  =  "Be brief. Answer with one number."\n'
         "    def answer(self, q):\n"
         "\t\tprompt = SYSTEM + q\n"
         "\t\treturn client.generate(prompt,  temperature=0.2,  top_p=0.9)\n"
@@ -296,6 +296,10 @@ def test_patch_matching_ignores_whitespace_differences():
     f = patch.check(AGENT_DIFF, make_tree({"cells/cell_003.py": inlined}))
     assert f.status == "present"
     assert [(e.path, e.line) for e in f.evidence] == [("cells/cell_003.py", 2), ("cells/cell_003.py", 5)]
+    # the same lines without the context they were changed in: no longer evidence of this patch
+    moved = inlined.replace("import  os\n", "class Agent:\n")
+    f = patch.check(AGENT_DIFF, make_tree({"cells/cell_003.py": moved}))
+    assert f.status == "partial" and f.detail["files"]["src/agent.py"]["hunks"] == ["unknown", "applied"]
 
 
 def test_patch_ignores_trivial_lines():
@@ -390,10 +394,18 @@ def test_patch_removal_only_and_addition_only_hunks():
         "     prompt = SYSTEM + q\n+    prompt = prompt.strip()[:4000]\n"
         "     return client.generate(prompt, temperature=0.2)\n"
     )
-    assert patch.check(addition, removed).status == "absent"  # context found, addition missing
+    assert patch.check(addition, removed).status == "absent"  # its place found, without the addition
     assert patch.check(addition, make_tree({"cells/cell_000.py": "import os\n"})).status == "unknown"
-    with_it = make_tree({"cells/cell_000.py": "prompt = prompt.strip()[:4000]\n"})
+    with_it = make_tree(
+        {
+            "cells/cell_000.py": "prompt = SYSTEM + q\nprompt = prompt.strip()[:4000]\n"
+            "return client.generate(prompt, temperature=0.2)\n"
+        }
+    )
     assert patch.check(addition, with_it).status == "present"
+    # the added line alone, without the context it was added in, is not evidence of this hunk
+    alone = make_tree({"cells/cell_000.py": "prompt = prompt.strip()[:4000]\n"})
+    assert patch.check(addition, alone).status == "unknown"
 
 
 def test_patch_empty_or_unparsable_diff_and_empty_tree():
@@ -407,3 +419,193 @@ def test_patch_empty_or_unparsable_diff_and_empty_tree():
         assert (f.status, f.method) == ("unknown", "patch") and "no hunks" in f.note
     f = patch.check(AGENT_DIFF, Tree())
     assert f.status == "unknown" and "no code" in f.note
+
+
+def test_patch_with_a_byte_order_mark_still_has_its_first_file_header():
+    plain = "﻿" + CONFIG_DIFF[CONFIG_DIFF.index("--- ") :]  # starts with the "---" line
+    (f,) = patch.parse(plain)
+    assert f.path == "src/config.py" and len(f.hunks) == 1
+    tree = make_tree({"files/src/config.py": "BATCH = 16\nTIMEOUT = 30\nRETRIES = 3\n"})
+    assert patch.check(plain, tree).detail["files"] == {
+        "src/config.py": {
+            "hunks": ["applied"],
+            "found_in": ["files/src/config.py"],
+            "new_file": False,
+            "deleted": False,
+        }
+    }
+
+
+# ----- patch matching: a change is judged at its place -----------------------------------------------
+
+STRIP_DIFF = """--- a/agent.py
++++ b/agent.py
+@@ -6,2 +6,3 @@ def solve(llm, prompt):
+     out = llm.generate(prompt)
++    out = out.strip()
+     return parse(out)
+"""
+HELPER = "def clean(out):\n    out = out.strip()\n    return out\n\n\n"
+SOLVE = "def solve(llm, prompt):\n    out = llm.generate(prompt)\n    return parse(out)\n"
+
+
+def test_an_added_line_found_away_from_its_context_is_not_applied():
+    # the added line exists in an unrelated helper, and solve() is unpatched: the hunk is reverted
+    f = patch.check(STRIP_DIFF, make_tree({"cells/cell_000.py": HELPER + SOLVE}))
+    assert f.status == "absent" and f.detail["files"]["agent.py"]["hunks"] == ["reverted"]
+    # solve() rewritten (its context is gone) while the helper still has the line: nothing is known
+    drifted = HELPER + "def solve(llm, prompt):\n    return parse(llm.generate(prompt)[0])\n"
+    assert patch.check(STRIP_DIFF, make_tree({"cells/cell_000.py": drifted})).status == "unknown"
+    # patched: the evidence is the line inside solve(), not the helper's
+    patched = HELPER + SOLVE.replace("(prompt)\n", "(prompt)\n    out = out.strip()\n")
+    f = patch.check(STRIP_DIFF, make_tree({"cells/cell_000.py": patched}))
+    assert f.status == "present" and f.evidence == [Evidence("cells/cell_000.py", 8, "out = out.strip()")]
+    # the same holds after the context line: a block anchored only below is applied too
+    below = "def solve(llm, prompt):\n    out = llm.generate(prompt, n=2)[0]\n    out = out.strip()\n"
+    below += "    return parse(out)\n"
+    assert patch.check(STRIP_DIFF, make_tree({"cells/cell_000.py": below})).status == "present"
+
+
+def test_reverted_needs_the_old_side_in_place():
+    # (a) an add-only hunk applied, then reformatted: unknown, not reverted
+    quotes = (
+        "--- a/agent.py\n+++ b/agent.py\n@@ -1,3 +1,4 @@\n def build(prompt):\n"
+        "     prompt = prompt.strip()\n+    prompt = prompt.replace('\\t', ' ')\n     return prompt\n"
+    )
+    reformatted = (
+        'def build(prompt):\n    prompt = prompt.strip()\n    prompt = prompt.replace("\\t", " ")\n'
+        "    return prompt\n"
+    )
+    assert patch.check(quotes, make_tree({"cells/cell_000.py": reformatted})).status == "unknown"
+    unpatched = "def build(prompt):\n    prompt = prompt.strip()\n    return prompt\n"
+    assert patch.check(quotes, make_tree({"cells/cell_000.py": unpatched})).status == "absent"
+
+    # (b) a removal applied, while the removed line still exists in another function: applied
+    removal = (
+        "--- a/agent.py\n+++ b/agent.py\n@@ -1,4 +1,3 @@\n def answer(q):\n     out = generate(q)\n"
+        "-    print(out)\n     return out\n"
+    )
+    other = "def debug(out):\n    print(out)\n\n\ndef answer(q):\n    out = generate(q)\n    return out\n"
+    f = patch.check(removal, make_tree({"cells/cell_000.py": other}))
+    assert f.status == "present", f.note
+    kept = "def answer(q):\n    out = generate(q)\n    print(out)\n    return out\n"
+    f = patch.check(removal, make_tree({"cells/cell_000.py": kept}))
+    assert f.status == "absent" and f.evidence == [Evidence("cells/cell_000.py", 3, "print(out)")]
+
+
+ANSWER_PY = (
+    "import re\n\n"
+    'ANSWER_RE = re.compile(r"Answer:\\s*(-?\\d+)")\n\n\n'
+    "def extract_answer(text):\n"
+    "    match = ANSWER_RE.search(text)\n"
+    "    if match is None:\n"
+    "        return None\n"
+    "    return int(match.group(1))\n"
+)
+ANSWER_DIFF = "--- /dev/null\n+++ b/src/answer.py\n@@ -0,0 +1,10 @@\n" + "".join(
+    "+" + line + "\n" for line in ANSWER_PY.splitlines()
+)
+
+
+def test_a_new_file_is_judged_by_how_much_of_it_is_found():
+    assert patch.check(ANSWER_DIFF, make_tree({"cells/cell_001.py": ANSWER_PY})).status == "present"
+    # (c) inlined in a cell, then one line edited: most of it is there, so not absent
+    edited = ANSWER_PY.replace("int(match", "float(match")
+    f = patch.check(ANSWER_DIFF, make_tree({"cells/cell_001.py": edited}))
+    assert f.status == "unknown" and f.detail["files"]["src/answer.py"]["lines_found"] == [6, 7]
+    # not there at all, apart from a common import: absent
+    f = patch.check(ANSWER_DIFF, make_tree({"cells/cell_000.py": "import re\nimport os\n"}))
+    assert f.status == "absent" and f.detail["files"]["src/answer.py"]["lines_found"] == [1, 7]
+    # a deleted file inlined elsewhere with an edit is not "deleted" either
+    deleted = "--- a/src/answer.py\n+++ /dev/null\n@@ -1,10 +0,0 @@\n" + "".join(
+        "-" + line + "\n" for line in ANSWER_PY.splitlines()
+    )
+    assert patch.check(deleted, make_tree({"cells/cell_001.py": edited})).status == "unknown"
+    assert patch.check(deleted, make_tree({"cells/cell_000.py": "import re\n"})).status == "present"
+
+
+def test_changes_at_the_start_or_end_of_a_file_use_the_file_boundary():
+    top = "--- a/agent.py\n+++ b/agent.py\n@@ -1,2 +1,3 @@\n+import json\n import os\n import re\n"
+    assert patch.check(top, make_tree({"files/agent.py": "import json\nimport os\nimport re\n"})).status == (
+        "present"
+    )
+    assert patch.check(top, make_tree({"files/agent.py": "import os\nimport re\n"})).status == "absent"
+    # "import os" further down a file is not the place this hunk changes
+    assert patch.check(top, make_tree({"files/agent.py": "x = 1\nimport os\nimport re\n"})).status == (
+        "unknown"
+    )
+    end = "--- a/agent.py\n+++ b/agent.py\n@@ -1,2 +1 @@\n x = load()\n-print(x)\n"
+    assert patch.check(end, make_tree({"files/agent.py": "x = load()\n\n"})).status == "present"
+    assert patch.check(end, make_tree({"files/agent.py": "x = load()\nprint(x)\n"})).status == "absent"
+    assert patch.check(end, make_tree({"files/agent.py": "x = load()\nrun(x)\n"})).status == "unknown"
+
+
+def test_a_hunk_with_two_changes_needs_both_in_place():
+    diff = (
+        "--- a/config.py\n+++ b/config.py\n@@ -1,5 +1,5 @@\n-BATCH = 8\n+BATCH = 16\n TIMEOUT = 30\n"
+        "-RETRIES = 1\n+RETRIES = 3\n VERBOSE = False\n"
+    )
+    both = make_tree({"files/config.py": "BATCH = 16\nTIMEOUT = 30\nRETRIES = 3\nVERBOSE = False\n"})
+    assert patch.check(diff, both).status == "present"
+    neither = make_tree({"files/config.py": "BATCH = 8\nTIMEOUT = 30\nRETRIES = 1\nVERBOSE = False\n"})
+    assert patch.check(diff, neither).status == "absent"
+    half = make_tree({"files/config.py": "BATCH = 16\nTIMEOUT = 30\nRETRIES = 1\nVERBOSE = False\n"})
+    f = patch.check(diff, half)
+    assert f.status == "unknown" and f.detail["unknown"] == 1
+
+
+# ----- multi-line fingerprints and match columns ------------------------------------------------------
+
+SOLVER = (
+    "import re\n\n"
+    "def solve(llm, problem, sampling, retries=2):\n"
+    "    for _ in range(retries + 1):\n"
+    "        out = llm.generate(problem, sampling)\n"
+    "        answer = parse_answer(out)\n"
+)
+
+
+def test_text_fingerprints_spanning_lines_match_consecutive_lines():
+    t = make_tree({"cells/cell_000.py": "x = 1\n", "files/solver.py": SOLVER})
+    f = fingerprint.check(["for _ in range(retries + 1):\n    out = llm.generate"], t)
+    assert f.status == "present" and f.detail["found"]
+    (ev,) = f.evidence
+    assert (ev.path, ev.line) == ("files/solver.py", 4)
+    assert ev.quote.startswith("for _ in range(retries + 1):") and "out = llm.generate" in ev.quote
+    assert ev.col == 0
+    # the first line may be the end of a line, whitespace and blank lines do not matter
+    f = fingerprint.check(["solve(llm, problem,  sampling, retries=2):\n\n  for _ in range("], t)
+    assert f.status == "present" and f.evidence[0].line == 3
+    assert f.evidence[0].quote[f.evidence[0].col :].startswith("solve(llm")
+    # negative ones are forbidden when found, and pasted snippets keep working with \r\n
+    f = fingerprint.check(["!def solve(llm, problem, sampling, retries=2):\r\n    for _ in"], t)
+    assert f.status == "absent" and f.detail["forbidden_found"]
+    assert fingerprint.check(["out = llm.generate(problem)\nanswer = parse_answer(out)"], t).status == (
+        "absent"
+    )
+
+
+def test_regex_fingerprints_spanning_lines_search_whole_files():
+    t = make_tree({"files/solver.py": SOLVER})
+    f = fingerprint.check(["re:range\\(retries \\+ 1\\):\n\\s+out = llm\\.generate"], t)
+    assert f.status == "present" and (f.evidence[0].path, f.evidence[0].line) == ("files/solver.py", 4)
+    assert f.evidence[0].quote[f.evidence[0].col :].startswith("range(retries + 1):")
+    # an escaped \n works the same way as a typed newline
+    assert fingerprint.check([r"re:retries=2\):\n\s+for "], t).evidence[0].line == 3
+    # (?m) searches the whole file, with ^ and $ at line boundaries
+    f = fingerprint.check([r"re:(?m)^\s+answer = parse_answer\(out\)$"], t)
+    assert f.status == "present" and f.evidence[0].line == 6
+    assert fingerprint.check([r"!re:(?m)^import re$\n^def solve"], t).status == "present"
+
+
+def test_fingerprint_evidence_records_where_the_match_starts():
+    prompt = 'SYSTEM_PROMPT = "You solve math word problems. Think step by step, briefly."\n'
+    t = make_tree({"files/solver.py": "    " + prompt})
+    (ev,) = fingerprint.check(["Think step by step, briefly."], t).evidence
+    assert ev.quote == prompt.strip() and ev.quote[ev.col :].startswith("Think step by step")
+    (ev,) = fingerprint.check([r"re:^\s+SYSTEM_PROMPT"], t).evidence
+    assert ev.col == 0
+    long_line = "blob = '" + "a" * 800 + "NEEDLE" + "b" * 400 + "'\n"
+    (ev,) = fingerprint.check(["NEEDLE"], make_tree({"cells/cell_000.py": long_line})).evidence
+    assert len(ev.quote) <= fingerprint.QUOTE_CHARS and ev.quote[ev.col :].startswith("NEEDLE")
+    assert ev.to_dict()["col"] == ev.col

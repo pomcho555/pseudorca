@@ -10,7 +10,7 @@ from pseudorca.audit import engine
 from pseudorca.audit.engine import audit_notebook, conclusive
 from pseudorca.audit.types import Evidence, Finding
 from pseudorca.llm import LLMError, LLMSettings
-from pseudorca.model import Idea, Notebook
+from pseudorca.model import Idea, Notebook, State
 from pseudorca.notebooks import register_bytes
 from pseudorca.store import Store
 from pseudorca.tree import Tree
@@ -190,11 +190,91 @@ def test_llm_is_skipped_only_for_the_same_model_and_prompt_version(
         store, nb, vague, settings=LLMSettings(provider="fake", model="other"), tree=tree, judge=judge
     )
     assert judge.calls == ["vague", "vague"]
-    monkeypatch.setattr(pseudorca.llm, "PROMPT_VERSION", "next")
+    monkeypatch.setattr(pseudorca.llm, "PROMPT_VERSION", "2")
     audit_notebook(store, nb, vague, settings=SETTINGS, tree=tree, judge=judge)
     assert judge.calls == ["vague"] * 3
     audit_notebook(store, nb, vague, settings=SETTINGS, tree=tree, judge=judge, force=True)
     assert judge.calls == ["vague"] * 4
+
+
+def test_an_older_pseudorca_never_redoes_a_newer_ones_verdicts(
+    store: Store, nb: Notebook, ideas: list[Idea], monkeypatch: pytest.MonkeyPatch
+):
+    """Bob runs a newer extractor and prompt; Alice, on an older Pseudorca, audits after him."""
+    low = ideas[:1]
+    present, reverted = make_tree(TREE_CODE), make_tree("def answer(q):\n    return 1\n")
+    monkeypatch.setattr(pseudorca.extract, "EXTRACTOR_VERSION", 2)
+    rows = audit_notebook(store, nb, low, llm_mode="never", tree=present)
+    assert rows[0].effective.status == "present"
+    monkeypatch.setattr(pseudorca.extract, "EXTRACTOR_VERSION", 1)  # Alice: skips, records nothing
+    rows = audit_notebook(store, nb, low, llm_mode="never", tree=reverted)
+    assert rows[0].skipped == ["fingerprint", "patch"] and rows[0].findings == []
+    assert rows[0].effective.status == "present" and len(verdict_events(store)) == 2
+    monkeypatch.setattr(pseudorca.extract, "EXTRACTOR_VERSION", 3)  # an upgrade redoes them
+    rows = audit_notebook(store, nb, low, llm_mode="never", tree=reverted)
+    assert [f.method for f in rows[0].findings] == ["fingerprint", "patch"]
+    assert rows[0].effective.status == "absent"
+
+    vague = ideas[2:]
+    judge = FakeJudge()
+    monkeypatch.setattr(pseudorca.llm, "PROMPT_VERSION", "10")
+    audit_notebook(store, nb, vague, settings=SETTINGS, tree=present, judge=judge)
+    monkeypatch.setattr(pseudorca.llm, "PROMPT_VERSION", "9")  # compared as integers, not as text
+    rows = audit_notebook(store, nb, vague, settings=SETTINGS, tree=present, judge=judge)
+    assert judge.calls == ["vague"] and rows[0].skipped == ["llm"]
+    # even with another model: its answer could never count over a newer prompt's
+    other = LLMSettings(provider="fake", model="other")
+    audit_notebook(store, nb, vague, settings=other, tree=present, judge=judge)
+    assert judge.calls == ["vague"]
+    monkeypatch.setattr(pseudorca.llm, "PROMPT_VERSION", "10")  # same version, other model: asked
+    rows = audit_notebook(store, nb, vague, settings=other, tree=present, judge=judge)
+    assert judge.calls == ["vague", "vague"] and rows[0].effective.records[0].model == "fake:other"
+
+
+def test_an_audit_replays_the_ledger_at_most_once(
+    store: Store, nb: Notebook, monkeypatch: pytest.MonkeyPatch
+):
+    many = [add_idea(store, f"idea-{i:02d}", fingerprints=(f"knob_{i} = 1",), patch=PATCH) for i in range(30)]
+    for i in range(2900):  # a ledger of about 3,000 events
+        store.append("idea.update", {"id": "idea-00", "owner": f"o{i % 7}"})
+    many = [store.state().ideas[i.id] for i in many]
+    replays: list[int] = []
+    replay = State.replay.__func__
+
+    def counting(cls, events):
+        replays.append(1)
+        return replay(cls, events)
+
+    monkeypatch.setattr(State, "replay", classmethod(counting))
+    code = "".join(f"knob_{i} = 1\n" for i in range(0, 30, 2)) + TREE_CODE
+    rows = audit_notebook(store, nb, many, llm_mode="never", tree=make_tree(code))
+    assert len(replays) <= 1
+    assert len(rows) == 30 and len(verdict_events(store)) == 60
+    assert [r.effective.status for r in rows[:2]] == ["present", "conflict"]
+    assert rows[1].effective.records[0].event_id  # the records of a real run carry their event ids
+    # a dry run replays nothing more either
+    rows = audit_notebook(store, nb, many, llm_mode="never", tree=make_tree(code), force=True, dry_run=True)
+    assert len(replays) <= 2 and rows[0].effective.status == "present"
+
+
+def test_an_llm_verdict_settles_a_conflict(store: Store, nb: Notebook):
+    conflict = add_idea(store, "conflict", fingerprints=("USE_CACHE",), patch=PATCH)
+    reverted = make_tree("def answer(q):\n    return client.generate(q, temperature=0.7)\nUSE_CACHE = 1\n")
+    judge = FakeJudge("absent")
+    rows = audit_notebook(store, nb, [conflict], settings=SETTINGS, tree=reverted, judge=judge)
+    assert judge.calls == ["conflict"]
+    eff = rows[0].effective
+    assert (eff.status, eff.method) == ("absent", "llm")
+    assert [r.method for r in eff.records] == ["llm", "fingerprint", "patch"]
+
+
+def test_a_patch_with_a_byte_order_mark_is_read(store: Store, nb: Notebook):
+    data = {"id": "bom", "title": "bom", "patch": store.put_blob(b"\xef\xbb\xbf" + PATCH.encode())}
+    store.append("idea.add", data)
+    rows = audit_notebook(
+        store, nb, [store.state().ideas["bom"]], llm_mode="never", tree=make_tree(TREE_CODE)
+    )
+    assert rows[0].effective.status == "present"
 
 
 def test_conclusive_counts_recorded_deterministic_verdicts(store: Store, nb: Notebook, ideas: list[Idea]):

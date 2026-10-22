@@ -13,6 +13,7 @@ from pseudorca.audit.types import Evidence, Finding
 from pseudorca.cli import main
 from pseudorca.commands._common import LEGEND
 from pseudorca.llm import LLMSettings
+from pseudorca.model import State
 from pseudorca.notebooks import register_bytes
 from pseudorca.store import Store
 from pseudorca.tree import Tree
@@ -178,10 +179,10 @@ def test_broken_llm_settings(ledger: Store, monkeypatch: pytest.MonkeyPatch, tmp
     result = run(ledger, "audit")
     assert "LLM not used: unknown provider 'nope' in [llm]" in result.stderr
     assert "✓ present" in table_row(result.stdout, "short-prompt")
-    # asked for on the command line: a one-line error, before anything is registered
+    # asked for on the command line: a one-line error (check could not run), before anything is registered
     path = tmp_path / "new.ipynb"
     path.write_bytes(BAD)
-    result = run(ledger, "check", str(path), "--llm", "always", code=1)
+    result = run(ledger, "check", str(path), "--llm", "always", code=2)
     assert "cannot use the LLM: unknown provider" in result.output and "Traceback" not in result.output
     assert len(Store.at(ledger.root).state().notebooks) == 1
 
@@ -280,3 +281,236 @@ def test_verdict_rejects_bad_input(ledger: Store):
     assert "is not PATH:LINE:QUOTE" in out and "Traceback" not in out
     assert "no idea matches" in run(ledger, "verdict", "good.ipynb", "nope", "present", code=1).output
     assert verdicts(ledger) == []
+
+
+# ----- check: configuration and exit codes ---------------------------------------------------------
+
+
+def set_config(store: Store, old: str, new: str) -> None:
+    config = store.root / "config.toml"
+    text = config.read_text(encoding="utf-8")
+    assert old in text
+    config.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def test_check_rejects_statuses_that_are_not_idea_statuses(ledger: Store):
+    register_bytes(ledger, BAD, name="bad.ipynb")
+    set_config(ledger, 'expect_status = ["adopted"]', 'expect_status = ["adopt"]')
+    out = run(ledger, "check", "bad.ipynb", "--llm", "never", code=2).output
+    assert out.strip() == (
+        "Error: [audit] expect_status: 'adopt' is not an idea status (idea, testing, adopted, rejected, parked)"
+    )
+    set_config(ledger, 'expect_status = ["adopt"]', 'expect_status = ["adopted"]')
+    set_config(ledger, 'forbid_status = ["rejected"]', 'forbid_status = "reject"')
+    out = run(ledger, "check", "bad.ipynb", "--llm", "never", code=2).output
+    assert "[audit] forbid_status: 'reject' is not an idea status" in out
+    assert verdicts(ledger) == []  # nothing was audited
+
+
+def test_check_with_nothing_expected_names_the_statuses(ledger: Store):
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    set_config(ledger, 'expect_status = ["adopted"]', 'expect_status = ["idea"]')
+    out = run(ledger, "check", "good.ipynb", "--llm", "never").stdout
+    assert "check passed (nothing is expected: no idea has status idea; pass --expect ID" in out
+    assert "OK" not in out
+    set_config(ledger, 'expect_status = ["idea"]', "expect_status = []")
+    out = run(ledger, "check", "good.ipynb", "--llm", "never").stdout
+    assert "nothing is expected: [audit] expect_status is empty;" in out
+
+
+def test_check_exits_2_when_it_cannot_run(ledger: Store, tmp_path: Path):
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    assert "no notebook matches 'nope.ipynb'" in run(ledger, "check", "nope.ipynb", code=2).output
+    broken = tmp_path / "broken.ipynb"
+    broken.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+    for args in ([str(broken)], [str(broken), "--dry-run"]):
+        out = run(ledger, "check", *args, "--llm", "never", code=2).output
+        assert out.startswith("Error: ") and "Traceback" not in out
+    assert "no idea matches 'nope'" in run(ledger, "check", "good.ipynb", "--expect", "nope", code=2).output
+    assert "Missing argument" in run(ledger, "check", code=2).output  # a usage error
+    assert "is not one of" in run(ledger, "check", "good.ipynb", "--llm", "sometimes", code=2).output
+    elsewhere = tmp_path / "no-store"
+    elsewhere.mkdir()
+    result = CliRunner().invoke(main, ["--store", str(elsewhere), "check", "good.ipynb"])
+    assert result.exit_code == 2 and "is not a Pseudorca store" in result.output
+    # a failed check is 1, a passed one 0
+    run(ledger, "check", "good.ipynb", "--llm", "never", "--expect", "kv-cache", "--strict", code=1)
+    run(ledger, "check", "good.ipynb", "--llm", "never")
+    help_text = " ".join(run(ledger, "check", "--help").stdout.split())
+    assert "0 the check passed 1 the check failed" in help_text
+    assert "2 the check could not run: any error, including a usage error" in help_text
+
+
+def test_check_exits_2_on_an_unexpected_error(ledger: Store, monkeypatch: pytest.MonkeyPatch):
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    monkeypatch.delenv("PSEUDORCA_DEBUG", raising=False)
+
+    def broken(*args, **kwargs):
+        raise KeyError("bug")
+
+    monkeypatch.setattr("pseudorca.commands.audit.audit_notebook", broken)
+    result = run(ledger, "check", "good.ipynb", "--llm", "never", code=2)
+    assert "check could not run: KeyError" in result.output and "Traceback" in result.stderr
+
+
+# ----- audit of a file ---------------------------------------------------------------------------
+
+
+def test_audit_of_a_file_audits_that_files_version(
+    ledger: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    Path("agent.ipynb").write_bytes(BAD)
+    register_bytes(ledger, BAD, name="agent.ipynb")
+    Path("agent.ipynb").write_bytes(GOOD)  # edited after it was registered
+    result = run(ledger, "audit", "agent.ipynb", "--llm", "never")
+    assert "agent.ipynb on disk is not the registered version" in result.stderr
+    assert "pseudorca nb add agent.ipynb" in result.stderr and "pseudorca check agent.ipynb" in result.stderr
+    assert f"audit of agent.ipynb ({util.short(util.sha256_bytes(BAD))})" in result.stdout
+    # once the file's version is registered, under any name, that version is audited
+    register_bytes(ledger, GOOD, name="agent-v2.ipynb")
+    result = run(ledger, "audit", "agent.ipynb", "--llm", "never")
+    assert "on disk" not in result.stderr and "audit of agent-v2.ipynb" in result.stdout
+    Path("other.ipynb").write_bytes(ipynb("x = 1\n"))
+    out = run(ledger, "audit", "other.ipynb", code=1).output
+    assert "other.ipynb is not registered" in out and "pseudorca check other.ipynb" in out
+
+
+# ----- what the tables show ----------------------------------------------------------------------
+
+
+def test_the_evidence_column_shows_the_matched_part_of_a_long_line(ledger: Store):
+    long_prompt = (
+        'PROMPT = "' + "You are a careful assistant who explains each step. " * 3 + 'Think briefly."\n'
+    )
+    japanese = (
+        'PROMPT_JA = "あなたは数学の文章題を解きます。答えは数字だけで書きます。手順を短く考えてください"\n'
+    )
+    register_bytes(ledger, ipynb(long_prompt, japanese), name="long.ipynb")
+    for iid, fp in (("brief", "Think briefly."), ("brief-ja", "手順を短く考えてください")):
+        ledger.append("idea.add", {"id": iid, "title": iid, "status": "adopted", "fingerprints": [fp]})
+    out = run(ledger, "audit", "--idea", "brief", "--idea", "brief-ja", "--llm", "never").stdout
+    assert "cells/cell_001.py:1 …" in table_row(out, "brief") and "Think briefly." in table_row(out, "brief")
+    assert "手順を短く" in table_row(out, "brief-ja")
+    assert all(util.display_width(line) <= 160 for line in out.splitlines())
+    out = run(ledger, "check", "long.ipynb", "--llm", "never", code=1).stdout
+    ok = next(s for s in out.split("\n\n") if s.startswith("OK"))
+    assert "Think briefly." in ok and "手順を短く" in ok
+
+
+def configure_llm(monkeypatch: pytest.MonkeyPatch, finding: Finding) -> list[str]:
+    asked: list[str] = []
+
+    def load_settings(store: Store, **overrides) -> LLMSettings:
+        return LLMSettings(provider="fake", model="m")
+
+    def judge_idea(idea, patch_text, tree, findings, settings, *, cache_dir=None) -> Finding:
+        asked.append(idea.id)
+        return finding
+
+    monkeypatch.setattr(pseudorca.llm, "load_settings", load_settings)
+    monkeypatch.setattr(pseudorca.llm, "judge_idea", judge_idea)
+    return asked
+
+
+CONFLICT_PATCH = "--- a/solver.py\n+++ b/solver.py\n@@ -1,2 +1,2 @@\n max_retries = 3\n-temperature=0.2\n+temperature=0.0\n"
+
+
+def test_an_llm_verdict_that_settles_a_conflict_is_shown_with_its_quote(
+    ledger: Store, monkeypatch: pytest.MonkeyPatch
+):
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    data = {"id": "zero-temp", "title": "t", "status": "adopted", "fingerprints": ["max_retries = 3"]}
+    ledger.append("idea.add", {**data, "patch": ledger.put_blob(CONFLICT_PATCH.encode())})
+    quote = Evidence("cells/cell_002.py", 2, "temperature=0.2")
+    asked = configure_llm(monkeypatch, Finding("present", "llm", [quote], note="seen"))
+    out = run(ledger, "audit", "--idea", "zero-temp").stdout
+    assert asked == ["zero-temp"]
+    assert table_row(out, "zero-temp").split()[2:5] == ["✓", "present", "llm"]
+    assert "cells/cell_002.py:2 temperature=0.2" in table_row(out, "zero-temp")
+    out = run(ledger, "check", "good.ipynb").stdout
+    ok = next(s for s in out.split("\n\n") if s.startswith("OK"))
+    assert "zero-temp" in ok and "cells/cell_002.py:2 temperature=0.2" in ok
+
+
+def test_an_llm_absent_without_a_note_does_not_show_a_contradicting_note(
+    ledger: Store, monkeypatch: pytest.MonkeyPatch
+):
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    data = {"id": "zero-temp", "title": "t", "status": "testing", "fingerprints": ["max_retries = 3"]}
+    ledger.append("idea.add", {**data, "patch": ledger.put_blob(CONFLICT_PATCH.encode())})
+    configure_llm(monkeypatch, Finding("absent", "llm", note=""))
+    row = table_row(run(ledger, "audit", "--idea", "zero-temp").stdout, "zero-temp")
+    assert row.split()[2:5] == ["✗", "absent", "llm"]
+    assert "found 1/1" not in row and "0/1 hunks applied, 1 reverted" in row
+
+
+# ----- JSON ----------------------------------------------------------------------------------------
+
+
+def test_audit_json(ledger: Store):
+    nb = register_bytes(ledger, GOOD, name="good.ipynb")[0]
+    result = run(ledger, "audit", "--llm", "never", "--json")
+    data = json.loads(result.stdout)
+    assert data["notebook"]["id"] == nb.id and data["dry_run"] is False
+    by_id = {i["idea"]: i for i in data["ideas"]}
+    assert list(by_id) == ["kv-cache", "retry-loop", "short-prompt", "hot-sampling"]
+    short = by_id["short-prompt"]
+    assert (short["idea_status"], short["claimed"], short["verdict"]["status"]) == (
+        "adopted",
+        False,
+        "present",
+    )
+    assert short["new"][0]["method"] == "fingerprint" and short["new"][0]["evidence"][0]["col"] == 0
+    assert by_id["kv-cache"]["verdict"] is None
+    assert by_id["kv-cache"]["notes"] == ["no fingerprints or patch to check"]
+    assert data["counts"] == {"present": 2, "absent": 1, "none": 1} and data["messages"] == []
+    again = json.loads(run(ledger, "audit", "--llm", "never", "--json").stdout)
+    again_short = next(i for i in again["ideas"] if i["idea"] == "short-prompt")
+    assert again_short["skipped"] == ["fingerprint"] and again_short["new"] == []
+
+
+def test_check_json(ledger: Store):
+    register_bytes(ledger, BAD, name="bad.ipynb", applies=["retry-loop"])
+    data = json.loads(run(ledger, "check", "bad.ipynb", "--llm", "never", "--json", code=1).stdout)
+    assert data["passed"] is False and data["problems"] == ["1 missing", "1 forbidden present"]
+    assert data["sections"] == {
+        "missing": ["retry-loop"],
+        "unknown": [],
+        "forbidden_present": ["hot-sampling"],
+        "claimed_but_not_found": ["retry-loop"],
+        "ok": ["short-prompt"],
+    }
+    assert (data["expected"], data["forbidden"]) == (["retry-loop", "short-prompt"], ["hot-sampling"])
+    verdict = {i["idea"]: i["verdict"] for i in data["ideas"]}
+    assert verdict["hot-sampling"]["status"] == "present" and verdict["retry-loop"]["status"] == "absent"
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    data = json.loads(run(ledger, "check", "good.ipynb", "--llm", "never", "--json").stdout)
+    assert data["passed"] is True and data["problems"] == [] and data["notebook"]["name"] == "good.ipynb"
+    assert data["registration"] == "" and data["strict"] is False and data["dry_run"] is False
+
+
+# ----- speed ---------------------------------------------------------------------------------------
+
+
+def test_audit_and_check_replay_the_ledger_a_few_times_not_once_per_idea(
+    ledger: Store, monkeypatch: pytest.MonkeyPatch
+):
+    for i in range(30):
+        ledger.append(
+            "idea.add", {"id": f"knob-{i}", "title": "t", "status": "adopted", "fingerprints": [f"k{i} = 1"]}
+        )
+    register_bytes(ledger, GOOD, name="good.ipynb")
+    replays: list[int] = []
+    replay = State.replay.__func__
+
+    def counting(cls, events):
+        replays.append(1)
+        return replay(cls, events)
+
+    monkeypatch.setattr(State, "replay", classmethod(counting))
+    run(ledger, "audit", "--llm", "never")
+    assert len(verdicts(ledger)) == 33 and len(replays) <= 2
+    replays.clear()
+    run(ledger, "check", "good.ipynb", "--llm", "never", code=1)  # the knobs are missing
+    assert len(replays) <= 3

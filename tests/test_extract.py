@@ -12,6 +12,7 @@ import pickle
 import random
 import shutil
 import tarfile
+import time
 import tracemalloc
 import zipfile
 import zlib
@@ -19,13 +20,16 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 import pseudorca.extract as extract_mod
-from pseudorca.extract import EXTRACTOR_VERSION, Limits, extract_bytes, extract_file, tree_for
-from pseudorca.extract.magics import transform_python
+from pseudorca.cli import main
+from pseudorca.extract import EXTRACTOR_VERSION, Limits, extract_bytes, extract_file, payloads, tree_for
+from pseudorca.extract.magics import cell_magic, transform_python
+from pseudorca.extract.payloads import _NotDecodable, decompress, pattern_candidates
 from pseudorca.notebooks import register_bytes, register_file
 from pseudorca.store import Store, StoreError
-from pseudorca.tree import Tree
+from pseudorca.tree import Hit, Tree
 
 # ----- synthetic inputs ------------------------------------------------------------------------------
 
@@ -124,6 +128,52 @@ def test_writefile_overwrite_keeps_the_last_version():
     assert t.paths("files/*") == ["files/a.py"]
 
 
+def test_writefile_bodies_end_with_a_newline_as_in_ipython():
+    # Jupyter saves a cell's last line without "\n" (the helper keeps that); IPython adds one before
+    # %%writefile runs, so an appended cell starts on a line of its own.
+    blob = b64(zlib.compress(py_source("appended").encode()))
+    t = extract(
+        "%%writefile main.py\nimport os\nMAX_STEPS = 64",
+        f"%%writefile -a main.py\ndef agent(obs):\n    return policy(obs)\nBLOB = '{blob}'",
+        "%%writefile empty.py",
+    )
+    assert t.text("files/main.py") == (
+        f"import os\nMAX_STEPS = 64\ndef agent(obs):\n    return policy(obs)\nBLOB = '{blob}'\n"
+    )
+    assert t.grep("def agent(obs):") == [Hit("files/main.py", 3, "def agent(obs):")]
+    (path,) = payload_files(t, 1)
+    assert t.files[path].origin == "cell 1 > %%writefile -a main.py > line 5 str > base64 > zlib"
+    assert t.text("files/empty.py") == ""
+
+    # appended Python writes count line breaks as the tree does ("\r" too)
+    t = extract(
+        "open('gen.py', 'w').write('import zlib\\r')\n"
+        f"open('gen.py', 'a').write('X = 1\\rBLOB = \"{blob}\"\\r')\n"
+    )
+    assert t.grep("BLOB = ", path_glob="files/*") == [Hit("files/gen.py", 3, f'BLOB = "{blob}"')]
+    (path,) = payload_files(t)
+    assert t.files[path].origin.startswith("cell 0 > open().write gen.py > line 3 str")
+
+
+def test_cell_magic_bodies_agree_with_ipython():
+    tm = pytest.importorskip("IPython.core.inputtransformer2")
+    sources = [
+        "%%writefile -a agent.py\ndef solve(task):\n    return task",
+        "%%writefile a.py\nx = 1\n",
+        "\n\n%%bash\nset -e\npip install x",
+        "%%writefile a.py",
+        "%%writefile a.py\nx = 1\r",
+        "%%writefile a.py\r\nx = 1\r\ny = 2",
+        "%%html\n<b>x</b>\n\n",
+    ]
+    for source in sources:
+        call = ast.parse(tm.TransformerManager().transform_cell(source)).body[0].value
+        assert isinstance(call, ast.Call) and call.func.attr == "run_cell_magic", source
+        name, args, body = (a.value for a in call.args)
+        magic = cell_magic(source)
+        assert magic is not None and (magic.name, magic.args, magic.body) == (name, args, body), source
+
+
 def test_shell_and_other_cell_magics():
     t = extract(
         "%%bash\necho hi\nls -la\n",
@@ -133,14 +183,34 @@ def test_shell_and_other_cell_magics():
         "%%html\n<b>bold</b>\n",
         "%%javascript\nconsole.log(1)\n",
     )
-    assert t.text("cells/cell_000.sh") == "echo hi\nls -la\n"
-    assert t.text("cells/cell_001.sh") == "export X=1\n"
-    assert t.text("cells/cell_002.sh") == "echo via script\n"
-    assert t.text("cells/cell_003.sh") == "echo via env\n"
-    assert t.text("cells/cell_004.html.txt") == "<b>bold</b>\n"
-    assert t.text("cells/cell_005.javascript.txt") == "console.log(1)\n"
+    assert t.text("cells/cell_000.sh") == "# %%bash\necho hi\nls -la\n"
+    assert t.text("cells/cell_001.sh") == "# %%sh\nexport X=1\n"
+    assert t.text("cells/cell_002.sh") == "# %%script bash --no-raise-error\necho via script\n"
+    assert t.text("cells/cell_003.sh") == "# %%script /usr/bin/env sh\necho via env\n"
+    assert t.text("cells/cell_004.html.txt") == "# %%html\n<b>bold</b>\n"
+    assert t.text("cells/cell_005.javascript.txt") == "# %%javascript\nconsole.log(1)\n"
     assert t.files["cells/cell_000.sh"].origin == "cell 0 > %%bash"
     assert not t.paths("cells/*.py") and t.warnings == []
+
+
+def test_shell_and_other_magic_files_keep_the_cell_line_numbers():
+    # the lines up to the magic line stay (the magic line as a comment), so line N of the file is line N
+    # of the cell, for evidence and for payload origins alike
+    blob = b64(gzip.compress(py_source("sh-lines").encode()))
+    t = extract(
+        "\n%%bash\nset -e\npip install vllm==0.6.3\n",
+        f"%%html\n<p>hi</p>\n<!-- {blob} -->",
+        f" \n%%sh\necho {blob} | base64 -d > a.py",
+        "\r\n%%bash\r\necho crlf\r\n",
+    )
+    assert t.text("cells/cell_000.sh") == "\n# %%bash\nset -e\npip install vllm==0.6.3\n"
+    assert t.grep("vllm==0.6.3") == [Hit("cells/cell_000.sh", 4, "pip install vllm==0.6.3")]
+    assert t.text("cells/cell_001.html.txt") == f"# %%html\n<p>hi</p>\n<!-- {blob} -->\n"
+    assert t.files["payloads/cell_001/0.py"].origin == "cell 1 > %%html > line 3 str > base64 > gzip"
+    assert t.text("cells/cell_002.sh").startswith(" \n# %%sh\necho ")
+    assert t.files["payloads/cell_002/0.py"].origin == "cell 2 > %%sh > line 3 str > base64 > gzip"
+    assert t.text("cells/cell_003.sh") == "\r\n# %%bash\r\necho crlf\r\n"
+    assert t.grep("echo crlf") == [Hit("cells/cell_003.sh", 3, "echo crlf")]
 
 
 def test_time_and_capture_bodies_stay_python():
@@ -430,7 +500,22 @@ def test_shell_cell_payloads_are_found():
     t = extract(f"%%bash\necho {blob} | base64 -d | gunzip > agent.py\n")
     (path,) = payload_files(t)
     assert path == "payloads/cell_000/0.py"
-    assert t.files[path].origin == "cell 0 > %%bash > line 1 str > base64 > gzip"
+    assert t.files[path].origin == "cell 0 > %%bash > line 2 str > base64 > gzip"
+
+
+def test_pattern_scan_strings_and_lines():
+    blob = b64(zlib.compress(py_source("lines").encode()))
+    # a one-quote string ends at a line end that no backslash escapes, even after an escaped one
+    (cand,) = pattern_candidates(f'x = "abc\\\ndef\ny = "{blob}"\n', 200)
+    assert (cand.line, cand.col, cand.value) == (3, 4, blob)
+    # an unclosed string does not hide the strings after it
+    (cand,) = pattern_candidates(f"say \"it's\n'{blob}'", 200)
+    assert (cand.line, cand.value) == (2, blob)
+    assert [c.value for c in pattern_candidates(f'"""{blob}"""\n\'{blob}\'', 200)] == [blob, blob]
+    assert pattern_candidates(f"# '{blob}'\n", 200) == []
+    # lines are counted as the tree counts them: \r\n, \r and \n
+    (cand,) = pattern_candidates(f"a = 1\rb = 2\r\nc = '{blob}'", 200)
+    assert (cand.line, cand.col) == (3, 4)
 
 
 # ----- limits and hostile input ----------------------------------------------------------------------
@@ -495,6 +580,73 @@ def test_hostile_payloads_never_raise():
     t = extract(*(f"X = '{b64(c)}'\n" for c in cases), limits=Limits(min_payload_chars=40))
     assert t.meta["cells"] == len(cases)
     assert not any("extraction failed" in w or "not decoded (" in w for w in t.warnings)
+
+
+def test_quoted_string_scan_takes_linear_time():
+    # an opening quote followed by many escaped ones once made every escaped quote rescan the line: O(n²)
+    n = 6000
+    hostile = [
+        '"' + '\\"' * n,
+        "'" + "\\'" * n,
+        '"""' + '\\"""' * n,
+        "'''" + "\\'''" * n,
+        "\"'" + "\\\"\\'" * n,
+    ]
+    start = time.perf_counter()
+    for text in hostile:
+        assert pattern_candidates(text, 200) == []
+    t = extract(f"%%bash\necho {hostile[0]}\n")
+    elapsed = time.perf_counter() - start
+    assert payload_files(t) == []
+    assert elapsed < 1.5
+
+
+def test_concatenated_and_empty_streams_take_linear_time():
+    # each stream's end once copied the rest of the input, and empty or one-byte streams trip no byte
+    # limit: N streams back to back cost O(N²) time
+    start = time.perf_counter()
+    for kind, member, n in [
+        ("zlib", zlib.compress(b""), 160_000),
+        ("gzip", gzip.compress(b""), 80_000),
+        ("bz2", bz2.compress(b""), 80_000),
+        ("xz", lzma.compress(b""), 80_000),
+    ]:
+        with pytest.raises(_NotDecodable):
+            decompress(kind, member * n, 1 << 20)
+    out, problem = decompress("zlib", zlib.compress(b"x") * 160_000, 1 << 20)
+    t = extract(f"E = '{b64(zlib.compress(b'') * 160_000)}'\n")
+    elapsed = time.perf_counter() - start
+    assert out == b"x" * payloads.MAX_STREAMS and problem == f"more than {payloads.MAX_STREAMS} streams"
+    assert payload_files(t) == [] and t.warnings == []
+    assert elapsed < 1.5
+
+
+def test_concatenated_streams_are_followed_up_to_a_limit():
+    a, b = py_source("first").encode(), py_source("second").encode()
+    big = random.Random(5).randbytes(300_000)  # compresses to more than one input window
+    for kind, compress in [
+        ("zlib", zlib.compress),
+        ("gzip", gzip.compress),
+        ("bz2", bz2.compress),
+        ("xz", lzma.compress),
+    ]:
+        assert decompress(kind, compress(a) + compress(b), 1 << 20) == (a + b, ""), kind
+        assert decompress(kind, compress(big) + compress(a), 1 << 20) == (big + a, ""), kind
+        # an empty stream ends the decoding; nothing is lost when nothing follows it
+        assert decompress(kind, compress(a) + compress(b"") + compress(b), 1 << 20) == (a, "empty stream")
+        assert decompress(kind, compress(a) + compress(b""), 1 << 20) == (a, "")
+    n = payloads.MAX_STREAMS
+    parts = [b"%d," % i for i in range(n + 5)]
+    out, problem = decompress("zlib", b"".join(zlib.compress(p) for p in parts), 1 << 20)
+    assert out == b"".join(parts[:n]) and problem == f"more than {n} streams"
+
+    t = extract(f"S = '{b64(b''.join(gzip.compress(py_source(str(i)).encode()) for i in range(n + 1)))}'\n")
+    (path,) = payload_files(t)
+    assert t.text(path) == "".join(py_source(str(i)) for i in range(n))
+    assert t.warnings == [
+        f"cell 0 > line 1 str > base64 > gzip: more than {n} streams after {len(t.text(path))} bytes; "
+        "kept what was decoded"
+    ]
 
 
 def test_malformed_notebooks():
@@ -650,3 +802,63 @@ def test_tree_for_detects_scripts_by_name(store: Store):
     nb, _ = register_bytes(store, b"import os\nprint(os.getcwd())\n", name="kernel.py")
     t = tree_for(store, nb)
     assert t.meta["format"] == "script" and t.text("script.py").startswith("import os")
+
+
+def test_only_ipynb_and_py_suffixes_pick_the_format():
+    # any other name (v1.5 has the suffix ".5") leaves it to the bytes: a JSON object with "cells" or
+    # "worksheets" is a notebook, anything else a script
+    data = notebook("x = 1\n")
+    for name in ("v1.5", "qwen2.5-7b", "agent.irnb", "solver v2.1", "", "NEXT.IPYNB"):
+        assert extract_bytes(data, name).meta["format"] == "ipynb", name
+    v3 = json.dumps({"nbformat": 3, "worksheets": [{"cells": [{"cell_type": "code", "input": "y = 2"}]}]})
+    assert extract_bytes(v3.encode(), "old.v3").text("cells/cell_000.py") == "y = 2"
+    assert extract_bytes(b"\xef\xbb\xbf \n" + data, "bom.v2").meta["format"] == "ipynb"
+    for content in (b"import os\n", b'{"seed": 7}', b"[1, 2]", b"{" * 100_000, b"\xff\xfe{garbage"):
+        assert extract_bytes(content, "v1.5").meta["format"] == "script", content[:20]
+    assert extract_bytes(data, "kernel.py").meta["format"] == "script"  # a recognised suffix wins
+    with pytest.raises(ValueError, match="not a valid notebook"):
+        extract_bytes(b"import os\n", "agent.ipynb")
+
+
+def test_a_dotted_name_does_not_make_a_notebook_a_script(store: Store):
+    data = notebook("TEMPERATURE = 0.7\n", "%%writefile agent.py\nSTEPS = 64\n")
+    f = store.root.parent / "nbs" / "next.ipynb"
+    f.parent.mkdir()
+    f.write_bytes(data)
+    nb, _ = register_file(store, f, name="v1.5")
+    t = tree_for(store, nb)
+    assert t.meta["format"] == "ipynb"
+    assert t.paths() == ["cells/cell_000.py", "cells/cell_001.py", "files/agent.py"]
+    assert t.grep("TEMPERATURE = 0.7") == [Hit("cells/cell_000.py", 1, "TEMPERATURE = 0.7")]
+
+    # renamed later (`nb update --name`) and read on a clone whose cache/ is empty
+    store.append("nb.update", {"id": nb.id, "name": "solver v2.1"})
+    shutil.rmtree(store.root / "cache" / "trees" / nb.id)
+    renamed = store.state().notebooks[nb.id]
+    assert renamed.name == "solver v2.1" and tree_for(store, renamed).meta["format"] == "ipynb"
+
+    # the path comes first, then the name, then the bytes
+    cases = [
+        (notebook("a = 1\n"), "main.ipynb.bak", "kernel.py", "script"),
+        (b"import os\n", "kernel.py", "qwen2.5-7b", "script"),
+        (notebook("b = 2\n"), "agent.irnb", "llama3.1-sft", "ipynb"),
+        (notebook("c = 3\n"), "", "exp-0.7", "ipynb"),
+        (b"import sys\n", "", "exp-0.8", "script"),
+    ]
+    for content, path, name, fmt in cases:
+        nb, _ = register_bytes(store, content, name=name, path=path)
+        assert tree_for(store, nb).meta["format"] == fmt, (path, name)
+
+
+def test_check_with_a_dotted_name_reads_the_notebook(store: Store):
+    # `check FILE --name qwen2.5-7b` once read the .ipynb as a script and missed a rejected idea in it
+    fp = r"re:^sampling = SamplingParams\(temperature=0\.7"
+    store.append(
+        "idea.add", {"id": "temp-07", "title": "t = 0.7", "status": "rejected", "fingerprints": [fp]}
+    )
+    f = store.root.parent / "next.ipynb"
+    f.write_bytes(notebook("from vllm import SamplingParams\nsampling = SamplingParams(temperature=0.7)\n"))
+    args = ["--store", str(store.root), "check", str(f), "--name", "qwen2.5-7b", "--llm", "never"]
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 1, result.output
+    assert "FORBIDDEN PRESENT" in result.output and "temp-07" in result.output

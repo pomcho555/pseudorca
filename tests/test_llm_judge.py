@@ -14,6 +14,8 @@ from pseudorca.audit.types import Evidence, Finding
 from pseudorca.llm import PROMPT_VERSION, LLMError, LLMSettings, judge_idea
 from pseudorca.llm.backends import STEP_LIMIT, FakeBackend
 from pseudorca.llm.judge import (
+    DESCRIPTION_CHARS,
+    PATCH_CHARS,
     SYSTEM_SINGLE,
     SYSTEM_TOOLS,
     build_user_message,
@@ -313,6 +315,35 @@ def test_the_user_message_holds_the_task_and_an_overview():
     assert msg.rstrip().endswith(
         "You can make up to 7 tool calls. Decide whether this idea is in the notebook's code, then call submit_verdict."
     )
+
+
+def test_prompt_pieces_are_redacted_before_they_are_cut():
+    """A secret cut in two by a length limit no longer looks like a secret, so each piece is redacted first."""
+    in_line, in_description, in_patch, in_note, in_detail = (fake_secret(p, 32) for p in "LDPNT")
+    # each secret starts before a limit and ends after it: 16 characters would survive a cut
+    line = 'client = Client(model="' + "m" * 128 + '", temperature=0.2, api_secret="' + in_line + '")'
+    assert line.index(in_line) == 200 - 1 - 16  # util.clip keeps 199 characters and an ellipsis
+    lead = ' api_secret = "'
+    description = "d" * (DESCRIPTION_CHARS - 16 - len(lead)) + lead + in_description + '"'
+    head = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,90 @@\n"
+    body = "+# " + "p" * 76 + "\n"
+    patch_lead = '+token = "'
+    pad = PATCH_CHARS - 16 - len(head) - len(patch_lead)
+    patch = head + body * (pad // len(body)) + "+#" + "p" * (pad % len(body) - 3) + "\n"
+    patch += patch_lead + in_patch + '"\n'
+    assert patch.index(in_patch) == PATCH_CHARS - 16
+    note = "n" * (300 - 16 - len(lead)) + lead + in_note + '"'
+    detail = {"found": ["x" * (400 - 16 - len('{"found": ["') - len(lead)) + lead + in_detail + '"']}
+    finding = Finding(
+        "partial", "fingerprint", [Evidence("cells/cell_000.py", 1, line)], note=note, detail=detail
+    )
+    idea = replace(IDEA, description=description)
+    backend = FakeBackend([("grep", {"text": "temperature"})], PRESENT)
+    judge_idea(idea, patch, notebook(), [finding], SETTINGS, backend=backend)
+    user = backend.prompts[0][1]
+    for secret in (in_line, in_description, in_patch, in_note, in_detail):
+        assert secret[:6] not in user
+    assert user.count(REDACTED) == 5
 
 
 def test_patch_paths():

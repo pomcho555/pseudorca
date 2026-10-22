@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shlex
+import traceback
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +30,7 @@ from pseudorca.commands._common import (
     warn,
 )
 from pseudorca.model import IDEA_STATUSES, VERDICT_STATUSES, Effective, Idea, Notebook, State
+from pseudorca.store import StoreError
 
 if TYPE_CHECKING:
     from pseudorca.llm import LLMSettings
@@ -34,6 +40,10 @@ if TYPE_CHECKING:
 HEADERS = ["IDEA", "STATUS", "VERDICT", "METHOD", "EVIDENCE/NOTE"]
 COUNT_ORDER = ("present", "partial", "absent", "unknown", "conflict", "none")
 SECTIONS = ("MISSING", "UNKNOWN", "FORBIDDEN PRESENT", "CLAIMED BUT NOT FOUND", "OK")
+SECTION_KEYS = {title: title.lower().replace(" ", "_") for title in SECTIONS}  # in --json
+EVIDENCE_WIDTH = 60  # display columns of the EVIDENCE/NOTE cell (util.format_table's default)
+CHECK_FAILED, CHECK_ERROR = 1, 2  # check's exit codes besides 0
+NOTEBOOK_SUFFIXES = (".ipynb", ".py")
 _EVIDENCE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d*):(?P<quote>.*)$", re.DOTALL)
 
 
@@ -47,9 +57,11 @@ def llm_options(f: Callable[..., Any]) -> Callable[..., Any]:
             help="When to ask the LLM: auto (only when fingerprints and patch are inconclusive), always or "
             "never (default: [audit] llm in config.toml, else auto).",
         ),
-        click.option("--model", metavar="M", help="LLM model (default: [llm] model)."),
+        click.option("--model", metavar="MODEL", help="LLM model (default: [llm] model)."),
         click.option("--base-url", metavar="URL", help="LLM endpoint (default: [llm] base_url)."),
-        click.option("--provider", metavar="P", help="openai (any OpenAI-compatible endpoint) or anthropic."),
+        click.option(
+            "--provider", metavar="PROVIDER", help="openai (any OpenAI-compatible endpoint) or anthropic."
+        ),
         click.option(
             "--allow-remote",
             is_flag=True,
@@ -102,6 +114,10 @@ def _report_messages(rows: AuditRows) -> None:
         warn(message)
 
 
+def _echo_json(obj: Any) -> None:
+    click.echo(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
 # ----- rendering -----------------------------------------------------------------------------------
 
 
@@ -110,9 +126,29 @@ def _verdict_cell(eff: Effective | None, claimed: bool) -> str:
     return f"{verdict_symbol(eff, claimed)} {word}"
 
 
-def _evidence_text(e: dict[str, Any]) -> str:
+def _excerpt(quote: str, col: int | None, width: int) -> str:
+    """util.excerpt, with the quote first started a little before `col`: util.excerpt places its window in
+    characters, so on a line of wide (East Asian) characters the match could fall outside it."""
+    if col is None or util.display_width(quote) <= width:
+        return util.excerpt(quote, col, width)
+    start = max(0, col - (width - 1) // 4)
+    # a match near the end leaves room: show more of what comes before it
+    while start > 0 and util.display_width(quote[start - 1 :]) <= width - 1:
+        start -= 1
+    if not start:
+        return util.excerpt(quote, col, width)
+    return "…" + util.excerpt(quote[start:], col - start, width - 1)
+
+
+def _evidence_text(e: dict[str, Any], width: int = EVIDENCE_WIDTH) -> str:
+    """PATH:LINE and the quote, cut to `width` around where the match starts (`col`) when that is known."""
     where = f"{e.get('path', '')}:{e['line']}" if e.get("line") else str(e.get("path", ""))
-    return f"{where} {e.get('quote', '')}".strip()
+    quote = str(e.get("quote") or "")
+    col = e.get("col")
+    if type(col) is not int or not 0 <= col <= len(quote):
+        col = None
+    room = max(16, width - util.display_width(where) - 1)
+    return f"{where} {_excerpt(quote, col, room)}".strip()
 
 
 def _explain(eff: Effective | None, row: AuditRow | None) -> str:
@@ -121,8 +157,10 @@ def _explain(eff: Effective | None, row: AuditRow | None) -> str:
     if row is not None and row.llm_error:
         parts.append(f"llm error: {row.llm_error}")
     if eff is not None:
-        evidence = [e for r in eff.records for e in r.evidence if isinstance(e, dict)]
-        note = next((r.note for r in eff.records if r.note), "")
+        # the records behind the verdict, such as the LLM's when it settled a fingerprint/patch conflict
+        backing = [r for r in eff.records if r.status == eff.status] or eff.records
+        evidence = [e for r in backing for e in r.evidence if isinstance(e, dict)]
+        note = next((r.note for r in backing if r.note), "")
         if eff.status == "conflict":
             parts.append(", ".join(f"{r.method} says {r.status}" for r in eff.records))
         elif eff.status == "present" and evidence:
@@ -138,8 +176,12 @@ def _cells(idea: Idea, eff: Effective | None, row: AuditRow | None, claimed: boo
     return [idea.id, idea.status, _verdict_cell(eff, claimed), eff.method if eff else "", _explain(eff, row)]
 
 
+def _counts(rows: AuditRows) -> Counter[str]:
+    return Counter(r.effective.status if r.effective else "none" for r in rows)
+
+
 def _summary(rows: AuditRows, dry_run: bool) -> str:
-    counts = Counter(r.effective.status if r.effective else "none" for r in rows)
+    counts = _counts(rows)
     verdicts = ", ".join(f"{counts[k]} {k}" for k in COUNT_ORDER if counts[k])
     new = sum(len(r.findings) for r in rows)
     skipped = sum(len(r.skipped) for r in rows)
@@ -149,6 +191,32 @@ def _summary(rows: AuditRows, dry_run: bool) -> str:
     if skipped:
         done += f", {skipped} skipped as already recorded (--force redoes them)"
     return f"{verdicts}; {done}"
+
+
+def _finding_json(f: Finding) -> dict[str, Any]:
+    return {
+        "method": f.method,
+        "status": f.status,
+        "evidence": [e.to_dict() for e in f.evidence],
+        "note": f.note,
+        "model": f.model,
+        "detail": f.detail,
+    }
+
+
+def _idea_json(idea: Idea, eff: Effective | None, row: AuditRow | None, claimed: bool) -> dict[str, Any]:
+    """One idea in --json: its effective verdict and, when it was audited now, what the audit did."""
+    return {
+        "idea": idea.id,
+        "idea_status": idea.status,
+        "claimed": claimed,
+        "verdict": asdict(eff) if eff is not None else None,
+        "new": [_finding_json(f) for f in row.findings] if row else [],
+        "skipped": list(row.skipped) if row else [],
+        "notes": list(row.notes) if row else [],
+        "llm_note": row.llm_note if row else "",
+        "llm_error": row.llm_error if row else "",
+    }
 
 
 # ----- audit ---------------------------------------------------------------------------------------
@@ -164,6 +232,27 @@ def _select(st: State, idea_refs: tuple[str, ...], statuses: tuple[str, ...]) ->
     return ideas if idea_refs else [i for i in ideas if i.status != "parked"]
 
 
+def _audit_target(st: State, nb_ref: str) -> Notebook:
+    """The notebook NB_REF names. When NB_REF is also a notebook file, that file's version is audited if it
+    is registered (under any name); a file that is not is pointed out, never silently replaced by the
+    registered notebook of the same name."""
+    path = Path(nb_ref)
+    looks_like_file = path.suffix.lower() in NOTEBOOK_SUFFIXES or "/" in nb_ref or os.sep in nb_ref
+    if not (looks_like_file and path.is_file()):
+        return st.resolve_nb(nb_ref)
+    sha = util.sha256_file(path)
+    if sha in st.notebooks:
+        return st.notebooks[sha]
+    q = shlex.quote(nb_ref)
+    todo = f"run `pseudorca nb add {q}` (or `pseudorca check {q}`) to audit the file"
+    try:
+        nb = st.resolve_nb(nb_ref)
+    except LookupError:
+        raise LookupError(f"{nb_ref} is not registered; {todo}") from None
+    warn(f"{nb_ref} on disk is not the registered version {util.short(nb.id)} audited here; {todo}")
+    return nb
+
+
 @click.command("audit")
 @click.argument("nb_ref", required=False, default="latest")
 @click.option("--idea", "idea_refs", multiple=True, metavar="ID", help="Audit only this idea (repeatable).")
@@ -177,6 +266,7 @@ def _select(st: State, idea_refs: tuple[str, ...], statuses: tuple[str, ...]) ->
 @llm_options
 @click.option("--force", is_flag=True, help="Redo methods whose verdict is already recorded.")
 @click.option("--dry-run", is_flag=True, help="Show the verdicts without recording them.")
+@click.option("--json", "as_json", is_flag=True, help="Print JSON.")
 @pass_ctx
 def audit_cmd(
     c: Ctx,
@@ -190,35 +280,53 @@ def audit_cmd(
     allow_remote: bool,
     force: bool,
     dry_run: bool,
+    as_json: bool,
 ) -> None:
     """Check which ideas are in a notebook (default: the latest registered one).
 
-    Fingerprints and patches are checked first, without running anything; the LLM is asked only when
-    they are inconclusive (see --llm). Each new verdict is recorded as an event, and methods already
-    recorded for the same idea revision are skipped.
+    NB_REF is a notebook reference, or a notebook file whose version is registered. Fingerprints and
+    patches are checked first, without running anything; the LLM is asked only when they are inconclusive
+    (see --llm). Each new verdict is recorded as an event, and methods already recorded for the same idea
+    revision are skipped.
     """
     store = c.store()
     show_warnings(store)
     with user_errors():
         st = store.state()
-        nb = st.resolve_nb(nb_ref)
+        nb = _audit_target(st, nb_ref)
         ideas = _select(st, idea_refs, statuses)
+    rows = AuditRows()
+    if ideas:
+        mode, settings = _llm(store, llm_mode, model, base_url, provider, allow_remote)
+        with user_errors():
+            rows = audit_notebook(
+                store,
+                nb,
+                ideas,
+                llm_mode=mode,
+                settings=settings,
+                force=force,
+                dry_run=dry_run,
+                on_progress=_progress,
+            )
+        _report_messages(rows)
+    if as_json:
+        counts = _counts(rows)
+        _echo_json(
+            {
+                "notebook": asdict(nb),
+                "dry_run": dry_run,
+                "ideas": [_idea_json(r.idea, r.effective, r, r.idea.id in nb.applies) for r in rows],
+                "counts": {k: counts[k] for k in COUNT_ORDER if counts[k]},
+                "new_verdicts": sum(len(r.findings) for r in rows),
+                "skipped": sum(len(r.skipped) for r in rows),
+                "messages": list(rows.messages),
+            }
+        )
+        return
     if not ideas:
         click.echo("no ideas to audit")
         return
-    mode, settings = _llm(store, llm_mode, model, base_url, provider, allow_remote)
-    with user_errors():
-        rows = audit_notebook(
-            store,
-            nb,
-            ideas,
-            llm_mode=mode,
-            settings=settings,
-            force=force,
-            dry_run=dry_run,
-            on_progress=_progress,
-        )
-    _report_messages(rows)
     click.echo(
         f"audit of {nb.label} ({util.short(nb.id)})" + (", dry run: nothing recorded" if dry_run else "")
     )
@@ -234,12 +342,22 @@ def audit_cmd(
 # ----- check ---------------------------------------------------------------------------------------
 
 
+class CheckError(click.ClickException):
+    """`check` could not run, which CI must tell apart from a check that failed."""
+
+    exit_code = CHECK_ERROR
+
+
 def _statuses(store: Store, key: str, default: str) -> list[str]:
     value = store.setting("audit", key, [default])
     if isinstance(value, str):
         value = [value]
+    known = ", ".join(IDEA_STATUSES)
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        fail(f"[audit] {key} in config.toml must be a list of idea statuses")
+        fail(f"[audit] {key} in config.toml must be a list of idea statuses ({known})")
+    for v in value:
+        if v not in IDEA_STATUSES:
+            fail(f"[audit] {key}: {v!r} is not an idea status ({known})")
     return value
 
 
@@ -277,13 +395,48 @@ def _target(
 @click.option("--expect", "expects", multiple=True, metavar="ID", help="Also expect this idea (repeatable).")
 @click.option("--strict", is_flag=True, help="Also fail when an expected idea is unknown.")
 @click.option("--dry-run", is_flag=True, help="Register nothing and record nothing.")
-@click.option("--name", metavar="N", help="Name to register a file under (default: its file name).")
+@click.option("--name", metavar="NAME", help="Name to register a file under (default: its file name).")
 @click.option(
-    "--tag", "tags", multiple=True, metavar="T", help="Tag for a file being registered (repeatable)."
+    "--tag", "tags", multiple=True, metavar="TAG", help="Tag for a file being registered (repeatable)."
 )
 @llm_options
+@click.option("--json", "as_json", is_flag=True, help="Print JSON: the sections, the verdicts and `passed`.")
 @pass_ctx
-def check_cmd(
+def check_cmd(c: Ctx, **options: Any) -> None:
+    """Check that a notebook holds the expected ideas and none of the forbidden ones.
+
+    TARGET is a notebook file (registered first, unless --dry-run) or a registered notebook reference.
+
+    \b
+    expected:  status in [audit] expect_status (default: adopted), and --expect
+    forbidden: status in [audit] forbid_status (default: rejected)
+
+    \b
+    Exit codes:
+      0  the check passed
+      1  the check failed: an expected idea is absent, partial or disputed, or a forbidden idea is
+         present; with --strict, also when an expected idea is unknown
+      2  the check could not run: any error, including a usage error
+    """
+    try:
+        _check(c, **options)
+    except (click.exceptions.Exit, BrokenPipeError):  # passed (0) or failed (1); `| head` is not an error
+        raise
+    except click.ClickException as e:  # one-line errors, usage errors included
+        e.exit_code = CHECK_ERROR
+        raise
+    except (KeyboardInterrupt, click.Abort):
+        raise CheckError("interrupted") from None
+    except Exception as e:
+        if os.environ.get("PSEUDORCA_DEBUG"):
+            raise
+        if isinstance(e, (StoreError, LookupError, ValueError, OSError)) and not isinstance(e, KeyError):
+            raise CheckError(str(e) or type(e).__name__) from e
+        traceback.print_exc()  # a bug: show it, but never let it look like a failed check
+        raise CheckError(f"check could not run: {type(e).__name__}: {e}") from e
+
+
+def _check(
     c: Ctx,
     target: str,
     expects: tuple[str, ...],
@@ -296,18 +449,8 @@ def check_cmd(
     base_url: str | None,
     provider: str | None,
     allow_remote: bool,
+    as_json: bool,
 ) -> None:
-    """Check that a notebook holds the expected ideas and none of the forbidden ones.
-
-    TARGET is a notebook file (registered first, unless --dry-run) or a registered notebook reference.
-
-    \b
-    expected:  status in [audit] expect_status (default: adopted), and --expect
-    forbidden: status in [audit] forbid_status (default: rejected)
-
-    Exits with 1 when an expected idea is absent, partial or disputed, or a forbidden idea is present;
-    with --strict, also when an expected idea is unknown.
-    """
     store = c.store()
     show_warnings(store)
     expect_status = _statuses(store, "expect_status", "adopted")
@@ -355,11 +498,39 @@ def check_cmd(
         "CLAIMED BUT NOT FOUND": [i for i in nb.applies if i in st.ideas and status(i) == "absent"],
         "OK": [i for i in expected if status(i) == "present"],
     }
+    problems = []
+    if sections["MISSING"]:
+        problems.append(f"{len(sections['MISSING'])} missing")
+    if sections["FORBIDDEN PRESENT"]:
+        problems.append(f"{len(sections['FORBIDDEN PRESENT'])} forbidden present")
+    if strict and sections["UNKNOWN"]:
+        problems.append(f"{len(sections['UNKNOWN'])} unknown (--strict)")
     listed = [iid for title in SECTIONS for iid in sections[title]]
+
+    if as_json:
+        shown = list(dict.fromkeys([*by_id, *listed]))
+        _echo_json(
+            {
+                "notebook": asdict(nb),
+                "registration": how,  # newly or already registered, a dry run, or "" for a reference
+                "dry_run": dry_run,
+                "strict": strict,
+                "passed": not problems,
+                "problems": problems,
+                "expected": expected,
+                "forbidden": forbidden,
+                "sections": {SECTION_KEYS[title]: sections[title] for title in SECTIONS},
+                "ideas": [_idea_json(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in shown],
+                "messages": list(rows.messages),
+            }
+        )
+        if problems:
+            click.get_current_context().exit(CHECK_FAILED)
+        return
+
     lines = util.format_table(
         HEADERS, [_cells(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in listed]
     ).splitlines()[2:]
-
     click.echo(f"check of {nb.label} ({util.short(nb.id)})" + (f", {how}" if how else ""))
     k = 0
     for title in SECTIONS:
@@ -369,19 +540,15 @@ def check_cmd(
             for _ in sections[title]:
                 click.echo("  " + lines[k])
                 k += 1
-    problems = []
-    if sections["MISSING"]:
-        problems.append(f"{len(sections['MISSING'])} missing")
-    if sections["FORBIDDEN PRESENT"]:
-        problems.append(f"{len(sections['FORBIDDEN PRESENT'])} forbidden present")
-    if strict and sections["UNKNOWN"]:
-        problems.append(f"{len(sections['UNKNOWN'])} unknown (--strict)")
     click.echo()
     if problems:
         click.echo("check failed: " + ", ".join(problems))
-        click.get_current_context().exit(1)
+        click.get_current_context().exit(CHECK_FAILED)
     if not expected:
-        click.echo("check passed (nothing is expected: set [audit] expect_status or pass --expect)")
+        why = "[audit] expect_status is empty"
+        if expect_status:
+            why = f"no idea has status {' or '.join(expect_status)}"
+        click.echo(f"check passed (nothing is expected: {why}; pass --expect ID to expect one)")
     elif sections["UNKNOWN"]:
         click.echo(f"check passed ({len(sections['UNKNOWN'])} expected unknown; --strict fails on them)")
     else:

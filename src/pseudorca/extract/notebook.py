@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
+
+_JSON_OBJECT_START = re.compile(rb"(?:\xef\xbb\xbf)?[ \t\r\n]*\{")
 
 
 @dataclass(frozen=True)
@@ -49,12 +52,30 @@ def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def read_notebook(data: bytes, name: str = "notebook.ipynb") -> NotebookCells:
-    """The cells of a notebook. Raises ValueError when the bytes are not notebook JSON."""
+def sniff_notebook(data: bytes) -> dict[str, Any] | None:
+    """The parsed JSON of bytes that hold a notebook (a JSON object with "cells" or "worksheets"), else None.
+
+    For files whose name does not say what they are. Only a JSON object is parsed at all.
+    """
+    if not _JSON_OBJECT_START.match(data):
+        return None
     try:
-        nb = json.loads(data)
-    except (ValueError, RecursionError) as e:
-        raise ValueError(f"{name} is not a valid notebook: its JSON cannot be read ({e})") from None
+        doc = json.loads(data)
+    except (ValueError, RecursionError):
+        return None
+    return doc if isinstance(doc, dict) and ("cells" in doc or "worksheets" in doc) else None
+
+
+def read_notebook(data: bytes | dict[str, Any], name: str = "notebook.ipynb") -> NotebookCells:
+    """The cells of a notebook, given as bytes or as its parsed JSON (from `sniff_notebook`). Raises
+    ValueError when the bytes are not notebook JSON."""
+    if isinstance(data, dict):
+        nb: Any = data
+    else:
+        try:
+            nb = json.loads(data)
+        except (ValueError, RecursionError) as e:
+            raise ValueError(f"{name} is not a valid notebook: its JSON cannot be read ({e})") from None
     if not isinstance(nb, dict):
         raise ValueError(f"{name} is not a Jupyter notebook: the JSON is not an object")
     raw = nb.get("cells")

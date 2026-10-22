@@ -187,6 +187,64 @@ KNOWN_FIELDS = {
 }
 
 
+# field -> kind, for checking event data (shared through git, possibly hand-edited) before it is applied
+FIELD_KINDS = {
+    **dict.fromkeys(
+        ("title", "description", "owner", "status", "name", "path", "kernel", "version", "note"), "str"
+    ),
+    **dict.fromkeys(
+        ("competition", "date", "submitted_by", "source", "format", "label", "protocol", "file"), "str"
+    ),
+    **dict.fromkeys(("tags", "links", "fingerprints", "applies"), "list"),
+    **dict.fromkeys(("patch", "parent", "nb"), "sha?"),
+    **dict.fromkeys(("public_score", "private_score"), "score"),
+    "stored": "bool",
+    "size": "int",
+    "n_rows": "int",
+    "extra": "dict",
+}
+
+
+def _checked(data: dict[str, Any], warn: Any) -> dict[str, Any]:
+    """`data` with every known field converted to its kind; a value that cannot be is dropped with a warning."""
+    out = dict(data)
+    for key, kind in FIELD_KINDS.items():
+        if key not in out:
+            continue
+        value = out[key]
+        try:
+            if kind == "str":
+                if value is None:
+                    value = ""
+                elif not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                    raise ValueError("not text")
+                value = str(value)
+            elif kind == "list":
+                if value is None:
+                    value = []
+                elif not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+                    raise ValueError("not a list of text")
+            elif kind == "sha?":
+                if value is not None and not util.is_sha256(value):
+                    raise ValueError("not a sha256")
+            elif kind == "score":
+                value = _score(value)
+            elif kind == "bool":
+                value = bool(value)
+            elif kind == "int":
+                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                    raise ValueError("not a number")
+                value = int(value)
+            elif kind == "dict" and not isinstance(value, dict):
+                raise ValueError("not an object")
+        except (TypeError, ValueError, OverflowError) as e:
+            warn(f"{key}={str(value)[:40]!r} ({e})")
+            out.pop(key)
+            continue
+        out[key] = value
+    return out
+
+
 def _version(record: VerdictRecord, key: str) -> int:
     try:
         return int(record.detail.get(key) or 0)
@@ -246,13 +304,14 @@ class State:
 
     # ----- event handlers (validate first, then change state) --------------------------------------
 
+    def _data(self, ev: Event) -> dict[str, Any]:
+        """The event's data with every field checked (see FIELD_KINDS)."""
+        return _checked(
+            ev.data, lambda what: self.warnings.append(f"ignored invalid {what} in event {ev.id}")
+        )
+
     def _idea_data(self, ev: Event) -> dict[str, Any]:
-        data = dict(ev.data)
-        patch = data.get("patch")
-        if patch is not None and not util.is_sha256(patch):
-            self.warnings.append(f"ignored invalid patch id in event {ev.id} (not a sha256)")
-            data.pop("patch")
-        return data
+        return self._data(ev)
 
     def _on_idea_add(self, ev: Event) -> None:
         iid = str(ev.data["id"])
@@ -281,15 +340,15 @@ class State:
         nid = str(ev.data["id"])
         if not util.is_sha256(nid):
             raise ValueError("notebook id is not a sha256")
+        d = self._data(ev)
         nb = self.notebooks.get(nid)
         if nb is None:
             nb = self.notebooks[nid] = Notebook(
                 id=nid, added=ev.time, added_by=ev.actor, seq=len(self.notebooks) + 1
             )
-            _set_fields(nb, ev.data, NOTEBOOK_FIELDS)
+            _set_fields(nb, d, NOTEBOOK_FIELDS)
             return
         # registered again (two clones before a pull): merge, never wipe what the first add recorded
-        d = ev.data
         for key in ("tags", "applies"):
             extra = [v for v in d.get(key) or [] if v not in getattr(nb, key)]
             setattr(nb, key, [*getattr(nb, key), *extra])
@@ -305,18 +364,11 @@ class State:
         if nb is None:
             self.warnings.append(f"update for unknown notebook {nid[:12]} ({ev.id}) ignored")
             return
-        _set_fields(nb, ev.data, NOTEBOOK_FIELDS)
+        _set_fields(nb, self._data(ev), NOTEBOOK_FIELDS)
 
     def _on_sub_upsert(self, ev: Event) -> None:
         sid = str(ev.data["id"])
-        data = dict(ev.data)
-        for key in ("public_score", "private_score"):
-            if key in data:
-                try:
-                    data[key] = _score(data[key])
-                except (TypeError, ValueError):
-                    self.warnings.append(f"ignored invalid {key} {data[key]!r} in event {ev.id}")
-                    data.pop(key)
+        data = self._data(ev)
         sub = self.subs.get(sid)
         if sub is None:
             sub = self.subs[sid] = Submission(id=sid)
@@ -329,7 +381,7 @@ class State:
         if not util.is_sha256(results):
             raise ValueError("results is not a blob id (sha256)")
         run = self.runs[rid] = Run(id=rid, results=results, added=ev.time, added_by=ev.actor)
-        _set_fields(run, ev.data, RUN_FIELDS)
+        _set_fields(run, self._data(ev), RUN_FIELDS)
 
     def _on_audit_verdict(self, ev: Event) -> None:
         d = ev.data

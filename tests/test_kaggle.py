@@ -286,7 +286,7 @@ def test_get_api_without_credentials_is_one_clear_error(
 
 def test_get_api_without_the_client(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "kaggle.api.kaggle_api_extended", None)
-    with pytest.raises(KaggleError, match=r'pip install "pseudorca\[kaggle\]"'):
+    with pytest.raises(KaggleError, match=r'pip install "pseudorca\[kaggle\] @ git\+https://'):
         REAL_GET_API()
 
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import fields
 from datetime import date
 from pathlib import Path
@@ -97,6 +100,39 @@ def field_names(cls: type) -> set[str]:
     return {f.name for f in fields(cls)}
 
 
+def put_event(store: Store, type: str, data: dict[str, Any], when: str, actor: str) -> None:
+    """Write an event file the way a teammate's clone does: with that machine's clock and UTC offset."""
+    eid = util.new_ulid()
+    folder = store.root / "events" / when[:7]
+    folder.mkdir(parents=True, exist_ok=True)
+    event = {"schema": 1, "id": eid, "type": type, "time": when, "actor": actor, "data": data}
+    (folder / f"{eid}-{actor}.json").write_text(json.dumps(event), encoding="utf-8")
+
+
+def flat(text: str) -> str:
+    """Text with every run of whitespace made one space (help text wraps at the terminal width)."""
+    return " ".join(text.split())
+
+
+@pytest.fixture
+def viewer_tz() -> Iterator[Callable[[str], None]]:
+    """Sets the viewer's time zone (a POSIX TZ string, so no time zone database is needed)."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("needs time.tzset")
+    old = os.environ.get("TZ")
+
+    def set_tz(tz: str) -> None:
+        os.environ["TZ"] = tz
+        time.tzset()
+
+    yield set_tz
+    if old is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = old
+    time.tzset()
+
+
 # ----- init ----------------------------------------------------------------------------------------
 
 
@@ -132,6 +168,64 @@ def test_init_defaults_to_the_current_directory_and_warns_outside_git(
     assert (plain / ".pseudorca" / "events").is_dir()
     assert "not inside a git repository" in r.stderr
     assert "cd " not in r.stdout
+
+
+def init_listing(out: str) -> list[str]:
+    """The names init lists under its first line, up to the blank line before the next steps."""
+    names = []
+    for line in out.splitlines()[1:]:
+        if not line.strip():
+            break
+        names.append(line.split()[0])
+    return names
+
+
+@pytest.mark.parametrize("empty_folder", [False, True])
+def test_init_lists_exactly_what_it_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_folder: bool
+):
+    monkeypatch.delenv("PSEUDORCA_STORE", raising=False)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    if empty_folder:  # made by hand: nothing to keep, so still "created"
+        (repo / ".pseudorca").mkdir()
+    r = CliRunner().invoke(main, ["init", str(repo)])
+    assert r.exit_code == 0, r.output
+    assert r.stdout.splitlines()[0] == f"created {repo.resolve() / '.pseudorca'}"
+    assert init_listing(r.stdout) == [
+        "config.toml",
+        "events/",
+        "blobs/",
+        "cache/",
+        ".gitignore",
+        ".gitattributes",
+    ]
+
+
+def test_init_completes_a_partial_store_without_touching_its_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A clone holds the committed config.toml and .gitignore but no events/ (nothing was recorded yet)."""
+    monkeypatch.delenv("PSEUDORCA_STORE", raising=False)
+    repo = tmp_path / "clone"
+    (repo / ".git").mkdir(parents=True)
+    config = '[store]\nname = "team"\ncompetition = "team-comp"\n\n[llm]\nmodel = "team-model"\n'
+    write(repo / ".pseudorca" / "config.toml", config)
+    write(repo / ".pseudorca" / ".gitignore", "cache/\n")
+    root = (repo / ".pseudorca").resolve()
+
+    r = CliRunner().invoke(main, ["init", str(repo), "--competition", "other"])
+    assert r.exit_code == 0, r.output
+    assert r.stdout.splitlines()[0].startswith(f"completed {root}")
+    assert init_listing(r.stdout) == ["events/", "blobs/", "cache/", ".gitattributes"]
+    assert "config.toml" not in r.stdout.split("\n\n")[0]
+    assert (repo / ".pseudorca" / "config.toml").read_text() == config
+    assert "--competition was not applied" in flat(r.stderr)
+    assert Store.at(repo).setting("store", "competition") == "team-comp"
+
+    again = CliRunner().invoke(main, ["init", str(repo)])
+    assert again.exit_code == 1
+    assert again.output == f"Error: a store already exists at {root}\n"  # one line, no traceback
 
 
 # ----- idea ----------------------------------------------------------------------------------------
@@ -178,6 +272,8 @@ def test_idea_add_records_every_field(store: Store, tmp_path: Path):
         (["ok", "--title", "t", "--fingerprint", "!re:[a-"], "invalid regex"),
         (["ok", "--title", "t", "--fingerprint", "re:"], "nothing to look for"),
         (["ok", "--title", "t", "--fingerprint", "!"], "nothing to look for"),
+        (["ok", "--title", "t", "--fingerprint", " \n \n"], "nothing to look for"),
+        (["ok", "--title", "t", "--fingerprint", "re:a\n(b"], "invalid regex"),
         (["ok", "--title", "  "], "--title cannot be empty"),
         (["ok", "--title", "t", "--tag", " "], "a tag cannot be empty"),
         (["ok", "--title", "t", "--desc", "x", "--desc-file", "-"], "not both"),
@@ -199,6 +295,36 @@ def test_idea_add_refuses_a_duplicate_id_and_a_bad_status(store: Store):
     r = cli(store, "idea", "add", "x", "--title", "t", "--status", "done", code=2)  # a usage error
     assert "Invalid value" in r.output
     assert len(fresh(store).events) == 1
+
+
+def test_multi_line_fingerprints_are_kept_and_shown_on_indented_lines(store: Store):
+    """A snippet copied from the notebook across lines is one fingerprint (the audit matches it as a block),
+    and so is a regex with a line break (searched over whole files)."""
+    snippet = "for _ in range(retries + 1):\n    out = llm.generate("
+    regex = "re:range\\(retries \\+ 1\\):\n\\s+out"
+    fps = (snippet, regex, "!solve_old(")
+    r = cli(store, "idea", "add", "retry", "--title", "t", *(a for fp in fps for a in ("--fingerprint", fp)))
+    assert r.output.strip() == "added idea retry (idea, owner tester, checks 3f)"
+    assert fresh(store).ideas["retry"].fingerprints == list(fps)
+
+    lines = cli(store, "idea", "show", "retry").stdout.splitlines()
+    i = next(n for n, line in enumerate(lines) if line.startswith("fingerprints"))
+    indent = " " * len("fingerprints  ")
+    assert lines[i : i + 5] == [
+        "fingerprints  for _ in range(retries + 1):",
+        indent + "      out = llm.generate(",  # its own indentation, two columns in from the first line
+        indent + "re:range\\(retries \\+ 1\\):",
+        indent + "  \\s+out",
+        indent + "!solve_old(",
+    ]
+    r = cli(store, "idea", "update", "retry", "--remove-fingerprint", snippet, "--remove-fingerprint", regex)
+    assert r.output == "updated idea retry: fingerprints=!solve_old(\n"
+    r = cli(store, "idea", "update", "retry", "--add-fingerprint", "if ok:\n    return out")
+    assert r.output == "updated idea retry: fingerprints=!solve_old(,if ok: return out\n"  # on one line
+
+    for command in (["idea", "add"], ["idea", "update"]):
+        help_text = flat(cli(store, *command, "--help").output)
+        assert "text (may span lines), re:REGEX, !text or !re:REGEX" in help_text
 
 
 def test_a_patch_that_is_not_a_diff_is_stored_with_a_warning(store: Store, tmp_path: Path):
@@ -399,6 +525,55 @@ def test_nb_add_records_a_repo_relative_path_never_an_absolute_one(
         assert not Path(data.get("path") or "x").is_absolute()
 
 
+def test_nb_add_no_store_reads_the_file_from_inside_the_repository(store: Store, tmp_path: Path):
+    repo = store.root.parent
+    draft = write(repo / "notebooks" / "draft.ipynb", '{"cells": []}')
+    r = cli(store, "nb", "add", str(draft), "--no-store")
+    nb = fresh(store).notebooks[util.sha256_file(draft)]
+    assert not nb.stored and (repo / nb.path).resolve() == draft.resolve()  # audits can find it again
+    assert r.output.splitlines()[1] == (
+        "  bytes not stored: audits read notebooks/draft.ipynb in the repository while it keeps this content"
+    )
+    outside = write(tmp_path / "elsewhere" / "other.ipynb", '{"cells": [2]}')
+    r = cli(store, "nb", "add", str(outside), "--no-store", code=1)
+    assert r.output.startswith("Error: ") and r.output.count("\n") == 1
+    assert "outside the repository" in r.output and "audits read" not in r.output
+    assert "must be inside the repository" in flat(cli(store, "nb", "add", "--help").output)
+
+
+def test_nb_add_refuses_an_ipynb_that_is_not_notebook_json(store: Store):
+    """A Git LFS pointer checked out without `git lfs pull` must not become the latest notebook."""
+    repo = store.root.parent
+    pointer = f"version https://git-lfs.github.com/spec/v1\noid sha256:{'ab' * 32}\nsize 48213\n"
+    lfs = write(repo / "notebooks" / "big.ipynb", pointer)
+    for extra in ([], ["--no-store"]):
+        r = cli(store, "nb", "add", str(lfs), *extra, code=1)
+        assert r.output.count("\n") == 1 and "Traceback" not in r.output  # one line
+        assert r.output.startswith("Error: notebooks/big.ipynb is not notebook JSON")
+        assert "git-lfs" in r.output and "Git LFS pointer" in r.output
+    assert fresh(store).events == []
+    assert [p.name for p in (store.root / "blobs").rglob("*")] == [".gitkeep"]
+
+
+def test_nb_add_again_says_when_it_stored_the_bytes(store: Store):
+    repo = store.root.parent
+    cand = write(repo / "cand.ipynb", '{"cells": []}')
+    sha = util.sha256_file(cand)
+    cli(store, "nb", "add", str(cand))
+    store.blob_path(sha).unlink()  # the event was pushed without its blob
+    r = cli(store, "nb", "add", str(cand))
+    assert r.output == f"already registered as cand.ipynb {sha[:10]}; stored its bytes, which were missing\n"
+    assert store.get_blob(sha) == cand.read_bytes()
+
+    draft = write(repo / "draft.ipynb", '{"cells": [1]}')
+    dsha = util.sha256_file(draft)
+    cli(store, "nb", "add", str(draft), "--no-store")
+    r = cli(store, "nb", "add", str(draft), "--tag", "candidate")
+    assert r.output == f"already registered as draft.ipynb {dsha[:10]}; updated tags; stored its bytes\n"
+    assert fresh(store).notebooks[dsha].stored and store.has_blob(dsha)
+    assert cli(store, "nb", "add", str(draft), "--no-store").output.endswith(" (no changes)\n")
+
+
 def test_nb_add_merges_metadata_and_validates_references(store: Store):
     cli(store, "idea", "add", "fast-prompt", "--title", "t")
     repo = store.root.parent
@@ -488,6 +663,32 @@ def test_nb_show_lists_claimed_and_audited_ideas(store: Store):
     assert json.loads(cli(store, "nb", "show", "base.ipynb", "--json").stdout)["children"] == [b]
     assert "no verdicts yet" in cli(store, "nb", "show", "base.ipynb").output
     assert "no notebook matches 'nope'" in cli(store, "nb", "show", "nope", code=1).output
+
+
+def test_evidence_columns_keep_the_matched_text_in_view(store: Store):
+    """A long quote is cut around the match (the evidence's col), not from the start of the line."""
+    en = 'SYSTEM_PROMPT = "You solve math word problems. Think step by step, briefly. Answer with a number."'
+    ja = 'PROMPT = "あなたは数学の文章題を解きます。手順を短く考えてください。答えだけを書いてください。"'
+    nb = add_nb(store, b"one", name="next.ipynb")
+    for iid, quote, needle in (("short-cot", en, "Think step"), ("ja-cot", ja, "手順を短く")):
+        store.append("idea.add", {"id": iid, "title": "t", "fingerprints": [needle]})
+        evidence = [{"path": "files/solver.py", "line": 3, "quote": quote, "col": quote.index(needle)}]
+        add_verdict(store, nb, iid, "present", "fingerprint", evidence=evidence)
+    odd_cols = {"no-col": None, "str-col": "5", "bool-col": True, "neg-col": -3, "far-col": 10**9}
+    for iid, col in odd_cols.items():  # older verdicts have no col; a teammate's could hold anything
+        store.append("idea.add", {"id": iid, "title": "t"})
+        ev = {"path": "files/solver.py", "line": 3, "quote": en, **({} if col is None else {"col": col})}
+        add_verdict(store, nb, iid, "present", "fingerprint", evidence=[ev])
+
+    cells = {row[0]: row[4] for row in table(cli(store, "nb", "show", "next.ipynb").stdout)}
+    assert cells["short-cot"].startswith("…") and "Think step by step, briefly." in cells["short-cot"]
+    assert cells["ja-cot"].startswith("…") and "手順を短く" in cells["ja-cot"]
+    for iid in odd_cols:  # cut from the start, as before
+        assert cells[iid].startswith('SYSTEM_PROMPT = "You solve'), iid
+    assert all(util.display_width(cell) <= 50 for cell in cells.values())
+
+    shown = table(cli(store, "idea", "show", "short-cot").stdout)[0][4]
+    assert shown.startswith("…") and "Think step by step, briefly." in shown
 
 
 def test_nb_show_before_any_notebook_is_registered(store: Store):
@@ -655,6 +856,7 @@ def test_status_columns_and_filters(store: Store, board: list[str]):
         return {row[0]: row[2:] for row in table(cli(store, "status", *args).stdout)}
 
     assert rows("-n", "2")["a-idea"] == ["✗", "!"]
+    assert rows("-n", "0")["a-idea"] == ["✓", "✗", "!"]  # 0 = all, as in the other commands
     assert rows("--nb", "base.ipynb", "--nb", n3[:8], "--nb", "base.ipynb")["a-idea"] == ["✓", "!"]
     assert rows("--nb", "latest", "--nb", "base.ipynb")["a-idea"] == ["!", "✓"]
     assert rows("--all")["d-idea"] == ["·", "·", "·"]
@@ -805,6 +1007,7 @@ def test_submissions_written_by_other_tools_with_empty_fields_still_list(store: 
 
 def test_log_shows_one_line_per_event_newest_first(store: Store):
     assert "no events" in cli(store, "log").output
+    assert json.loads(cli(store, "log", "--json").stdout) == []
     cli(store, "idea", "add", "fast-prompt", "--title", "Shorter prompt")
     cli(store, "idea", "update", "fast-prompt", "--status", "adopted")
     sha = add_nb(store, b"one", name="main.ipynb", tags=["candidate"])
@@ -838,3 +1041,103 @@ def test_log_shows_one_line_per_event_newest_first(store: Store):
     assert types("--actor", "bob") == ["sub.upsert"]
     assert len(types("-n", "2")) == 2 and len(types("-n", "0")) == 7
     assert "unknown event type 'nope'" in cli(store, "log", "--type", "nope", code=1).output
+
+    data = json.loads(cli(store, "log", "--json", "-n", "2").stdout)
+    assert [(d["type"], d["actor"], d["summary"]) for d in data] == [
+        ("nb.update", "tester", f"nb main.ipynb {sha[:10]}: applies=fast-prompt"),
+        ("sub.upsert", "bob", "sub 123: nb=main.ipynb"),
+    ]
+    assert set(data[0]) == {"schema", "id", "type", "time", "actor", "data", "summary"}
+    assert data[1]["data"] == {"id": "123", "nb": sha} and data[0]["id"] > data[1]["id"]
+    assert [d["type"] for d in json.loads(cli(store, "log", "--json", "--type", "idea").stdout)] == [
+        "idea.update",
+        "idea.add",
+    ]
+
+
+def test_times_show_in_the_viewers_time_zone_and_order_by_instant(
+    store: Store, viewer_tz: Callable[[str], None]
+):
+    """Berlin, Tokyo and Los Angeles write events seconds apart, each stamped with its own UTC offset."""
+    put_event(store, "idea.add", {"id": "retry", "title": "Retry", "fingerprints": ["X"]},
+              "2026-10-22T11:30:23+02:00", "berlin")  # fmt: skip
+    nb, late = util.sha256_bytes(b"main"), util.sha256_bytes(b"late")
+    put_event(store, "nb.add", {"id": nb, "name": "main.ipynb"}, "2026-10-22T11:30:24+02:00", "berlin")
+    verdict = {"nb": nb, "idea": "retry", "idea_rev": Idea("retry", "Retry", fingerprints=["X"]).rev}
+    put_event(store, "audit.verdict", {**verdict, "status": "present", "method": "fingerprint"},
+              "2026-10-22T18:30:26+09:00", "tokyo")  # 09:30:26 UTC  # fmt: skip
+    put_event(store, "audit.verdict", {**verdict, "status": "present", "method": "patch"},
+              "2026-10-22T11:31:00+02:00", "berlin")  # 09:31 UTC: the later one  # fmt: skip
+    put_event(store, "idea.update", {"id": "retry", "owner": "la"}, "2026-10-22T02:32:00-07:00", "la")
+    put_event(store, "nb.add", {"id": late, "name": "late.ipynb"}, "2026-10-23T01:00:00+09:00", "tokyo")
+    put_event(store, "sub.upsert", {"id": "7", "date": "2026-10-23T08:00:00+09:00"},
+              "2026-10-23T08:00:05+09:00", "tokyo")  # 2026-10-22 23:00 UTC  # fmt: skip
+    put_event(store, "sub.upsert", {"id": "8", "date": "2026-10-22T20:00:00-05:00"},
+              "2026-10-22T20:00:05-05:00", "la")  # 2026-10-23 01:00 UTC  # fmt: skip
+
+    viewer_tz("UTC0")
+    assert [row[:3] for row in table(cli(store, "log", "-n", "0").stdout)] == [
+        ["2026-10-23 01:00", "la", "sub.upsert"],
+        ["2026-10-22 23:00", "tokyo", "sub.upsert"],
+        ["2026-10-22 16:00", "tokyo", "nb.add"],
+        ["2026-10-22 09:32", "la", "idea.update"],
+        ["2026-10-22 09:31", "berlin", "audit.verdict"],
+        ["2026-10-22 09:30", "tokyo", "audit.verdict"],
+        ["2026-10-22 09:30", "berlin", "nb.add"],
+        ["2026-10-22 09:30", "berlin", "idea.add"],
+    ]
+    out = cli(store, "idea", "show", "retry").stdout
+    assert "2026-10-22 09:30 by berlin" in out and "2026-10-22 09:32 by la" in out
+    assert table(out)[0][1:4] == ["✓ present", "fingerprint+patch", "2026-10-22 09:31"]  # WHEN: the newest
+    assert table(cli(store, "idea", "list").stdout)[0][5] == "2026-10-22"
+    assert [row[6] for row in table(cli(store, "nb", "list").stdout)] == ["2026-10-22", "2026-10-22"]
+    assert "2026-10-22 16:00 by tokyo" in cli(store, "nb", "show", "late.ipynb").stdout
+    key = cli(store, "status").stdout.split(LEGEND)[1]
+    assert [row[3] for row in table(key)] == ["2026-10-22", "2026-10-22"]
+    subs = [row[:2] for row in table(cli(store, "sub", "list").stdout)]
+    assert subs == [["7", "2026-10-22 23:00"], ["8", "2026-10-23 01:00"]]  # by instant, not by text
+
+    viewer_tz("JST-9")
+    assert table(cli(store, "log", "-n", "1").stdout)[0][0] == "2026-10-23 10:00"
+    assert table(cli(store, "idea", "show", "retry").stdout)[0][3] == "2026-10-22 18:31"
+    assert [row[6] for row in table(cli(store, "nb", "list").stdout)] == ["2026-10-22", "2026-10-23"]
+    assert [row[:2] for row in table(cli(store, "sub", "list").stdout)] == [
+        ["7", "2026-10-23 08:00"],
+        ["8", "2026-10-23 10:00"],
+    ]
+
+
+def test_times_that_cannot_be_converted_are_shown_as_written(store: Store):
+    put_event(store, "idea.add", {"id": "x", "title": "t"}, "0001-01-01T00:00:00+05:00", "old")
+    put_event(store, "sub.upsert", {"id": "9", "date": "9999-12-31T23:59:59-05:00"}, "sometime", "odd")
+    assert [row[0] for row in table(cli(store, "log").stdout)] == ["sometime", "0001-01-01 00:00"]
+    assert table(cli(store, "sub", "list").stdout)[0][1] == "9999-12-31 23:59"
+    assert "0001-01-01 00:00 by old" in cli(store, "idea", "show", "x").stdout
+
+
+@pytest.mark.parametrize(
+    ("command", "wanted"),
+    [
+        (["init"], ["--name NAME"]),
+        (["idea", "add"], ["--owner NAME", "--fingerprint FINGERPRINT"]),
+        (
+            ["idea", "update"],
+            ["--owner NAME", "--add-fingerprint FINGERPRINT", "--remove-fingerprint FINGERPRINT"],
+        ),
+        (["idea", "list"], ["--tag TAG", "--owner NAME"]),
+        (["nb", "add"], ["--name NAME", "--tag TAG"]),
+        (["nb", "list"], ["--tag TAG", "-n N", "(0 = all)"]),
+        (["nb", "update"], ["--name NAME", "--add-tag TAG"]),
+        (["status"], ["--tag TAG", "-n N", "(0 = all)"]),
+        (["sub", "add"], ["--status TEXT", "Kaggle"]),
+        (["sub", "list"], ["-n N", "(0 = all)"]),
+        (["sub", "link"], ["sub link [OPTIONS] ID REF"]),
+        (["log"], ["-n N", "(0 = all)", "--json"]),
+    ],
+)
+def test_options_follow_one_convention(store: Store, command: list[str], wanted: list[str]):
+    """-n N with 0 = all, --json on the listings, and word metavars (TAG, NAME, REF) rather than letters."""
+    raw = cli(store, *command, "--help").output
+    for text in wanted:
+        assert text in flat(raw), text
+    assert not re.search(r"--[\w-]+ [A-Z]\b(?!/)", raw)  # no one-letter metavar such as `--tag T`

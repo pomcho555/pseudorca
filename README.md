@@ -45,9 +45,13 @@ The tour uses synthetic files from `examples/make_demo_files.py`: an offline wor
 notebook versions, a patch, and two results tables.
 
 ```bash
-python examples/make_demo_files.py demo && cd demo && git init
+git clone https://github.com/pomcho555/pseudorca
+python3 pseudorca/examples/make_demo_files.py ~/pseudorca-demo
+cd ~/pseudorca-demo && git init
 pseudorca init --competition word-problems
 ```
+
+`bash pseudorca/examples/demo.sh ~/pseudorca-demo` runs the whole tour at once.
 
 ### 1. Write down the ideas
 
@@ -126,8 +130,13 @@ need.
 
 ### 7. The leaderboard
 
+In a real competition, `pseudorca kaggle sync` fills in your team's submissions and scores from Kaggle.
+It only reads. Here we add three submissions by hand:
+
 ```bash
-pseudorca kaggle sync           # read-only: your team's submissions and scores
+pseudorca sub add 1001 --nb base.ipynb --score 0.412 --date 2026-01-05
+pseudorca sub add 1002 --nb base.ipynb --score 0.398 --date 2026-01-06   # the same notebook again
+pseudorca sub add 1003 --nb next.ipynb --score 0.437 --date 2026-01-07
 pseudorca lb --diff 1001 1003   # is this LB gap bigger than the LB noise?
 ```
 

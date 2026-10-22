@@ -123,8 +123,9 @@ def build_user_message(
 ) -> str:
     """The task: the idea, its fingerprints and patch, the deterministic findings and an overview of the tree.
 
-    With `snippets` (the single-shot fallback) the retrieved snippets replace the tool instructions. The
-    whole message is redacted.
+    With `snippets` (the single-shot fallback) the retrieved snippets replace the tool instructions. Each
+    piece is redacted before it is cut to its length, since a secret cut in two no longer looks like one,
+    and the whole message is redacted again.
     """
     fingerprints = [f"- {fp}" for fp in idea.fingerprints[:MAX_FINGERPRINTS]] or ["(none)"]
     if len(idea.fingerprints) > MAX_FINGERPRINTS:
@@ -133,7 +134,7 @@ def build_user_message(
         f"Idea: {idea.id}",
         f"Title: {idea.title or '(none)'}",
         "Description:",
-        _cut(idea.description.strip(), DESCRIPTION_CHARS) or "(none)",
+        _cut(redact(idea.description.strip()), DESCRIPTION_CHARS) or "(none)",
         "",
         "Fingerprints (the team's own checks: plain text must occur in the code, re: marks a regex, and a "
         "leading ! means it must not occur):",
@@ -142,7 +143,7 @@ def build_user_message(
         "Patch of the change (a unified diff; its context lines may differ from this notebook):",
     ]
     if patch_text and patch_text.strip():
-        parts += ["<patch>", _cut(patch_text.strip("\n"), PATCH_CHARS), "</patch>"]
+        parts += ["<patch>", _cut(redact(patch_text.strip("\n")), PATCH_CHARS), "</patch>"]
     else:
         parts.append("(none)")
     parts += [
@@ -183,17 +184,20 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _finding_lines(findings: list[Finding]) -> list[str]:
-    """Each finding's status and note, its detail as compact JSON, and up to 5 evidence lines."""
+    """Each finding's status and note, its detail as compact JSON, and up to 5 evidence lines.
+
+    Each piece is redacted before it is clipped. The detail is redacted before it becomes JSON, whose
+    escaped quotes (\\") would hide an assignment such as api_key="..." from redaction.
+    """
     lines = []
     for f in findings:
-        note = f" ({util.clip(' '.join(f.note.split()), 300)})" if f.note else ""
+        note = f" ({util.clip(' '.join(redact(f.note).split()), 300)})" if f.note else ""
         lines.append(f"- {f.method}: {f.status}{note}")
         if f.detail:
-            lines.append(
-                f"    detail: {util.clip(json.dumps(f.detail, ensure_ascii=False, default=str), 400)}"
-            )
+            detail = json.dumps(redact_value(f.detail), ensure_ascii=False, default=str)
+            lines.append(f"    detail: {util.clip(detail, 400)}")
         for e in f.evidence[:FINDING_EVIDENCE]:
-            first = next((ln.strip() for ln in e.quote.splitlines() if ln.strip()), "")
+            first = next((ln.strip() for ln in redact(e.quote).splitlines() if ln.strip()), "")
             where = f"{e.path}:{e.line}" if e.line else e.path
             lines.append(f"    {where}: {util.clip(first, 200)}")
     return lines

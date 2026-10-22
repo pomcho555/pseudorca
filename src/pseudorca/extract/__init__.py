@@ -21,7 +21,8 @@ if TYPE_CHECKING:
     from pseudorca.model import Notebook
     from pseudorca.store import Store
 
-EXTRACTOR_VERSION = 1  # bump when extraction output changes, so cached trees are rebuilt
+EXTRACTOR_VERSION = 2  # bump when extraction output changes, so cached trees are rebuilt
+FORMAT_SUFFIXES = {".ipynb": "ipynb", ".py": "script"}  # the only suffixes that pick the format
 
 
 @dataclass(frozen=True)
@@ -35,18 +36,30 @@ class Limits:
     max_parse_chars: int = 4 << 20  # longer decoded Python is searched by pattern instead of parsed
 
 
-def extract_bytes(data: bytes, name: str = "notebook.ipynb", limits: Limits | None = None) -> Tree:
-    """Extract a notebook (.ipynb JSON) or a script (.py) given as bytes; `name`'s suffix picks the format.
+def suffix_format(name: str | None) -> str:
+    """The format a name ending in .ipynb ("ipynb") or .py ("script") picks, in any case; else "".
 
-    Raises ValueError when an .ipynb is not notebook JSON. Hostile payloads never raise: what cannot be
-    decoded within `limits` is recorded in `tree.warnings`.
+    Any other suffix decides nothing: `v1.5`, `qwen2.5-7b` and `solver v2.1` are labels, not formats.
+    """
+    return FORMAT_SUFFIXES.get(PurePosixPath(name or "").suffix.lower(), "")
+
+
+def extract_bytes(data: bytes, name: str = "notebook.ipynb", limits: Limits | None = None) -> Tree:
+    """Extract a notebook (.ipynb JSON) or a script given as bytes.
+
+    A `name` ending in .ipynb or .py picks the format. Any other name leaves it to the bytes: a JSON object
+    with "cells" or "worksheets" is a notebook, anything else a script. Raises ValueError when an .ipynb is
+    not notebook JSON. Hostile payloads never raise: what cannot be decoded within `limits` is recorded in
+    `tree.warnings`.
     """
     from pseudorca.extract.engine import Extractor
+    from pseudorca.extract.notebook import sniff_notebook
 
     ex = Extractor(limits or Limits())
-    path = PurePosixPath(name or "notebook.ipynb")
-    if path.suffix.lower() == ".ipynb":
-        ex.notebook(data, path.name)
+    fmt = suffix_format(name)
+    doc = None if fmt else sniff_notebook(data)
+    if fmt == "ipynb" or doc is not None:
+        ex.notebook(data if doc is None else doc, PurePosixPath(name or "").name or "notebook")
         fmt = "ipynb"
     else:
         ex.script(data)
@@ -75,7 +88,7 @@ def tree_for(store: Store, nb: Notebook) -> Tree:
     ):
         return tree
     data = _notebook_bytes(store, nb)
-    tree = extract_bytes(data, _format_name(nb, data))
+    tree = extract_bytes(data, _format_name(nb))
     tree.save(cache)
     _prune(cache, tree)
     return tree
@@ -104,12 +117,12 @@ def _notebook_bytes(store: Store, nb: Notebook) -> bytes:
     )
 
 
-def _format_name(nb: Notebook, data: bytes) -> str:
-    """A file name whose suffix picks the format: the notebook's name, else its path, else a guess."""
-    for candidate in (nb.name, nb.path):
-        if candidate and PurePosixPath(candidate).suffix:
-            return candidate
-    return "notebook.ipynb" if data.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] == b"{" else "script.py"
+def _format_name(nb: Notebook) -> str:
+    """The name to extract a registered notebook under: its path, else its name, whichever ends in .ipynb
+    or .py. With neither, extract_bytes looks at the bytes, so a name like `v1.5` cannot turn a notebook
+    into a script."""
+    names = [n for n in (nb.path, nb.name) if n]
+    return next((n for n in names if suffix_format(n)), names[0] if names else "")
 
 
 def _prune(directory: Path, tree: Tree) -> None:

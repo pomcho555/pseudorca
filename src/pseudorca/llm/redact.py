@@ -1,16 +1,25 @@
 """Secret redaction for everything an LLM sees: prompts, tool outputs and transcripts.
 
 Known key formats are replaced by [REDACTED]: OpenAI (sk-, sk-proj-), Anthropic (sk-ant-), GitHub (ghp_,
-gho_, ghu_, ghs_, ghr_, github_pat_), Hugging Face (hf_), AWS access key ids (AKIA, ASIA), Google (AIza),
-Slack (xox?-), JSON web tokens, bearer tokens, private key blocks, passwords in URLs, kaggle.json keys, and
-generic assignments such as `api_key = "..."` or `%env MY_TOKEN=...` (the name stays, the value goes).
+gho_, ghu_, ghs_, ghr_, github_pat_), Hugging Face (hf_), AWS access key ids (AKIA, ASIA) and secret access
+keys, Google (AIza), Slack (xox?-), JSON web tokens, bearer tokens, Basic auth credentials, private key
+blocks, passwords in URLs and kaggle.json keys. Values assigned to secret-like names are replaced too (the
+name stays, the value goes):
+- quoted, with any string prefix or triple quotes: `api_key = "..."`, `client_secret = f"..."`;
+- passwords and passphrases, which may be short or hold spaces: `password = "correct horse battery"`;
+- unquoted, in YAML, INI and .env files: `api_key: ...`, `aws_secret_access_key = ...`;
+- in magics and shell commands: `%env MY_TOKEN=...`, `export MY_TOKEN=...`, `MY_TOKEN=... python run.py`.
 
 Replacements keep every line break, so a redacted file has the line numbers of the original, and quotes
-verified against the redacted view point at the right lines.
+verified against the redacted view point at the right lines. Every rule takes time linear in the text:
+where a match can fail late, its quantifiers are bounded or possessive, and private key blocks are found
+in one pass over their BEGIN and END lines.
 """
 
 from __future__ import annotations
 
+import base64
+import functools
 import re
 import weakref
 from collections.abc import Callable
@@ -29,95 +38,251 @@ def _whole(m: re.Match[str]) -> str:
     return REDACTED + "\n" * m.group(0).count("\n")
 
 
-def _value(m: re.Match[str]) -> str:
-    """Replace only the `value` group, keeping the rest of the match (such as the variable name)."""
+def _span(m: re.Match[str], group: str) -> str:
+    """Replace one group, keeping the rest of the match (such as the variable name) and its line breaks."""
     text, base = m.group(0), m.start()
-    start, end = m.start("value") - base, m.end("value") - base
+    start, end = m.start(group) - base, m.end(group) - base
     return text[:start] + REDACTED + "\n" * text[start:end].count("\n") + text[end:]
 
 
+def _value(m: re.Match[str]) -> str:
+    """Replace only the `value` group."""
+    return _span(m, "value")
+
+
 # a name that holds a secret: api_key, HF_TOKEN, client_secret, db_password (but not tokenizer, ...)
-_SECRET_NAME = re.compile(r"key|secret|passw(?:or)?d|token(?!izer)", re.I)
-# names that hold where a secret is, not the secret: KEY_PATH, token_file, api_key_env, SECRET_NAME
+_SECRET_NAME = re.compile(r"key|secret|passw(?:or)?d|pwd|passphrase|credential|token(?!izer)", re.I)
+# secrets that people choose: they can be short and can hold spaces
+_PASSWORD_WORD = r"passw(?:or)?d|pwd|passphrase"
+_PASSWORD_NAME = re.compile(_PASSWORD_WORD, re.I)
+# names that hold where a secret is, or text about it, not the secret: KEY_PATH, token_file, api_key_env,
+# SECRET_NAME, password_prompt, key_size
 _NOT_SECRET_NAME = re.compile(
-    r"(?:^|[_.-])(?:path|dir|file|url|uri|name|env|var|id|template|format|prefix|suffix|type)s?$", re.I
+    r"(?:^|[_.-])(?:path|dir|file|url|uri|name|env|var|id|template|format|prefix|suffix|type"
+    r"|prompt|hint|policy|label|message|msg|help|header|field|column|length|len|size|count)s?$",
+    re.I,
 )
 # a value that names an environment variable rather than holding a key: "OPENAI_API_KEY"
 _ENV_VAR_VALUE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+# unquoted values that are settings or code rather than secrets: booleans, numbers, words of up to 15
+# letters and dotted names without digits (true, 4096, SecretStr, config.api_key). A longer run of letters
+# can be a key.
+_PLAIN_VALUE = re.compile(
+    r"(?i:true|false|yes|no|on|off|null|none|nil)|[-+]?\d[\d_]*(?:\.\d+)?(?:[eE][-+]?\d+)?"
+    r"|[A-Za-z_]{1,15}|[A-Za-z_]+(?:\.[A-Za-z_]+)+"
+)
+# names made of words, in snake_case or CamelCase without digits (resolved_api_key, InputTokensDetails):
+# code, not a key or token, which are random. Passwords are exempt, as passphrases can look like this.
+_WORDS_NAME = re.compile(r"_*[a-z]{1,16}(?:_+[a-z]{1,16})+_*|_*(?:[A-Z][a-z]{1,16})+")
+# a template with replacement fields (f"{model}_{seed}", "${API_KEY}", "{{ token }}"): it builds a value
+# from others rather than holding one
+_TEMPLATE = re.compile(r"\{[^{}]*\}")
+
+
+def _is_secret_name(name: str) -> bool:
+    return bool(_SECRET_NAME.search(name)) and not _NOT_SECRET_NAME.search(name)
+
+
+def _min_chars(name: str) -> int:
+    """Passwords can be short; keys and tokens are long, and a short value is usually a setting."""
+    return 6 if _PASSWORD_NAME.search(name) else 12
+
+
+def _is_code(name: str, value: str) -> bool:
+    """`value` names something (a variable, a class, an environment variable) or is a template, so it holds
+    no secret itself. For a password only an environment variable's name counts: passphrases can be words."""
+    if _ENV_VAR_VALUE.fullmatch(value):
+        return True
+    return not _PASSWORD_NAME.search(name) and bool(_WORDS_NAME.fullmatch(value) or _TEMPLATE.search(value))
 
 
 def _assignment(m: re.Match[str]) -> str:
     name, value = m.group("name"), m.group("value")
-    if not _SECRET_NAME.search(name) or _NOT_SECRET_NAME.search(name) or _ENV_VAR_VALUE.fullmatch(value):
+    if not _is_secret_name(name) or _is_code(name, value):
         return m.group(0)
     return _value(m)
 
 
-# Each rule: pattern, replacement, and substrings of which one must occur for the rule to run (a fast
+_QUOTED_GROUPS = ("v1", "v2", "v3", "v4")
+
+
+def _password(m: re.Match[str]) -> str:
+    name, group = m.group("name"), next(g for g in _QUOTED_GROUPS if m.group(g) is not None)
+    if _NOT_SECRET_NAME.search(name) or _is_code(name, m.group(group)):
+        return m.group(0)
+    return _span(m, group)
+
+
+def _unquoted(m: re.Match[str]) -> str:
+    name, value = m.group("name"), m.group("value")
+    if (
+        not _is_secret_name(name)
+        or len(value) < _min_chars(name)
+        or _is_code(name, value)
+        or _PLAIN_VALUE.fullmatch(value)
+    ):
+        return m.group(0)
+    return _value(m)
+
+
+def _basic(m: re.Match[str]) -> str:
+    """Basic auth sends base64 of user:password; words after "basic" in prose do not decode to that."""
+    try:
+        raw = base64.b64decode(m.group("value"), validate=True)
+    except ValueError:  # binascii.Error
+        return m.group(0)
+    return _value(m) if b":" in raw else m.group(0)
+
+
+_PEM_BEGIN = re.compile(r"-----BEGIN[A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----")
+_PEM_END = re.compile(r"-----END[A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----")
+_LITERAL_END = re.compile(r"[\"'`]")
+
+
+def _private_keys(text: str) -> str:
+    """Private key blocks (PEM, OpenSSH, PGP), also inside a string literal with \\n escapes.
+
+    A block runs from its BEGIN line to the next END line. Without one it runs to the end of its string
+    literal (the next quote), or of the text. A pattern like BEGIN.*?END would scan the rest of the text
+    again for every BEGIN that has no END; here each header is looked at once.
+    """
+    parts: list[str] = []
+    pos = 0
+    more_ends = True  # False once a search found no END: none follows any later BEGIN either
+    for begin in _PEM_BEGIN.finditer(text):
+        if begin.start() < pos:
+            continue  # inside the block before
+        end = _PEM_END.search(text, begin.end()) if more_ends else None
+        if end is not None:
+            stop = end.end()
+        else:
+            more_ends = False
+            quote = _LITERAL_END.search(text, begin.end())
+            stop = len(text) if quote is None else quote.start()
+        parts += [text[pos : begin.start()], REDACTED + "\n" * text.count("\n", begin.start(), stop)]
+        pos = stop
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _sub(pattern: str, replace: Replace, flags: int = 0) -> Callable[[str], str]:
+    return functools.partial(re.compile(pattern, flags).sub, replace)
+
+
+# A name, and what follows it in an assignment: an optional closing quote or bracket and type annotation,
+# then =, :=, => or :, or a comma after a quoted name ("NAME", "value"), and a string prefix (r, b, u, f, t
+# and pairs such as rb or fr). After an unquoted name, a comma separates arguments: join(pwd, "data").
+# None of the characters that can follow a name can be part of one, so the name is possessive ({0,80}+):
+# it never gives characters back, which would only retry the same failure. The values below are possessive
+# for the same reason: their closing quote, or the end of the line, cannot be part of them.
+_NAME = r"(?P<name>[A-Za-z_][\w.-]{0,80}+)"
+_ASSIGN = (
+    r"""(?:["'][ \t]*,|["']?\]?(?:[ \t]*:[ \t]*[A-Za-z_][\w.\[\]| ]{0,40}?)?[ \t]*(?::=|=>|[=:]))"""
+    r"""[ \t]*[rbuftRBUFT]{0,2}"""
+)
+
+# Each rule: the function that applies it, and substrings of which one must occur for it to run (a fast
 # pre-check; empty means always run). Order matters: specific formats first, generic assignments last.
-_RULES: list[tuple[re.Pattern[str], Replace, tuple[str, ...]]] = [
-    # private key blocks (PEM, OpenSSH, PGP), also inside a string literal with \n escapes
+_RULES: list[tuple[Callable[[str], str], tuple[str, ...]]] = [
+    (_private_keys, ("PRIVATE KEY",)),
+    # AWS secret access keys: credentials files, code and `aws configure set aws_secret_access_key ...`
     (
-        re.compile(
-            r"-----BEGIN[A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----.*?-----END[A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----", re.S
+        _sub(
+            r"(?i)(?<![A-Za-z0-9])aws_?secret_?access_?key[\"']?\]?[ \t]*(?:[:=,][ \t]*)?[\"']?"
+            r"(?P<value>[A-Za-z0-9/+]{40})(?![A-Za-z0-9/+=])",
+            _value,
         ),
-        _whole,
-        ("PRIVATE KEY",),
+        ("ecret", "ECRET"),
     ),
-    # an unterminated block: everything up to the end of the string literal, or of the text
-    (re.compile(r"-----BEGIN[A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----[^\"'`]*"), _whole, ("PRIVATE KEY",)),
     # OpenAI sk-... and sk-proj-..., Anthropic sk-ant-...
-    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}"), _whole, ("sk-",)),
+    (_sub(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}", _whole), ("sk-",)),
     # GitHub classic and fine-grained tokens
-    (re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}"), _whole, ("gh",)),
-    (re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"), _whole, ("github_pat_",)),
+    (_sub(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}", _whole), ("gh",)),
+    (_sub(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}", _whole), ("github_pat_",)),
     # Hugging Face
-    (re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"), _whole, ("hf_",)),
+    (_sub(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}", _whole), ("hf_",)),
     # AWS access key ids
-    (re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"), _whole, ("AKIA", "ASIA")),
+    (_sub(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])", _whole), ("AKIA", "ASIA")),
     # Google API keys
-    (re.compile(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}"), _whole, ("AIza",)),
+    (_sub(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}", _whole), ("AIza",)),
     # Slack
-    (re.compile(r"(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}"), _whole, ("xox",)),
-    # JSON web tokens
+    (_sub(r"(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}", _whole), ("xox",)),
+    # JSON web tokens. A token starts where its first segment does (not after a letter, digit, _ or -), and
+    # the possessive {8,}+ never gives characters back, so each segment is scanned a bounded number of times.
     (
-        re.compile(r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
-        _whole,
+        _sub(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}+\.eyJ[A-Za-z0-9_-]{8,}+\.[A-Za-z0-9_-]{8,}+", _whole),
         ("eyJ",),
     ),
     # kaggle.json: {"username": "...", "key": "<32 hex>"}
-    (re.compile(r"""["']key["']\s*:\s*["'](?P<value>[0-9a-fA-F]{32})(?=["'])"""), _value, ("key",)),
+    (_sub(r"""["']key["']\s*:\s*["'](?P<value>[0-9a-fA-F]{32})(?=["'])""", _value), ("key",)),
     # Authorization: Bearer <token>
-    (re.compile(r"(?i)\bbearer[ \t]+(?P<value>[A-Za-z0-9._~+/-]{16,}=*)"), _value, ("earer", "EARER")),
-    # scheme://user:password@host
-    (re.compile(r"(?<=://)(?P<value>[^\s/:@'\"]+:[^\s/@'\"]+)@"), _value, ("://",)),
-    # api_key = "...", password: str = "...", "token": "...", os.environ["X_SECRET"] = "...",
-    # login(token="..."), os.environ.setdefault("X_TOKEN", "...")
+    (_sub(r"(?i)\bbearer[ \t]+(?P<value>[A-Za-z0-9._~+/-]{16,}=*)", _value), ("earer", "EARER")),
+    # Authorization: Basic <base64 of user:password>
     (
-        re.compile(
-            r"""\b(?P<name>[A-Za-z_][\w.-]{0,80})["']?\]?(?:[ \t]*:[ \t]*[A-Za-z_][\w.\[\]| ]{0,40}?)?"""
-            r"""[ \t]*(?::=|=>|[=:,])[ \t]*[rbuRBU]{0,2}(?P<q>["'])(?P<value>[^\s"'`\\<>|]{12,4096})(?P=q)"""
+        _sub(r"(?i)\bbasic[ \t]+(?P<value>[A-Za-z0-9+/]{4,}+={0,2})(?![A-Za-z0-9+/=])", _basic),
+        ("asic", "ASIC"),
+    ),
+    # scheme://user:password@host
+    (_sub(r"(?<=://)(?P<value>[^\s/:@'\"]+:[^\s/@'\"]+)@", _value), ("://",)),
+    # api_key = "...", password: str = "...", "token": "...", os.environ["X_SECRET"] = "...",
+    # login(token="..."), os.environ.setdefault("X_TOKEN", "..."), API_TOKEN = """...""", key = f"..."
+    (
+        _sub(
+            r"\b"
+            + _NAME
+            + _ASSIGN
+            + r'(?P<q>"""|'
+            + r"'''|[\"'])"
+            + r"""(?P<value>[^\s"'`\\<>|]{12,4096}+)(?P=q)""",
+            _assignment,
         ),
-        _assignment,
         (),
+    ),
+    # passwords and passphrases: the value runs to its closing quote and may be short or hold spaces
+    (
+        _sub(
+            r"(?<![\w.-])(?=[\w.-]{0,80}?(?i:"
+            + _PASSWORD_WORD
+            + r"))"
+            + _NAME
+            + _ASSIGN
+            + r'(?:"""(?P<v1>[^"\n]{6,4096}+)"""'
+            + r"|'''(?P<v2>[^'\n]{6,4096}+)'''"
+            + r'|"(?P<v3>(?:[^"\\\n]|\\.){6,4096}+)"'
+            + r"|'(?P<v4>(?:[^'\\\n]|\\.){6,4096}+)')",
+            _password,
+        ),
+        ("assw", "ASSW", "wd", "WD", "assphrase", "ASSPHRASE"),
     ),
     # %env NAME=value, %set_env NAME value, export NAME=value (magics may be commented out by extraction)
     (
-        re.compile(
-            r"(?:%env|%set_env|\bexport)[ \t]+(?P<name>[A-Za-z_]\w{0,80})(?:[ \t]*=[ \t]*|[ \t]+)"
-            r"(?P<value>[^\s\"'`$(){}\[\],;<>|]{12,4096})"
+        _sub(
+            r"(?:%env|%set_env|\bexport)[ \t]+(?P<name>[A-Za-z_]\w{0,80}+)(?:[ \t]*=[ \t]*|[ \t]+)"
+            r"(?P<value>[^\s\"'`$(){}\[\],;<>|]{12,4096})",
+            _assignment,
         ),
-        _assignment,
         ("%env", "%set_env", "export"),
     ),
     # NAME=value in .env files and shell commands (HF_TOKEN=... python run.py)
     (
-        re.compile(
-            r"(?:^|(?<=[\s;&|]))(?P<name>[A-Za-z_]\w{0,80})=(?P<value>[^\s\"'`$(){}\[\],;<>|]{12,4096})(?=\s|$)",
+        _sub(
+            r"(?:^|(?<=[\s;&|]))(?P<name>[A-Za-z_]\w{0,80}+)=(?P<value>[^\s\"'`$(){}\[\],;<>|]{12,4096}+)(?=\s|$)",
+            _assignment,
             re.M,
         ),
-        _assignment,
         ("=",),
+    ),
+    # unquoted settings, one per line (YAML, INI, .env, properties): `api_key: ...`, `password = ...`,
+    # `- token: ...`, with an optional comment after the value
+    (
+        _sub(
+            r"^[ \t]*(?:-[ \t]+)?"
+            + _NAME
+            + r"[ \t]*[:=][ \t]*(?P<value>[^\s\"'`\\<>|()\[\]{},$]{6,4096}+)(?:[ \t]+[#;][^\n]*)?[ \t]*\r?$",
+            _unquoted,
+            re.M,
+        ),
+        (),
     ),
 ]
 
@@ -126,10 +291,10 @@ def redact(text: str) -> str:
     """`text` with secrets replaced by [REDACTED]. Line breaks are kept, so line numbers do not move."""
     if not text:
         return text
-    for pattern, replace, hints in _RULES:
+    for apply, hints in _RULES:
         if hints and not any(h in text for h in hints):
             continue
-        text = pattern.sub(replace, text)
+        text = apply(text)
     return text
 
 

@@ -30,9 +30,10 @@ harness changes and inference speed-ups, as done in Kaggle competitions. It answ
 ```
 .pseudorca/
   config.toml                          settings (commit it; never put secrets in it)
-  events/YYYY-MM/<ulid>-<actor>.json   one immutable event per file
+  events/YYYY-MM/<ulid>-<actor>.json   one immutable event per file (actor slugged for the file name)
   blobs/<sha256[:2]>/<sha256>          notebooks, patches, result tables
   cache/                               local only (extracted trees, LLM transcripts, Kaggle pulls); gitignored
+  .gitattributes                       blobs/** -text -diff, so git never rewrites blob bytes
 ```
 
 Every event file has this shape:
@@ -40,8 +41,23 @@ Every event file has this shape:
 
 - Events are never edited. A correction is a new event.
 - Replaying events in id order rebuilds the state.
-- Concurrent edits resolve last-writer-wins per field. Lists are replaced whole.
-- Unknown event types and fields are ignored with a warning, so older versions can read newer stores.
+- **Order is causal first.** A new event's ULID is later than both the wall clock and every event the
+  writer's store already holds (a hybrid logical clock).
+  - So an edit made after pulling a teammate's change wins over it, even when the writer's clock is
+    behind.
+  - When the newest event is more than a minute ahead of the local clock, a warning is shown.
+  - The `time` field keeps the writer's wall clock (with its offset) for display. Displays convert it to
+    the viewer's time zone.
+- **Conflicts:** concurrent edits resolve last-writer-wins per field, and lists are replaced whole.
+  - Exception: a second `nb.add` of the same notebook (registered on two clones before a pull) merges.
+    Tags and applies are unioned, and empty fields are filled; nothing already recorded is wiped.
+- **Forward compatibility:** unknown event types, unknown fields and a newer `schema` are ignored with
+  one warning each, so older versions can read newer stores.
+- **Validation:**
+  - Each event is checked before it changes the state. A malformed value is dropped with a warning:
+    a non-sha256 `patch` or `results`, or a score that is not a finite number.
+  - Blob ids must be sha256 before they become paths, and blob bytes are checked against their name on
+    read. A Git LFS pointer or a line-ending conversion is an error, not a wrong verdict.
 - Because every event is a new file, git merges never conflict.
 
 | type | data |
@@ -49,7 +65,7 @@ Every event file has this shape:
 | `idea.add` | `id`, `title`, `description`, `owner`, `status`, `tags[]`, `links[]`, `fingerprints[]`, `patch` (blob sha or null) |
 | `idea.update` | `id` plus any idea fields to change |
 | `nb.add` | `id` (sha256 of the bytes), `name`, `path`, `kernel`, `version`, `parent`, `applies[]`, `tags[]`, `note`, `stored`, `size` |
-| `nb.update` | `id` plus any of `name`, `path`, `kernel`, `version`, `parent`, `applies`, `tags`, `note` |
+| `nb.update` | `id` plus any of `name`, `path`, `kernel`, `version`, `parent`, `applies`, `tags`, `note`, `stored` |
 | `sub.upsert` | `id` plus any of `competition`, `nb`, `description`, `date`, `status`, `public_score`, `private_score`, `submitted_by`, `source`, `extra{}` |
 | `run.add` | `id` (ULID), `results` (blob sha), `format` (`csv`/`jsonl`), `nb`, `label`, `protocol`, `note`, `n_rows`, `file` (source file name) |
 | `audit.verdict` | `nb`, `idea`, `idea_rev`, `status`, `method`, `evidence[{path,line,quote}]`, `note`, `model`, `detail{}` |
@@ -71,12 +87,16 @@ the OS user.
 
 **Effective verdict** for a (notebook, idea) pair. Each rule applies only if the ones before it did not.
 1. The latest `human` verdict.
-2. The deterministic methods (`fingerprint`, `patch`) for the current rev:
-   - if they agree on `present` or `absent` and none says `partial`, that status;
-   - if one says `present` and the other `absent`, `conflict`.
-3. A non-`unknown` `llm` verdict.
-4. `partial` if a deterministic method said so.
-5. `unknown`.
+2. The deterministic methods (`fingerprint`, `patch`) for the current rev: if they agree on `present`
+   or `absent` and none says `partial`, that status.
+3. A non-`unknown` `llm` verdict. This also settles a fingerprint/patch contradiction.
+4. `conflict` if the deterministic methods contradict each other.
+5. `partial` if a deterministic method said so.
+6. `unknown`.
+
+For each machine method, the record that counts is the one made with the newest extractor version
+(deterministic) or prompt version (llm), and the latest among equals. A teammate on an older Pseudorca
+therefore cannot override a newer one's verdict.
 
 ## Tree and extraction (`pseudorca.tree`, `pseudorca.extract`)
 
@@ -264,6 +284,12 @@ It also lists ideas the notebook claims (`applies`) that the audit found absent.
 
 Heavy imports (`numpy`, `openai`, `anthropic`, `kaggle`) happen inside the functions that need them.
 
-Commands turn user mistakes into one-line errors with `commands._common.user_errors()`. That covers
-store errors, `LookupError`, `ValueError`, `OSError`, and any exception types passed to it. Raise
-`LookupError` or `ValueError` for user mistakes, never `KeyError`, which is treated as a bug.
+`pseudorca init` creates a store or completes a partial one (for example a clone without `events/`).
+It never overwrites existing files such as a committed `config.toml`.
+
+Expected failures become one-line errors in every command: store errors, `LookupError`, `ValueError`
+and `OSError`.
+- `cli.LazyGroup.invoke` does this around each command, and `commands._common.user_errors()` does it inside
+  a command, for any extra exception types passed to it.
+- Set `PSEUDORCA_DEBUG=1` to see tracebacks.
+- Raise `LookupError` or `ValueError` for user mistakes, never `KeyError`, which is treated as a bug.

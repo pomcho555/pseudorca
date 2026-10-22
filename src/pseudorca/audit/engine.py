@@ -4,20 +4,26 @@ For each idea:
 1. fingerprint (when the idea has fingerprints) and patch (when it has a patch);
 2. the LLM: never, always, or (auto) only when the deterministic verdicts are not conclusive;
 3. each new finding is written as one audit.verdict event (nothing is written in a dry run).
-A method is skipped when an equal verdict is already recorded (same notebook, idea, rev, method and
-extractor version; for the LLM also the same model and PROMPT_VERSION), unless `force` is given.
+A method is skipped, unless `force` is given, when the recorded verdict that counts for it (see
+`State.current_records`) is at least as new as what this run would record: for fingerprint and patch, a
+`detail.extractor_version` >= EXTRACTOR_VERSION; for the LLM, the same model with `detail.prompt_version`
+>= PROMPT_VERSION, or any model with a newer prompt version (versions compare as integers). So an older
+Pseudorca never redoes a newer one's verdicts, and an upgrade redoes older ones.
+
+The ledger is read once per audit: the effective verdicts are computed at the end from that snapshot plus
+this run's own findings, never by replaying the events after each one is written.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pseudorca.audit import fingerprint, patch
 from pseudorca.audit.types import Evidence, Finding
 from pseudorca.model import DETERMINISTIC, VERDICT_STATUSES, Effective, Idea, Notebook, State, VerdictRecord
-from pseudorca.store import Store, StoreError
+from pseudorca.store import Event, Store, StoreError
 from pseudorca.tree import Tree
 
 if TYPE_CHECKING:
@@ -35,7 +41,7 @@ class AuditRow:
 
     idea: Idea
     findings: list[Finding] = field(default_factory=list)  # new ones: written, or to be written in a dry run
-    skipped: list[str] = field(default_factory=list)  # methods whose equal verdict was already recorded
+    skipped: list[str] = field(default_factory=list)  # methods whose current verdict was already recorded
     effective: Effective | None = None  # after writing; in a dry run, as if the findings had been written
     llm_note: str = ""  # why the LLM was wanted but not asked
     llm_error: str = ""  # the LLM was asked and failed
@@ -79,6 +85,8 @@ def audit_notebook(
     run = _Run(store, nb, llm_mode, settings, force, dry_run, tree, judge, on_progress)
     for idea in ideas:
         run.rows.append(run.audit(idea))
+    for row in run.rows:  # once, at the end: as recorded before this run, plus this run's findings
+        row.effective = run.view(row.idea).effective_verdict(nb.id, row.idea.id)
     if run.unconfigured:
         n = run.unconfigured
         if llm_mode == "auto":
@@ -92,6 +100,14 @@ def audit_notebook(
 
 def _ideas(n: int) -> str:
     return f"{n} idea" if n == 1 else f"{n} ideas"
+
+
+def _int(value: Any) -> int:
+    """A version from event data as an integer (0 when it is missing or not a number)."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class _Run:
@@ -109,6 +125,8 @@ class _Run:
     ) -> None:
         self.store, self.nb, self.llm_mode, self.settings = store, nb, llm_mode, settings
         self.force, self.dry_run, self.judge, self.on_progress = force, dry_run, judge, on_progress
+        self.state = store.state()  # the one snapshot this run reads; its own findings are kept in `new`
+        self.new: dict[str, list[VerdictRecord]] = {}
         self._tree = tree
         self._patch: tuple[str, str | None] | None = None  # (idea id, patch text) of the current idea
         self.rows = AuditRows()
@@ -122,27 +140,34 @@ class _Run:
             self._tree = extract.tree_for(self.store, self.nb)
         return self._tree
 
+    def view(self, idea: Idea) -> State:
+        """The verdicts on `idea` (recorded before this run, then this run's), judged for `idea` as given."""
+        st = State()
+        st.ideas[idea.id] = idea
+        st.verdicts[(self.nb.id, idea.id)] = [
+            *self.state.verdicts.get((self.nb.id, idea.id), []),
+            *self.new.get(idea.id, []),
+        ]
+        return st
+
     def audit(self, idea: Idea) -> AuditRow:
-        row = AuditRow(idea)
-        records = self.store.state().verdicts.get((self.nb.id, idea.id), [])
-        rev = idea.rev
-        # latest still-valid recorded verdict per deterministic method, replaced below by new findings
         from pseudorca.extract import EXTRACTOR_VERSION
 
-        current = {
-            r.method: _as_finding(r)
-            for r in records
-            if r.idea_rev == rev
-            and r.method in DETERMINISTIC
-            and r.detail.get("extractor_version") == EXTRACTOR_VERSION
-        }
+        row = AuditRow(idea)
+        current = self.view(idea).current_records(self.nb.id, idea.id)
+        det = {m: _as_finding(current[m]) for m in DETERMINISTIC if m in current}
         methods = []
         if any(f.strip() for f in idea.fingerprints):
             methods.append("fingerprint")
         if idea.patch:
             methods.append("patch")
         for method in methods:
-            if method in current and not self.force:
+            rec = current.get(method)
+            if (
+                rec is not None
+                and not self.force
+                and _int(rec.detail.get("extractor_version")) >= EXTRACTOR_VERSION
+            ):
                 row.skipped.append(method)
                 continue
             if method == "fingerprint":
@@ -153,24 +178,22 @@ class _Run:
             if found is not None:
                 found.detail = {**found.detail, "extractor_version": EXTRACTOR_VERSION}
                 self.record(row, idea, found)
-                current[method] = found
+                det[method] = found
         if not methods:
             row.notes.append("no fingerprints or patch to check")
 
-        det = list(current.values())
-        if self.llm_mode == "always" or (self.llm_mode == "auto" and not conclusive(f.status for f in det)):
-            self.ask_llm(idea, row, records, det)
-
-        if self.dry_run:
-            row.effective = _simulated(self.store.state(), self.nb.id, idea, row.findings)
-        else:
-            row.effective = self.store.state().effective_verdict(self.nb.id, idea.id)
+        findings = [det[m] for m in DETERMINISTIC if m in det]
+        if self.llm_mode == "always" or (
+            self.llm_mode == "auto" and not conclusive(f.status for f in findings)
+        ):
+            self.ask_llm(idea, row, current.get("llm"), findings)
         return row
 
     def patch_text(self, idea: Idea, row: AuditRow) -> str | None:
         if self._patch is None or self._patch[0] != idea.id:
             try:
-                text: str | None = self.store.get_blob(idea.patch or "").decode("utf-8", "replace")
+                # utf-8-sig: a byte order mark would otherwise hide the first file header
+                text: str | None = self.store.get_blob(idea.patch or "").decode("utf-8-sig", "replace")
             except StoreError as e:
                 text = None
                 row.notes.append(f"patch unavailable: {e}")
@@ -178,22 +201,25 @@ class _Run:
         return self._patch[1]
 
     def record(self, row: AuditRow, idea: Idea, finding: Finding) -> None:
-        if not self.dry_run:
-            self.store.append("audit.verdict", finding.event_data(self.nb.id, idea))
+        data = finding.event_data(self.nb.id, idea)
+        event = None if self.dry_run else self.store.append("audit.verdict", data)
+        self.new.setdefault(idea.id, []).append(_record(data, event))
         row.findings.append(finding)
 
-    def ask_llm(self, idea: Idea, row: AuditRow, records: list[VerdictRecord], det: list[Finding]) -> None:
+    def ask_llm(self, idea: Idea, row: AuditRow, current: VerdictRecord | None, det: list[Finding]) -> None:
         settings = self.settings
         if settings is None:
             # a teammate's LLM verdict for this rev is enough; otherwise the idea waits for an LLM
-            if not any(r.method == "llm" and r.idea_rev == idea.rev for r in records):
+            if current is None:
                 self.unconfigured += 1
                 row.llm_note = "LLM not configured"
             return
         from pseudorca import llm
 
-        if not self.force and any(
-            _same_llm(r, idea.rev, settings.label, llm.PROMPT_VERSION) for r in records
+        if (
+            not self.force
+            and current is not None
+            and _llm_is_current(current, settings.label, llm.PROMPT_VERSION)
         ):
             row.skipped.append("llm")
             return
@@ -227,42 +253,41 @@ class _Run:
         self.record(row, idea, found)
 
 
-def _same_llm(r: VerdictRecord, rev: str, label: str, prompt_version: str) -> bool:
-    return (
-        r.method == "llm"
-        and r.idea_rev == rev
-        and r.model == label
-        and str(r.detail.get("prompt_version", "")) == str(prompt_version)
+def _llm_is_current(r: VerdictRecord, label: str, prompt_version: str) -> bool:
+    """Whether the LLM verdict that counts makes asking `label` now pointless: it came from the same model
+    with this prompt version or a newer one, or from any model with a newer one (an older prompt's answer
+    would never count over it)."""
+    recorded, ours = _int(r.detail.get("prompt_version")), _int(prompt_version)
+    return recorded > ours or (recorded == ours and r.model == label)
+
+
+def _record(data: dict[str, Any], event: Event | None) -> VerdictRecord:
+    """The record a finding's event makes (in a dry run, without an event id)."""
+    return VerdictRecord(
+        event_id=event.id if event else "",
+        nb=data["nb"],
+        idea=data["idea"],
+        idea_rev=data["idea_rev"],
+        status=data["status"],
+        method=data["method"],
+        evidence=list(data["evidence"]),
+        note=data["note"],
+        model=data["model"],
+        detail=dict(data["detail"]),
+        time=event.time if event else "",
+        actor=event.actor if event else "",
     )
 
 
 def _as_finding(r: VerdictRecord) -> Finding:
     evidence = [
-        Evidence(str(e.get("path", "")), e.get("line"), str(e.get("quote", "")))
+        Evidence(
+            str(e.get("path", "")),
+            e.get("line"),
+            str(e.get("quote", "")),
+            e["col"] if type(e.get("col")) is int else None,
+        )
         for e in r.evidence
         if isinstance(e, dict)
     ]
     return Finding(r.status, r.method, evidence, note=r.note, model=r.model, detail=dict(r.detail))
-
-
-def _simulated(state: State, nb_id: str, idea: Idea, findings: list[Finding]) -> Effective | None:
-    """The effective verdict as if `findings` had been written after the recorded verdicts."""
-    sim = State()
-    sim.ideas[idea.id] = idea
-    new = [
-        VerdictRecord(
-            event_id="",
-            nb=nb_id,
-            idea=idea.id,
-            idea_rev=idea.rev,
-            status=f.status,
-            method=f.method,
-            evidence=[e.to_dict() for e in f.evidence],
-            note=f.note,
-            model=f.model,
-            detail=dict(f.detail),
-        )
-        for f in findings
-    ]
-    sim.verdicts[(nb_id, idea.id)] = [*state.verdicts.get((nb_id, idea.id), []), *new]
-    return sim.effective_verdict(nb_id, idea.id)

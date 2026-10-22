@@ -6,7 +6,8 @@ cannot write anywhere.
 
 Path scheme used by the extractor:
     cells/cell_004.py            code cell 4 after IPython magics were turned into plain Python
-    cells/cell_004.sh            a %%bash / %%sh cell
+    cells/cell_004.sh            a %%bash / %%sh cell (the magic line kept as "# %%bash", so lines match the cell)
+    cells/cell_004.<magic>.txt   any other cell magic (same line numbering)
     markdown/cell_000.md         markdown cell 0 (context for humans and the LLM; never evidence)
     files/<path>                 a file the notebook writes (%%writefile, Path.write_text, open().write)
     payloads/cell_004/<n>.<ext>  an embedded string payload after decoding (base64, zlib, lzma, ...)

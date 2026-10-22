@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -120,6 +121,59 @@ def test_random_sign_flips_above_sixteen_items():
     assert res.p_value == pytest.approx(1 / (stats.RANDOM_FLIPS + 1))  # only the identity flip reaches it
 
 
+def _all_favour_b(n: int) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+    return {f"q{i}": [0.5] for i in range(n)}, {f"q{i}": [0.51 + i / 100] for i in range(n)}
+
+
+def test_too_few_items_never_name_a_winner():
+    # one item: the bootstrap interval is a single point that excludes 0, but p = 1
+    one = stats.compare({"x": [0.50]}, {"x": [0.51]}, resamples=500)
+    assert one.ci_low > 0 and one.p_value == 1.0 and one.se == 0
+    assert one.verdict == "too few items" and one.small_n and one.min_items == 6
+    # 2, 3 and 5 items that all favour B: the interval excludes 0, but the exact p is 0.5, 0.25, 0.0625
+    for n, p in ((2, 0.5), (3, 0.25), (5, 0.0625)):
+        res = stats.compare(*_all_favour_b(n), resamples=500)
+        assert res.ci_low > 0 and res.p_value == pytest.approx(p)
+        assert res.verdict == "too few items" and res.small_n
+        lower = stats.compare(*_all_favour_b(n), resamples=500, higher_is_better=False)
+        assert lower.verdict == "too few items"
+    # six items is the fewest that can reach p < 0.05: 2 of the 64 sign flips are as extreme as the data
+    six = stats.compare(*_all_favour_b(6), resamples=500)
+    assert six.p_value == pytest.approx(2 / 64) and six.verdict == "B better" and six.small_n
+    # at 90% confidence five items are enough
+    five = stats.compare(*_all_favour_b(5), resamples=500, confidence=0.9)
+    assert five.min_items == 5 and five.verdict == "B better"
+
+
+def test_a_winner_needs_the_permutation_test_to_agree():
+    # Five items favour B by 0.2 and one favours A by 0.02. Every bootstrap mean is positive, but 4 of the
+    # 64 sign flips are as extreme as the data (p = 0.0625), so the difference is within noise.
+    a = {f"q{i}": [0.5] for i in range(6)}
+    b = {**{f"q{i}": [0.7] for i in range(5)}, "q5": [0.48]}
+    res = stats.compare(a, b, resamples=2000)
+    assert res.ci_low > 0 and res.p_value == pytest.approx(4 / 64)
+    assert res.verdict == "within noise" and res.min_items == 6
+    assert stats.compare(b, a, resamples=2000).verdict == "within noise"
+
+
+def test_min_items_and_small_n():
+    assert [stats.min_items(c) for c in (0.5, 0.8, 0.9, 0.95, 0.99, 0.999)] == [3, 4, 5, 6, 8, 11]
+    nine, ten = _arms(9, 2, 0.2, seed=5), _arms(10, 2, 0.2, seed=5)
+    assert stats.compare(*nine, resamples=500).small_n
+    res = stats.compare(*ten, resamples=500)
+    assert not res.small_n and res.verdict == "B better"
+    strict = stats.compare(*ten, resamples=500, confidence=0.999)  # 99.9% needs 11 items
+    assert strict.small_n and strict.min_items == 11 and strict.verdict == "too few items"
+
+
+def test_random_flips_resolve_a_high_confidence():
+    # 30 items that all favour B: the exact p is 2/2^30, so even a 99.999% verdict can name a winner
+    a = {f"q{i}": [0.0] for i in range(30)}
+    b = {f"q{i}": [1.0 + i / 100] for i in range(30)}
+    res = stats.compare(a, b, resamples=200, confidence=0.99999)
+    assert res.p_value < 1e-5 and res.verdict == "B better"
+
+
 def test_aa_needs_two_draws_on_five_items():
     four = {f"q{i}": np.array([0.0, 1.0]) for i in range(4)}
     assert stats.aa(four, resamples=200) is None
@@ -131,6 +185,7 @@ def test_aa_needs_two_draws_on_five_items():
     # alternate split: draws 0, 2 (all 0.0) versus draws 1, 3 (all 1.0)
     assert check.diff == pytest.approx(1.0) and check.draws_a == (1, 1.0, 2)
     assert check.aa_a is None and check.aa_b is None
+    assert check.verdict == "too few items"  # five items cannot reach p < 0.05
 
 
 def test_compare_attaches_aa_checks_on_the_compared_items():
@@ -144,7 +199,7 @@ def test_compare_attaches_aa_checks_on_the_compared_items():
     assert stats.compare(a, fewer, resamples=500).aa_a is None
 
 
-def _sub(sid: str, nb: str | None, score: float | None) -> Submission:
+def _sub(sid: str, nb: Any, score: Any) -> Submission:
     return Submission(id=sid, nb=nb, public_score=score)
 
 
@@ -170,6 +225,30 @@ def test_lb_noise_pooled_sd_by_hand():
 def test_lb_noise_needs_a_repeat():
     assert stats.lb_noise([]) is None
     assert stats.lb_noise([_sub("1", "a", 0.5), _sub("2", "b", 0.6), _sub("3", None, 0.7)]) is None
+
+
+def test_lb_noise_skips_scores_that_are_not_finite_numbers():
+    subs = [
+        _sub("1", "nb1", 0.70),
+        _sub("2", "nb1", 0.72),
+        _sub("3", "nb1", "pending"),  # a hand-edited or foreign event
+        _sub("4", "nb1", "0.9"),
+        _sub("5", "nb1", math.nan),
+        _sub("6", "nb1", -math.inf),
+        _sub("7", "nb1", True),
+        _sub("8", "nb1", [0.7]),
+        _sub("9", ["nb1"], 0.9),  # not a notebook id
+        _sub("10", "nb2", np.float64(0.5)),
+        _sub("11", "nb2", np.int64(1)),
+    ]
+    noise = stats.lb_noise(subs)
+    assert noise is not None
+    assert noise.groups == {"nb1": [0.70, 0.72], "nb2": [0.5, 1.0]}
+    assert all(type(v) is float for scores in noise.groups.values() for v in scores)
+    assert (noise.n_groups, noise.n_subs) == (2, 4)
+    assert stats.lb_noise([_sub("1", "a", "x"), _sub("2", "a", "y")]) is None
+    assert stats.finite(0.5) == 0.5 and stats.finite(np.float32(0.25)) == 0.25
+    assert [stats.finite(v) for v in (None, "1", True, math.nan, math.inf, 10**400)] == [None] * 6
 
 
 def test_lb_diff():

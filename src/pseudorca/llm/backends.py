@@ -3,7 +3,7 @@
 OpenAIBackend talks to any OpenAI-compatible chat-completions endpoint (OpenAI, vLLM, Ollama, LM Studio,
 llama.cpp, ...), AnthropicBackend to the Anthropic API, and FakeBackend plays a script for tests. SDKs are
 imported only when a backend first sends a request, and their errors become LLMError messages that never
-contain an API key.
+contain an API key. A local endpoint is reached directly: never through a proxy, never by a redirect.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pseudorca import util
 from pseudorca.llm import LLMError, LLMSettings, endpoint_host, is_local
 from pseudorca.llm.redact import REDACTED, redact
 from pseudorca.llm.tools import ToolHandler, anthropic_tools, openai_tools, parse_verdict
@@ -197,6 +198,25 @@ def describe_error(e: BaseException, settings: LLMSettings, key: str | None = No
     return f"{settings.label} at {endpoint_host(settings)} failed{code}: {type(e).__name__}: {text}"
 
 
+def _direct_http_client(openai: Any, base_url: str | None) -> Any:
+    """The openai SDK's HTTP client for a local endpoint: no proxy from the environment, no redirects.
+
+    By default httpx sends requests through HTTP_PROXY, HTTPS_PROXY or ALL_PROXY (or the system proxy on
+    macOS and Windows) unless NO_PROXY names the host, so a "local" request, with the notebook's code, would
+    reach the proxy's host. trust_env=False stops that. A redirect could lead to another host as well, so
+    it is not followed: the request fails with its HTTP status. trust_env=False also drops SSL_CERT_FILE
+    and SSL_CERT_DIR, which are applied here instead, for https endpoints with their own certificates.
+    """
+    options: dict[str, Any] = {"trust_env": False, "follow_redirects": False}
+    cafile = os.environ.get("SSL_CERT_FILE") or None
+    capath = os.environ.get("SSL_CERT_DIR") or None
+    if (base_url or "").lower().startswith("https:") and (cafile or capath):
+        import ssl
+
+        options["verify"] = ssl.create_default_context(cafile=cafile, capath=None if cafile else capath)
+    return openai.DefaultHttpxClient(**options)
+
+
 class _SDKBackend(Backend):
     sdk = ""  # the package to import
     key_env = ""  # the default environment variable for the key
@@ -214,7 +234,7 @@ class _SDKBackend(Backend):
                 self._client = self._connect(self._key)
             except ImportError:
                 raise LLMError(
-                    f'the {self.sdk} package is not installed; install it with: pip install "pseudorca[llm]"'
+                    f"the {self.sdk} package is not installed; {util.install_hint('llm')}"
                 ) from None
             except Exception as e:
                 raise LLMError(describe_error(e, self.settings, self._key)) from None
@@ -260,9 +280,12 @@ class OpenAIBackend(_SDKBackend):
         return key
 
     def _connect(self, key: str | None) -> Any:
-        from openai import OpenAI
+        import openai
 
-        return OpenAI(base_url=self.settings.base_url, api_key=key)
+        if not is_local(self.settings):
+            return openai.OpenAI(base_url=self.settings.base_url, api_key=key)
+        http_client = _direct_http_client(openai, self.settings.base_url)
+        return openai.OpenAI(base_url=self.settings.base_url, api_key=key, http_client=http_client)
 
     def _create(self, **kwargs: Any) -> Any:
         resp = self._request(self.client().chat.completions.create, model=self.settings.model, **kwargs)

@@ -2,12 +2,14 @@
 
 A comparison pairs the two arms by item, averages each item's draws, and reports the mean per-item
 difference with a two-stage bootstrap interval (resample items, then draws within each item), a sign-flip
-permutation p-value, and the minimum detectable effect at 80% power.
+permutation p-value, and the minimum detectable effect at 80% power. It names a winner only when both the
+interval and the permutation test say so.
 """
 
 from __future__ import annotations
 
 import math
+import numbers
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -20,9 +22,14 @@ if TYPE_CHECKING:
 
 TIE = 1e-12  # |d_i| below this is a tie
 EXACT_MAX_ITEMS = 16  # the permutation test enumerates all 2^n sign flips up to this many items
-RANDOM_FLIPS = 20_000  # random sign flips above it
+RANDOM_FLIPS = 20_000  # random sign flips above it (more for a confidence above 99.9%, see _flips)
+FLIPS_PER_ALPHA = 20  # enough random flips for this many expected hits at p = 1 − confidence...
+MAX_FLIPS = 1_000_000  # ...up to this many (a p-value floor of 1e-6)
 MDE_Z = 2.8  # z(0.975) + z(0.80): an effect of 2.8 SE is detected 80% of the time at 95% confidence
 AA_MIN_ITEMS = 5  # an A/A check needs this many items with 2+ draws
+SMALL_N = 10  # with fewer items the interval and p-value are rough
+WITHIN_NOISE = "within noise"
+TOO_FEW = "too few items"  # fewer than min_items(confidence): no outcome could be significant
 _CHUNK = 2_000_000  # array elements per vectorised batch, to bound memory
 
 
@@ -51,8 +58,10 @@ class CompareResult:
     aa_b: CompareResult | None
     resamples: int
     seed: int
-    verdict: str  # "B better" | "A better" | "within noise"
+    verdict: str  # "B better" | "A better" | "within noise" | "too few items"
     higher_is_better: bool = True
+    min_items: int = 1  # the fewest items that can show a difference at this confidence (see min_items)
+    small_n: bool = False  # fewer than SMALL_N items (or min_items): the interval and p-value are rough
 
 
 @dataclass
@@ -76,7 +85,10 @@ def compare(
 ) -> CompareResult:
     """Compare two arms given as {item: draws}. Only items with at least one value in both arms count.
 
-    The verdict is "B better" or "A better" when the interval excludes 0, else "within noise". Each arm
+    The verdict is "B better" or "A better" when the interval excludes 0 and the sign-flip p-value is below
+    1 − confidence. With fewer than `min_items(confidence)` items no outcome can pass that test, and the
+    verdict is "too few items": over a handful of items that all favour one side, every bootstrap mean has
+    that sign, so the interval alone would always name a winner. Otherwise it is "within noise". Each arm
     also gets an A/A check (see `aa`) on the compared items.
     """
     result = _compare(
@@ -106,8 +118,9 @@ def aa(
 ) -> CompareResult | None:
     """An A/A check: split each item's draws alternately (0, 2, 4... vs 1, 3, 5...) and compare the halves.
 
-    Uses the items with 2+ draws, and needs at least 5 of them (else None). Its interval should include 0;
-    if it does not, the draws are probably not independent repeats.
+    Uses the items with 2+ draws, and needs at least 5 of them (else None). Its verdict should be "within
+    noise"; a winner means the halves differ, so the draws are probably not independent repeats. Below
+    `min_items(confidence)` items (6 at 95%) the verdict is "too few items": only the interval is informative.
     """
     multi = {k: v for k, v in _clean(arm).items() if v.size >= 2}
     if len(multi) < AA_MIN_ITEMS:
@@ -122,6 +135,21 @@ def aa(
     )
 
 
+def min_items(confidence: float = 0.95) -> int:
+    """The fewest items with which the sign-flip test can reach p < 1 − confidence.
+
+    The smallest p-value n items can give is 2/2^n (every difference on one side), so with fewer items no
+    outcome is significant at that confidence: 6 items at 95%, 5 at 90%, 8 at 99%.
+    """
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be between 0 and 1")
+    alpha = 1 - confidence
+    n = 1
+    while 2.0 ** (1 - n) >= alpha:
+        n += 1
+    return n
+
+
 def spread(counts: Iterable[int]) -> tuple[int, float, int]:
     """(min, median, max) of draw counts; (0, 0.0, 0) when empty."""
     values = sorted(int(c) for c in counts)
@@ -130,17 +158,29 @@ def spread(counts: Iterable[int]) -> tuple[int, float, int]:
     return (values[0], float(statistics.median(values)), values[-1])
 
 
+def finite(value: object) -> float | None:
+    """`value` as a float if it is a finite real number (not a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    try:
+        x = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return x if math.isfinite(x) else None
+
+
 def lb_noise(subs: Iterable[Submission]) -> LbNoise | None:
     """Pooled SD of public scores over notebooks with 2+ scored submissions; None if there are none.
 
-    sd = sqrt(sum((n_g - 1) * s_g^2) / sum(n_g - 1)), with s_g each notebook's sample SD.
+    sd = sqrt(sum((n_g - 1) * s_g^2) / sum(n_g - 1)), with s_g each notebook's sample SD. A score that is not
+    a finite number (say, from a hand-edited event) is skipped.
     """
     by_nb: dict[str, list[float]] = {}
     for s in subs:
-        score = s.public_score
-        if not s.nb or score is None or not math.isfinite(score):
+        score = finite(s.public_score)
+        if score is None or not isinstance(s.nb, str) or not s.nb:
             continue
-        by_nb.setdefault(s.nb, []).append(float(score))
+        by_nb.setdefault(s.nb, []).append(score)
     groups = {nb: scores for nb, scores in by_nb.items() if len(scores) >= 2}
     if not groups:
         return None
@@ -207,17 +247,18 @@ def _compare(
     alpha = 1 - confidence
     lo, hi = (float(q) for q in np.quantile(boot, [alpha / 2, 1 - alpha / 2]))
     se = float(boot.std(ddof=1))
-    p = _sign_flip_p(d, np.random.default_rng(perm_seq))
+    p = _sign_flip_p(d, np.random.default_rng(perm_seq), _flips(alpha))
 
     better = d if higher_is_better else -d
     tie = np.abs(d) < TIE
     wins, losses = int((~tie & (better > 0)).sum()), int((~tie & (better < 0)).sum())
-    if lo > 0:
-        verdict = "B better" if higher_is_better else "A better"
-    elif hi < 0:
-        verdict = "A better" if higher_is_better else "B better"
+    need = min_items(confidence)
+    if len(items) < need:
+        verdict = TOO_FEW
+    elif (lo > 0 or hi < 0) and p < alpha:  # both the interval and the permutation test see a difference
+        verdict = "B better" if (lo > 0) == higher_is_better else "A better"
     else:
-        verdict = "within noise"
+        verdict = WITHIN_NOISE
     return CompareResult(
         n_items=len(items),
         only_a=sorted(has_a - has_b),
@@ -242,6 +283,8 @@ def _compare(
         seed=int(seed),
         verdict=verdict,
         higher_is_better=higher_is_better,
+        min_items=need,
+        small_n=len(items) < max(SMALL_N, need),
     )
 
 
@@ -295,8 +338,17 @@ def _bootstrap(
     return out
 
 
-def _sign_flip_p(d: np.ndarray, rng: np.random.Generator) -> float:
-    """Two-sided sign-flip permutation p-value of mean(d) = 0: exact up to 16 items, else 20,000 flips."""
+def _flips(alpha: float) -> int:
+    """Random sign flips for a p-value that can resolve `alpha`: RANDOM_FLIPS, or more when alpha is so
+    small that they would give fewer than FLIPS_PER_ALPHA expected hits at p = alpha (up to MAX_FLIPS).
+
+    A random-flip p-value is never below 1/(flips + 1), so too few flips would hide every difference."""
+    return min(MAX_FLIPS, max(RANDOM_FLIPS, math.ceil(FLIPS_PER_ALPHA / alpha)))
+
+
+def _sign_flip_p(d: np.ndarray, rng: np.random.Generator, flips: int = RANDOM_FLIPS) -> float:
+    """Two-sided sign-flip permutation p-value of mean(d) = 0: exact up to 16 items, else `flips` random
+    sign flips (the p-value is then at least 1/(flips + 1))."""
     import numpy as np
 
     n = d.size
@@ -307,8 +359,8 @@ def _sign_flip_p(d: np.ndarray, rng: np.random.Generator) -> float:
         return float((np.abs(signs @ d) >= threshold).mean())
     hits = 0
     chunk = max(1, _CHUNK // n)
-    for start in range(0, RANDOM_FLIPS, chunk):
-        m = min(chunk, RANDOM_FLIPS - start)
+    for start in range(0, flips, chunk):
+        m = min(chunk, flips - start)
         signs = 1 - 2 * rng.integers(0, 2, size=(m, n), dtype=np.int8)
         hits += int((np.abs(signs @ d) >= threshold).sum())
-    return (hits + 1) / (RANDOM_FLIPS + 1)
+    return (hits + 1) / (flips + 1)

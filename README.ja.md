@@ -42,9 +42,13 @@ pip install "pseudorca[all] @ git+https://github.com/pomcho555/pseudorca"
 `examples/make_demo_files.py` が作る合成データで一周します。中身は、オフラインで文章題を解くソルバーのノートブック 2 版、パッチ 1 つ、結果表 2 つです。
 
 ```bash
-python examples/make_demo_files.py demo && cd demo && git init
+git clone https://github.com/pomcho555/pseudorca
+python3 pseudorca/examples/make_demo_files.py ~/pseudorca-demo
+cd ~/pseudorca-demo && git init
 pseudorca init --competition word-problems
 ```
+
+`bash pseudorca/examples/demo.sh ~/pseudorca-demo` を使うと、以下を一度に通しで実行できます。
 
 ### 1. 改善を登録する
 
@@ -123,8 +127,12 @@ pseudorca compare base next
 
 ### 7. リーダーボード
 
+実際のコンペでは、`pseudorca kaggle sync` がチームの提出とスコアを Kaggle から取り込みます（読み取りのみ）。ここでは手で 3 件追加します。
+
 ```bash
-pseudorca kaggle sync           # 読み取りのみ：チームの提出とスコア
+pseudorca sub add 1001 --nb base.ipynb --score 0.412 --date 2026-01-05
+pseudorca sub add 1002 --nb base.ipynb --score 0.398 --date 2026-01-06   # 同じノートブックをもう一度
+pseudorca sub add 1003 --nb next.ipynb --score 0.437 --date 2026-01-07
 pseudorca lb --diff 1001 1003   # この LB の差は LB のブレより大きいか
 ```
 

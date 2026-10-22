@@ -43,6 +43,16 @@ class _Source:
         return _Source(self.cell, origin, self.pdir, self.level + 1)
 
 
+def _lines_before(text: str, appended: str) -> int:
+    """Line N of `appended` is line N + this of `text + appended`.
+
+    Line breaks count as the tree counts them (\\r\\n, \\r, \\n). Text that does not end with one shares
+    its last line with the first appended line, and a "\\r" then a "\\n" across the seam are one break.
+    """
+    breaks = text.count("\n") + text.count("\r") - text.count("\r\n")
+    return breaks - 1 if text.endswith("\r") and appended.startswith("\n") else breaks
+
+
 class Extractor:
     """Collects one notebook's (or script's) files into a Tree. Nothing is ever run."""
 
@@ -59,8 +69,9 @@ class Extractor:
 
     # ----- entry points ----------------------------------------------------------------------------
 
-    def notebook(self, data: bytes, name: str) -> None:
-        """Extract an .ipynb (raises ValueError when it is not notebook JSON)."""
+    def notebook(self, data: bytes | dict[str, Any], name: str) -> None:
+        """Extract an .ipynb, from its bytes or its parsed JSON (raises ValueError when it is not notebook
+        JSON)."""
         nb = read_notebook(data, name)
         self.cells = nb.count
         for w in nb.warnings:
@@ -141,12 +152,13 @@ class Extractor:
                 return
             self.warn(f"cell {i}: %%{label(magic.name)} without a file name")
         body = _Source(i, f"cell {i} > %%{label(magic.name)}", src.pdir)
+        text = magic.lead + magic.body  # the magic line stays as a comment: line N is the cell's line N
         if kind == "shell":
-            self.tree.add_text(f"{stem}.sh", magic.body, body.origin)
+            self.tree.add_text(f"{stem}.sh", text, body.origin)
         else:
             slug = _SLUG_RE.sub("_", magic.name).strip("_") or "magic"
-            self.tree.add_text(f"{stem}.{slug[:40]}.txt", magic.body, body.origin)
-        self._scan_text(magic.body, body)
+            self.tree.add_text(f"{stem}.{slug[:40]}.txt", text, body.origin)
+        self._scan_text(magic.body, body, offset=magic.line)
 
     def _writefile(self, i: int, magic: magics.CellMagic, path: str, append: bool) -> None:
         target = "files/" + safe_path(path)
@@ -154,7 +166,7 @@ class Extractor:
         existing = self.tree.files.get(target)
         offset = 0
         if append and existing is not None and not existing.binary:
-            offset = existing.text.count("\n")
+            offset = _lines_before(existing.text, magic.body)
             self.tree.add_text(
                 target, existing.text + magic.body, f"{existing.origin}; {origin}", replace=True
             )
@@ -231,7 +243,7 @@ class Extractor:
             offset = 0
         else:
             self.tree.add_text(target, base.text + w.content, f"{base.origin}; {origin}", replace=True)
-            offset = base.text.count("\n")
+            offset = _lines_before(base.text, w.content)
         if target.endswith(".py"):
             self._scan_nested(w.content, src.nested(origin), offset=offset)
 

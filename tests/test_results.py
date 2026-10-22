@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import numpy as np
 import pytest
 from click.testing import CliRunner
 
+from pseudorca import util
 from pseudorca.cli import main
+from pseudorca.model import Run
 from pseudorca.notebooks import register_bytes
-from pseudorca.results import format_for, load_table, per_item, pool
+from pseudorca.results import distinct_runs, format_for, load_table, per_item, pool
 from pseudorca.store import Store
 
 # ----- parsing -------------------------------------------------------------------------------------
@@ -135,6 +139,15 @@ def test_pool_renumbers_draws_across_runs():
     assert pool([t1]) is t1
     with pytest.raises(ValueError):
         pool([])
+
+
+def test_distinct_runs_keeps_the_first_run_of_each_table():
+    x, y = "a" * 64, "b" * 64
+    runs = [Run("r1", x), Run("r2", y), Run("r3", x), Run("r4", x)]
+    kept, repeats = distinct_runs(runs)
+    assert [r.id for r in kept] == ["r1", "r2"]
+    assert [(r.id, first.id) for r, first in repeats] == [("r3", "r1"), ("r4", "r1")]
+    assert distinct_runs([]) == ([], [])
 
 
 # ----- CLI -----------------------------------------------------------------------------------------
@@ -269,7 +282,7 @@ def test_compare_by_run_id_label_and_notebook(two_notebooks: Store, tmp_path: Pa
     assert lines[1] == f"B  run {new[:10]} (new): 30 items, 3 draws per item"
     assert "items compared: 30 (only in A: 0, only in B: 0)" in by_id.output
     assert "B − A: +0.1" in by_id.output and "95% CI [+0.0" in by_id.output
-    assert "verdict: B better (the 95% CI excludes 0)" in by_id.output
+    assert "verdict: B better (the 95% CI excludes 0 and p < 0.05)" in by_id.output
     assert "A/A on A (draws split in halves)" in by_id.output and "MDE80" in by_id.output
 
     prefix = new[:16].lower()  # case-insensitive unique prefix
@@ -367,6 +380,82 @@ def test_compare_json(two_notebooks: Store, tmp_path: Path):
     assert data["draws_a"] == [2, 2.0, 2] and data["draws_b"] == [1, 1.0, 1]
     assert data["aa_a"]["n_items"] == 12 and data["aa_b"] is None
     assert "only 12" not in result.stdout  # warnings go to stderr
+    assert data["small_n"] is False and data["min_items"] == 5 and data["arm_a"]["duplicates"] == []  # at 90%
+
+
+def test_compare_with_too_few_items_names_no_winner(store: Store, tmp_path: Path):
+    # five items, all better in B: the interval excludes 0, but 2 of the 32 sign flips are as extreme
+    a, b = tmp_path / "a.csv", tmp_path / "b.csv"
+    a.write_text("item,score\n" + "".join(f"q{i},0.{i}0\nq{i},0.{i}2\n" for i in range(1, 6)))
+    b.write_text("item,score\n" + "".join(f"q{i},0.{i}5\n" for i in range(1, 6)))
+    _add(store, a, "--label", "a")
+    _add(store, b, "--label", "b")
+    text = _cli(store, "compare", "a", "b", "--resamples", "500")
+    assert text.exit_code == 0, text.output
+    assert "B wins/losses/ties: 5/0/0  p = 0.062" in text.stdout and "95% CI [+0.0" in text.stdout
+    assert "A/A on A (draws split in halves)" in text.stdout and "too few items to judge" in text.stdout
+    assert text.stdout.splitlines()[-1] == (
+        "verdict: too few items (5 items cannot reach p < 0.05 in the sign-flip test; it needs 6 or more)"
+    )
+    assert "only 5 item(s) compared" in text.stderr
+    data = json.loads(_cli(store, "compare", "a", "b", "--json", "--resamples", "500").stdout)
+    assert data["verdict"] == "too few items" and data["ci_low"] > 0
+    assert data["small_n"] is True and data["min_items"] == 6
+    assert data["aa_a"]["verdict"] == "too few items"
+    at_90 = _cli(store, "compare", "a", "b", "--resamples", "500", "--confidence", "0.9")
+    assert "verdict: B better (the 90% CI excludes 0 and p < 0.1)" in at_90.stdout
+
+
+def test_aa_check_flags_draws_that_are_not_repeats(store: Store, tmp_path: Path):
+    a, b = tmp_path / "a.csv", tmp_path / "b.csv"
+    # in A, draw 1 is always 0.1 above draw 0: the halves differ on every one of 12 items
+    a.write_text("item,score\n" + "".join(f"q{i},0.{i:02d}\nq{i},0.{i + 10:02d}\n" for i in range(12)))
+    b.write_text("item,score\n" + "".join(f"q{i},0.{i:02d}\n" for i in range(12)))
+    _add(store, a, "--label", "a")
+    _add(store, b, "--label", "b")
+    out = _cli(store, "compare", "a", "b", "--resamples", "500").stdout
+    assert "A/A on A (draws split in halves): +0.10" in out
+    assert "excludes 0: the draws may not be independent repeats" in out
+
+
+def test_compare_pools_each_results_table_once(store: Store, tmp_path: Path):
+    base = _write_run(tmp_path / "base.csv", shift=0, draws=3, seed=1)
+    first = _add(store, base, "--label", "base")
+    _add(store, _write_run(tmp_path / "next.csv", shift=0.05, draws=3, seed=2), "--label", "next")
+    alone = _cli(store, "compare", first, "next", "--resamples", "1000")
+    assert alone.exit_code == 0, alone.output
+
+    # A teammate imports the same file under the same label before pulling. After the merge, label base
+    # has two runs and one table, and nothing in the importer's `run add` could have warned.
+    mate = Store.at(store.root)
+    mate.actor_override = "mate"
+    copy = util.new_ulid()
+    sha = util.sha256_bytes(base.read_bytes())
+    mate.append("run.add", {"id": copy, "results": sha, "format": "csv", "label": "base", "n_rows": 90})
+    merged = _cli(store, "compare", "base", "next", "--resamples", "1000")
+    assert merged.exit_code == 0, merged.output
+    assert (
+        f"label base: 1 run repeats the results table of an earlier run ({copy[:10]} (base) = "
+        f"{first[:10]} (base)); each table is pooled once"
+    ) in merged.stderr
+    lines = merged.stdout.splitlines()
+    assert lines[0] == "A  label base: 30 items, 3 draws per item"  # not "2 runs, 30 items, 6 draws"
+    assert lines[1:] == alone.stdout.splitlines()[1:]  # the same interval and A/A check as the one run
+    data = json.loads(_cli(store, "compare", "base", "next", "--json", "--resamples", "1000").stdout)
+    assert data["arm_a"]["runs"] == [first] and data["arm_a"]["duplicates"] == [copy]
+
+    # the same table on both sides is compared with itself
+    other = _add(store, base, "--label", "copy")
+    cross = _cli(store, "compare", "copy", "base", "--resamples", "500")
+    assert cross.exit_code == 0, cross.output
+    assert "A and B share 1 results table; its rows are compared with themselves" in cross.stderr
+    assert "verdict: within noise" in cross.stdout
+
+    listing = _cli(store, "run", "list")
+    assert listing.exit_code == 0, listing.output
+    assert "2 runs repeat the results table of an earlier run" in listing.stderr
+    shown = _cli(store, "run", "show", first)
+    assert f"also in runs {copy[:10]} (base), {other[:10]} (copy)" in shown.stdout
 
 
 def _sub(
@@ -423,3 +512,88 @@ def test_lb_with_repeats_and_diff(two_notebooks: Store):
     assert no_score.exit_code == 1 and "1006 has no public score" in no_score.output
     unknown = _cli(store, "lb", "--diff", "1001", "77")
     assert unknown.exit_code == 1 and "no submission matches '77'" in unknown.output
+
+
+def test_list_options_follow_the_conventions(store: Store):
+    for args in (("lb",), ("run", "list")):
+        usage = _cli(store, *args, "--help").output
+        assert "-n N" in usage and "INTEGER RANGE" not in usage and "(0 = all)" in usage, usage
+        assert "--json" in usage
+    run_ids = [
+        _add(store, _write_run(store.root.parent / f"r{n}.csv", shift=0, draws=1, seed=n)) for n in range(4)
+    ]
+    latest = _cli(store, "run", "list", "-n", "2").output
+    assert [line.split()[0] for line in latest.splitlines()[2:4]] == [r[:10] for r in run_ids[2:]]
+    assert "(2 older runs not shown)" in latest
+    assert len(json.loads(_cli(store, "run", "list", "-n", "0", "--json").stdout)) == 4
+
+
+def test_lb_json(two_notebooks: Store):
+    store = two_notebooks
+    empty = json.loads(_cli(store, "lb", "--json").stdout)
+    assert empty == {"submissions": [], "total": 0, "noise": None}
+    _sub(store, "1001", "base.ipynb", 0.70, "2026-10-01 10:00:00")
+    _sub(store, "1002", "base.ipynb", 0.72, "2026-10-02 10:00:00")
+    _sub(store, "1003", "new.ipynb", 0.75, "2026-10-03 10:00:00")
+    data = json.loads(_cli(store, "lb", "--json").stdout)
+    assert [s["id"] for s in data["submissions"]] == ["1001", "1002", "1003"] and data["total"] == 3
+    assert data["submissions"][2]["public_score"] == 0.75
+    sd = math.sqrt(0.0002)
+    assert data["noise"]["sd"] == pytest.approx(sd) and data["noise"]["n_subs"] == 2
+    limited = json.loads(_cli(store, "lb", "--json", "-n", "1", "--nb", "base.ipynb").stdout)
+    assert [s["id"] for s in limited["submissions"]] == ["1002"] and limited["total"] == 2
+    every = json.loads(_cli(store, "lb", "--json", "-n", "0").stdout)
+    assert len(every["submissions"]) == 3
+
+    diff = json.loads(_cli(store, "lb", "--diff", "1001", "1003", "--json").stdout)
+    assert (diff["a"]["id"], diff["b"]["id"]) == ("1001", "1003")
+    assert diff["diff"] == pytest.approx(0.05) and diff["z"] == pytest.approx(0.05 / (sd * math.sqrt(2)))
+    assert diff["verdict"] == "B higher, beyond LB noise" and diff["noise"]["n_groups"] == 1
+
+
+def test_lb_survives_a_malformed_score(two_notebooks: Store):
+    store = two_notebooks
+    _sub(store, "1001", "base.ipynb", 0.70, "2026-10-01")
+    _sub(store, "1002", "base.ipynb", 0.72, "2026-10-02")
+    nb_id = Store.at(store.root).state().resolve_nb("base.ipynb").id
+    # a teammate's hand-edited event: the score is not a number
+    store.append("sub.upsert", {"id": "1003", "nb": nb_id, "description": "rerun", "public_score": "pending"})
+    result = _cli(store, "lb")
+    assert result.exit_code == 0, result.output
+    assert "from 1 notebook and 2 submissions" in result.output
+    no_score = _cli(store, "lb", "--diff", "1001", "1003")
+    assert no_score.exit_code == 1 and "1003 has no public score" in no_score.output
+
+
+@pytest.fixture
+def viewer_zone(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
+    """Switch the time zone the CLI shows times in (TZ); the original zone is restored afterwards."""
+
+    def switch(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield switch
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_times_are_shown_in_the_viewers_zone(
+    two_notebooks: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, viewer_zone: Callable[[str], None]
+):
+    store = two_notebooks
+    monkeypatch.setattr(util, "now_iso", lambda: "2026-10-22T18:30:26+09:00")  # written in Tokyo
+    path = _write_run(tmp_path / "a.csv", shift=0, draws=1, seed=1, n_items=3)
+    run_id = _add(store, path, "--label", "tokyo")
+    _sub(store, "2001", "base.ipynb", 0.5, "2026-10-02T08:00:00+00:00")  # Kaggle dates are UTC
+    _sub(store, "2002", "base.ipynb", 0.6, "2026-10-03")  # a bare date stays a date
+
+    viewer_zone("UTC")
+    assert "2026-10-22 09:30" in _cli(store, "run", "list").output.splitlines()[2]
+    assert f"{'added':<9} 2026-10-22 09:30 by tester" in _cli(store, "run", "show", run_id).output
+    viewer_zone("America/Los_Angeles")
+    assert "2026-10-22 02:30" in _cli(store, "run", "list").output.splitlines()[2]
+    viewer_zone("Asia/Tokyo")
+    rows = {line.split()[0]: line for line in _cli(store, "lb").output.splitlines()[2:4]}
+    assert "2026-10-02 17:00" in rows["2001"] and "2026-10-03" in rows["2002"]
+    assert "(2026-10-02 17:00)" in _cli(store, "lb", "--diff", "2001", "2002").output

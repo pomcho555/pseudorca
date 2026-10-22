@@ -132,7 +132,7 @@ def _lineage(state: State) -> str:
 
 
 def _submissions(state: State, lb_noise: Any) -> str:
-    subs = sorted(state.subs.values(), key=lambda s: (s.date, s.id))
+    subs = sorted(state.subs.values(), key=lambda s: (util.instant(s.date), s.id))
     if not subs:
         return '<p class="muted">No submissions yet (<code>pseudorca kaggle sync</code> or <code>pseudorca sub add</code>).</p>'
     rows = []

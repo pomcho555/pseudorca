@@ -118,3 +118,14 @@ def test_demo_flow(store: Store, demo: Path, monkeypatch: pytest.MonkeyPatch):
 
     code, out = _run(store, "report")
     assert code == 0 and (store.root / "cache" / "report.html").exists()
+
+
+def test_store_problems_are_one_line_errors_in_every_command(store: Store, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("PSEUDORCA_DEBUG", raising=False)
+    (store.root / "config.toml").write_bytes(b"[store\nname = \xff\n")
+    assert CliRunner().invoke(main, ["--store", str(store.root), "status"]).exit_code == 0  # needs no config
+    for args in (["sub", "add", "1", "--score", "0.5"], ["report"]):
+        out = CliRunner().invoke(main, ["--store", str(store.root), *args])
+        assert out.exit_code == 1, (args, out.output)
+        assert out.output.startswith("Error: ") and "Traceback" not in out.output, (args, out.output)
+        assert "config.toml" in out.output or "store" in out.output

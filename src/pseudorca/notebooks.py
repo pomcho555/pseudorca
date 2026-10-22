@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from pseudorca import util
@@ -36,7 +36,7 @@ def check_notebook_bytes(data: bytes, label: str) -> None:
     """Refuse an .ipynb that is not notebook JSON (for example a Git LFS pointer)."""
     try:
         doc = json.loads(data.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         doc = None
     if not (isinstance(doc, dict) and ("cells" in doc or "worksheets" in doc)):
         first = data[:60].decode("utf-8", "replace").splitlines()[0] if data.strip() else "(empty)"
@@ -79,7 +79,9 @@ def register_bytes(
     `parent` must be the full id of a registered notebook. Returns (notebook, created).
     """
     applies, tags = list(dict.fromkeys(applies)), list(dict.fromkeys(tags))
-    if any(PurePosixPath(x).suffix.lower() == ".ipynb" for x in (name, path) if x):
+    from pseudorca.extract import suffix_format
+
+    if (suffix_format(path) or suffix_format(name)) == "ipynb":  # the extractor's own rule: path first
         check_notebook_bytes(data, path or name)
     sha = util.sha256_bytes(data)
     st = store.state()

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import random
 import string
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -251,10 +253,109 @@ def test_redact_generic_assignments_keep_the_name(template: str):
         'cache_dir = "/tmp/cache/somewhere/deep"',
         'print("task-1234567890abcdefghijklmnop")',
         'short_key = "abc123"',
+        # code and settings that the rules for unquoted values, passwords and Basic auth must not touch
+        "api_key = config.api_key",
+        "token = tokenizer.eos_token",
+        "password: SecretStr",
+        "num_tokens = len(tokenizer.encode(text))",
+        "    max_tokens: 4096",
+        "key_size = 2048",
+        "use_auth_token: true",
+        "api_key: ${OPENAI_API_KEY}",
+        "secret_key = SECRET_KEY",
+        "pwd = os.getcwd()",
+        'password = os.environ.get("DB_PASSWORD")',
+        "password_file = /run/secrets/db-password-0001",
+        'KEY_IDEA = "rerank the beam with a verifier, width 4"',
+        'password_prompt = "Enter the password for the vault"',
+        'print("token", "is not valid for this endpoint")',
+        "A basic implementation of beam search",
+        "Basic usage: call solve() on each task",
+        "self.api_key = resolved_api_key",
+        "input_tokens_details: InputTokensDetails",
+        '__all__ = ["ClientSecrets", "AsyncClientSecrets"]',
+        'getter = getattr(credentials, "get_frozen_credentials", None)',
+        'train = pd.read_csv(join(pwd, "./data/train-set-2024.csv"))',
+        'cache_key = f"{model_name}_{seed}_{temperature}"',
+        'api_key: "${OPENAI_API_KEY}"',
     ],
 )
 def test_redact_leaves_ordinary_code_alone(text: str):
     assert redact(text) == text
+
+
+def _words(n: int) -> str:
+    rng = random.Random(n)
+    return " ".join(
+        "".join(rng.choice(string.ascii_lowercase) for _ in range(rng.randint(4, 7))) for _ in range(n)
+    )
+
+
+# (template, value): redact(template.format(v=value)) must be template.format(v=REDACTED)
+SECRET_FORMS = {
+    "aws credentials file": (
+        "[default]\naws_secret_access_key = {v}\nregion = eu-west-1\n",
+        fake_secret("", 40, ALNUM + "/+"),
+    ),
+    "aws credentials file, letters only": (
+        "[profile ci]\naws_secret_access_key = {v}\n",
+        fake_secret("", 40, string.ascii_letters),
+    ),
+    "aws cli": ("# !aws configure set aws_secret_access_key {v}", fake_secret("", 40, ALNUM + "/+")),
+    "triple double quotes": ('API_TOKEN = """{v}"""', fake_secret("", 24)),
+    "triple single quotes (TOML literal)": ("api_key = '''{v}'''", fake_secret("", 24)),
+    "f-string": ('client_secret = f"{v}"', fake_secret("", 20)),
+    "raw f-string": ("CLIENT_SECRET = rf'{v}'", fake_secret("", 20)),
+    "password with spaces": ('password = "{v}"', _words(4)),
+    "short password": ('db_password = "{v}"', fake_secret("", 7, ALNUM + "!#%&")),
+    "name pwd": ('pwd = "{v}"', fake_secret("", 16)),
+    "name passphrase": ('ssh_passphrase = "{v}"', _words(5)),
+    "name credential": ('db_credential = "{v}"', fake_secret("", 16)),
+    "basic auth": (
+        'headers = {{"Authorization": "Basic {v}"}}',
+        base64.b64encode(b"someone:" + fake_secret("", 12).encode()).decode(),
+    ),
+    "yaml, unquoted": ("llm:\n  api_key: {v}\n  model: some-model\n", fake_secret("", 24)),
+    "yaml list item, unquoted": ("- token: {v}", fake_secret("", 24)),
+    "ini, unquoted": (
+        "[database]\nuser = someone\npassword = {v}\n",
+        fake_secret("", 6, string.ascii_letters) + "#" + fake_secret("", 3, string.digits),
+    ),
+    ".env with spaces around =": ("API_TOKEN = {v}\nDEBUG = 1\n", fake_secret("", 30)),
+    "unquoted, then a comment": ("secret_key: {v}  # rotate monthly", fake_secret("", 24)),
+}
+
+
+@pytest.mark.parametrize("form", list(SECRET_FORMS))
+def test_redact_more_secret_forms(form: str):
+    template, value = SECRET_FORMS[form]
+    out = redact(template.format(v=value))
+    assert value not in out
+    assert out == template.format(v=REDACTED)
+    assert redact(out) == out  # prompts are redacted again as a whole: nothing more may change
+
+
+PEM_HEADER = "-----BEGIN " + "PRIVATE KEY-----"
+# inputs on which a backtracking pattern takes quadratic time: many places where a match starts and fails late
+HOSTILE = {
+    "private key headers without END": lambda n: (PEM_HEADER + "\n") * (n // 28),
+    "a private key header that never closes": lambda n: "-----BEGIN " + "PRIVATE KEY " * (n // 12),
+    "an END header that never closes": lambda n: PEM_HEADER + "\n-----END " + "PRIVATE KEY " * (n // 12),
+    "a run of -eyJ": lambda n: "-eyJ" * (n // 4),
+    "a dotted name that never ends": lambda n: "a." * (n // 2),
+}
+
+
+@pytest.mark.parametrize("kind", list(HOSTILE))
+def test_redaction_takes_linear_time_on_hostile_text(kind: str):
+    text = HOSTILE[kind](256_000)
+    start = time.perf_counter()
+    out = redact(text)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"{elapsed:.2f} s for {len(text) // 1000} kB"  # linear: well under 0.1 s
+    assert out.count("\n") == text.count("\n")
+    if "PRIVATE KEY-----" in text:  # an unterminated block is redacted to the end of the text
+        assert "PRIVATE KEY" not in out
 
 
 def test_redact_value_handles_nested_data():

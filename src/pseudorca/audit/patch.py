@@ -1,20 +1,31 @@
 """Patch matching: is a unified diff applied in a notebook, reverted, or neither?
 
-Each hunk splits into added blocks (runs of "+" lines) and removed blocks (runs of "-" lines). Blocks are
-matched as whole lines after whitespace normalisation, wherever the notebook keeps the code: a diff made
-against a repository file still matches the same code inlined into a cell, written with %%writefile or
-embedded as a payload. Candidate files are tried in order: paths ending with the diff's path, then the same
-basename, then every evidence path.
+Lines are compared as whole lines after whitespace normalisation, wherever the notebook keeps the code: a
+diff made against a repository file still matches the same code inlined into a cell, written with
+%%writefile or embedded as a payload. Candidate files are tried in order: paths ending with the diff's
+path, then the same basename, then every evidence path.
+
+A change is judged at its place. The non-trivial context lines of a hunk split it into changes, and each
+change is anchored by the nearest non-trivial context line before and after it:
+    new side in place  the change's added lines next to one of its anchors; for a change that only
+                       removes lines, the two anchors next to each other
+    old side in place  the removed lines between both anchors; for a change that only adds lines, the
+                       two anchors next to each other
+A change at the start or end of a hunk has one anchor. When that anchor alone would have to stand for the
+place, it must be the first or last line of its file.
 
 Hunk states:
-    applied   every non-trivial added block is found; a removal-only hunk counts as applied when its
-              removed blocks are gone and a context line is still found
-    reverted  no added block is found and every removed block is; an add-only hunk counts as reverted
-              when a context line is still found
-    unknown   anything else (the code drifted, or the file is not in the notebook)
+    applied   every change's new side is in place (and, for a change that only removes lines, its old
+              side is not)
+    reverted  every change's old side is in place, and its new side is not
+    unknown   anything else: the code drifted, the file is not in the notebook, or added lines are found
+              only away from their context
     trivial   only blank or trivial lines change, or only whitespace; ignored
-A hunk without non-trivial context lines is located by its file instead: the file must be in the notebook
-(same path or basename), or for a new or deleted file, must not be.
+A hunk without non-trivial context lines (a new or deleted file, or a diff made with -U0) has no place, so
+its blocks (runs of "+" or "-" lines) are matched alone: applied when every added block is found, reverted
+when every removed block is found and no added block is. When it only adds or only removes lines, the
+other side is "almost none of these lines is found" (at most ALMOST_NONE of them): anywhere, and without a
+file of that name, for a new or deleted file; in the file itself otherwise.
 """
 
 from __future__ import annotations
@@ -25,10 +36,11 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from pseudorca.audit.types import Evidence, Finding
-from pseudorca.tree import Tree, normalize_line
+from pseudorca.tree import Tree, normalize_line, split_lines
 
 MAX_EVIDENCE = 5
 QUOTE_CHARS = 300
+ALMOST_NONE = 0.2  # share of a context-free hunk's lines that may be found while it counts as not there
 TRIVIAL_LINES = frozenset(
     {"pass", "else:", "try:", "finally:", "except:", "return", "continue", "break", "..."}
 )
@@ -37,6 +49,8 @@ _HUNK_RE = re.compile(r"^@@+ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _TIMESTAMP_RE = re.compile(r"\s+\d{4}-\d\d-\d\d[ T]\d\d:\d\d.*$")
 _DUP_SUFFIX_RE = re.compile(r"~\d+$")  # Tree._unique's suffix for a path written twice
 
+Hit = tuple[str, int]  # (path, 1-based line)
+
 
 @dataclass
 class Hunk:
@@ -44,6 +58,7 @@ class Hunk:
     context: list[str] = field(default_factory=list)
     added: list[list[str]] = field(default_factory=list)  # runs of consecutive "+" lines, without the "+"
     removed: list[list[str]] = field(default_factory=list)  # runs of consecutive "-" lines, without the "-"
+    lines: list[tuple[str, str]] = field(default_factory=list)  # every line in order: (" ", "+" or "-", text)
 
 
 @dataclass
@@ -69,7 +84,7 @@ def parse(diff_text: str) -> list[FilePatch]:
     (unless a "@@" line follows the pair). Hand-edited diffs often miscount, so after the counts run out,
     hunk lines still continue the hunk.
     """
-    lines = diff_text.splitlines()
+    lines = split_lines(diff_text.removeprefix("\ufeff"))  # a BOM would hide the first file header
     files: list[FilePatch] = []
     fp: FilePatch | None = None
     hunk: Hunk | None = None
@@ -112,12 +127,14 @@ def parse(diff_text: str) -> list[FilePatch]:
                     (hunk.added if tag == "+" else hunk.removed).append(run)
                     run_kind = tag
                 run.append(line[1:])
+                hunk.lines.append((tag, line[1:]))
                 if tag == "+":
                     new_left -= 1
                 else:
                     old_left -= 1
             elif tag in (" ", ""):  # editors sometimes strip the space of a blank context line
                 hunk.context.append(line[1:])
+                hunk.lines.append((" ", line[1:]))
                 run_kind = ""
                 old_left -= 1
                 new_left -= 1
@@ -188,8 +205,21 @@ def _normalized(blocks: list[list[str]]) -> list[str]:
     return [s for block in blocks for line in block if (s := normalize_line(line))]
 
 
+def _blocks(lines: list[tuple[str, str]], tag: str) -> list[list[str]]:
+    """Runs of consecutive lines with this tag ("+" or "-") that are not all trivial."""
+    runs: list[list[str]] = []
+    prev = ""
+    for t, text in lines:
+        if t == tag:
+            if prev != tag:
+                runs.append([])
+            runs[-1].append(text)
+        prev = t
+    return [b for b in runs if not _trivial_block(b)]
+
+
 class _Matcher:
-    """Finds blocks in the candidate files of one diff path: same path, then same basename, then anywhere."""
+    """Finds lines in the candidate files of one diff path: same path, then same basename, then anywhere."""
 
     def __init__(self, tree: Tree, diff_path: str, evidence_paths: list[str]) -> None:
         self.tree = tree
@@ -207,19 +237,31 @@ class _Matcher:
             else:
                 rest.append(p)
         self.levels = [level for level in (suffix, same_name, rest) if level]
-        self.file_exists = bool(suffix or same_name)
+        self.located = suffix + same_name  # the diff's file, when the notebook has it
+        self.everywhere = evidence_paths
+        self.file_exists = bool(self.located)
         self.found_in: set[str] = set()
-        self._cache: dict[tuple[str, ...], tuple[str, int] | None] = {}
+        self._cache: dict[tuple[tuple[str, ...], bool, bool], Hit | None] = {}
+        self._line_sets: dict[bool, set[str]] = {}
 
-    def find(self, block: list[str]) -> tuple[str, int] | None:
-        key = tuple(block)
+    def find(self, lines: list[str], *, at_start: bool = False, at_end: bool = False) -> Hit | None:
+        """Where `lines` occur as consecutive whole lines (blank lines ignored), in the first candidate level
+        that has them; with at_start/at_end, only where nothing but blank lines comes before/after them."""
+        key = (tuple(lines), at_start, at_end)
         if key not in self._cache:
-            snippet = "\n".join(block)
+            snippet = "\n".join(lines)
+            n = sum(1 for x in lines if x.strip())
             self._cache[key] = next(
                 (
                     hits[0]
                     for paths in self.levels
-                    if (hits := self.tree.find_snippet(snippet, paths, partial_ends=False))
+                    if (
+                        hits := [
+                            h
+                            for h in self.tree.find_snippet(snippet, paths, partial_ends=False)
+                            if self._bounded(h, n, at_start, at_end)
+                        ]
+                    )
                 ),
                 None,
             )
@@ -228,19 +270,82 @@ class _Matcher:
             self.found_in.add(hit[0])
         return hit
 
+    def _bounded(self, hit: Hit, n: int, at_start: bool, at_end: bool) -> bool:
+        """Whether only blank lines come before (at_start) or after (at_end) the n lines found at `hit`."""
+        if not (at_start or at_end):
+            return True
+        path, line = hit
+        lines = self.tree.lines(path)
+        if at_start and any(x.strip() for x in lines[: line - 1]):
+            return False
+        if at_end:
+            j, seen = line - 1, 0
+            while j < len(lines) and seen < n:
+                seen += bool(lines[j].strip())
+                j += 1
+            if any(x.strip() for x in lines[j:]):
+                return False
+        return True
 
-def _located(hunk: Hunk, fp: FilePatch, m: _Matcher, *, removal: bool) -> bool:
-    """Whether the hunk's place is in the notebook, to tell "applied/reverted" from "drifted"."""
-    context = [c for c in hunk.context if not is_trivial(c)]
-    if context:
-        return any(m.find([c]) for c in context)
-    if (removal and fp.is_deleted) or (not removal and fp.is_new):
-        return not m.file_exists
-    return m.file_exists
+    def share(self, blocks: list[list[str]], *, everywhere: bool) -> tuple[int, int]:
+        """(found, total) for the distinct non-trivial lines of `blocks`, as whole lines of the diff's file
+        (or of any evidence path)."""
+        wanted = {normalize_line(x) for b in blocks for x in b if not is_trivial(x)}
+        if everywhere not in self._line_sets:
+            paths = self.everywhere if everywhere else self.located
+            self._line_sets[everywhere] = {normalize_line(x) for p in paths for x in self.tree.lines(p)}
+        return len(wanted & self._line_sets[everywhere]), len(wanted)
 
 
-def _evidence(tree: Tree, hit: tuple[str, int], block: list[str]) -> Evidence:
-    """The block's first non-trivial line where the block was found."""
+@dataclass
+class _Change:
+    """The lines of a hunk between two non-trivial context lines (its anchors)."""
+
+    before: str | None  # None when the change starts the hunk
+    after: str | None  # None when the change ends the hunk
+    lines: list[tuple[str, str]]  # the changed lines and the trivial context lines around them
+
+    def side(self, drop: str) -> list[str]:
+        """The new side (drop="-") or the old side (drop="+") of the change, without its anchors."""
+        return [text for tag, text in self.lines if tag != drop]
+
+
+def _changes(hunk: Hunk) -> list[_Change]:
+    out: list[_Change] = []
+    anchor: str | None = None
+    cur: list[tuple[str, str]] = []
+    for tag, text in hunk.lines:
+        if tag == " " and not is_trivial(text):
+            if any(t != " " for t, _ in cur):
+                out.append(_Change(anchor, text, cur))
+            anchor, cur = text, []
+        else:
+            cur.append((tag, text))
+    if any(t != " " for t, _ in cur):
+        out.append(_Change(anchor, None, cur))
+    return out
+
+
+def _in_place(m: _Matcher, c: _Change, side: list[str], *, own: bool, both: bool) -> Hit | None:
+    """Where one side of a change is in place.
+
+    `own`: the side has non-trivial lines of its own, so `both` decides whether one anchor next to them is
+    enough or both are needed. Otherwise the side is only a place: both anchors next to each other, or a
+    lone anchor at the start or end of a file.
+    """
+    if own and not both:
+        tries = ([[c.before, *side]] if c.before is not None else []) + (
+            [[*side, c.after]] if c.after is not None else []
+        )
+        return next((hit for lines in tries if (hit := m.find(lines))), None)
+    lines = [x for x in (c.before, *side, c.after) if x is not None]
+    if own or sum(1 for x in lines if x.strip()) > 1:
+        return m.find(lines)
+    return m.find(lines, at_start=c.before is None, at_end=c.after is None)
+
+
+def _evidence(tree: Tree, hit: Hit, block: list[str]) -> Evidence:
+    """The block's first non-trivial line, at or after `hit`."""
     path, line = hit
     target = next((normalize_line(x) for x in block if not is_trivial(x)), "")
     lines = tree.lines(path)
@@ -250,26 +355,74 @@ def _evidence(tree: Tree, hit: tuple[str, int], block: list[str]) -> Evidence:
     return Evidence(path, line, lines[line - 1].strip()[:QUOTE_CHARS])
 
 
-def hunk_state(hunk: Hunk, fp: FilePatch, m: _Matcher) -> tuple[str, list[Evidence]]:
-    """(state, evidence) of one hunk; see the module docstring for the states."""
-    added = [b for b in hunk.added if not _trivial_block(b)]
-    removed = [b for b in hunk.removed if not _trivial_block(b)]
+def _change_state(c: _Change, m: _Matcher) -> tuple[str, list[Evidence]]:
+    added, removed = _blocks(c.lines, "+"), _blocks(c.lines, "-")
     if _normalized(added) == _normalized(removed):  # only trivial lines or whitespace changed
         return "trivial", []
-    added_hits = [m.find(b) for b in added]
-    first = added_hits[0] if added_hits else None
-    if first is not None and all(added_hits):
-        return "applied", [_evidence(m.tree, first, added[0])]
-    if any(added_hits):
-        return "unknown", []
-    removed_hits = [m.find(b) for b in removed]
-    if removed and all(removed_hits):
-        return "reverted", [_evidence(m.tree, h, b) for h, b in zip(removed_hits, removed, strict=True) if h]
-    if not added and not any(removed_hits) and _located(hunk, fp, m, removal=True):
+    new_hit = _in_place(m, c, c.side("-"), own=bool(added), both=False)
+    old_hit = _in_place(m, c, c.side("+"), own=bool(removed), both=True)
+    reverted = [_evidence(m.tree, old_hit, b) for b in removed] if old_hit else []
+    if added:
+        if new_hit:
+            return "applied", [_evidence(m.tree, new_hit, added[0])]
+        return ("reverted", reverted) if old_hit else ("unknown", [])
+    # the change only removes lines: its new side is just the place, so both found is unclear
+    if old_hit and not new_hit:
+        return "reverted", reverted
+    if new_hit and not old_hit:
         return "applied", []
-    if not removed and _located(hunk, fp, m, removal=False):
-        return "reverted", []
     return "unknown", []
+
+
+def _free_state(hunk: Hunk, fp: FilePatch, m: _Matcher) -> tuple[str, list[Evidence], tuple[int, int] | None]:
+    """A hunk without non-trivial context: (state, evidence, (found, total) lines when they decided)."""
+    added, removed = _blocks(hunk.lines, "+"), _blocks(hunk.lines, "-")
+    if _normalized(added) == _normalized(removed):
+        return "trivial", [], None
+    added_hits = [m.find(b) for b in added]
+    if added and all(added_hits):
+        hit = added_hits[0]
+        assert hit is not None
+        return "applied", [_evidence(m.tree, hit, added[0])], None
+    removed_hits = [m.find(b) for b in removed]
+    if removed and all(removed_hits) and not any(added_hits):
+        return (
+            "reverted",
+            [_evidence(m.tree, h, b) for h, b in zip(removed_hits, removed, strict=True) if h],
+            None,
+        )
+    if added and removed:
+        return "unknown", [], None
+    # only adds or only removes lines: the other side is "almost none of them is found"
+    whole_file = fp.is_new if added else fp.is_deleted
+    if whole_file and m.file_exists:  # a file of that name with other content: the code drifted
+        return "unknown", [], None
+    if not whole_file and not m.file_exists:  # lines of a file that is not in the notebook
+        return "unknown", [], None
+    found, total = m.share(added or removed, everywhere=whole_file)
+    if found > ALMOST_NONE * total:
+        return "unknown", [], (found, total)
+    return ("reverted" if added else "applied"), [], (found, total)
+
+
+def hunk_state(hunk: Hunk, fp: FilePatch, m: _Matcher) -> tuple[str, list[Evidence]]:
+    """(state, evidence) of one hunk; see the module docstring for the states."""
+    state, evidence, _ = _hunk_state(hunk, fp, m)
+    return state, evidence
+
+
+def _hunk_state(hunk: Hunk, fp: FilePatch, m: _Matcher) -> tuple[str, list[Evidence], tuple[int, int] | None]:
+    if not any(tag == " " and not is_trivial(text) for tag, text in hunk.lines):
+        return _free_state(hunk, fp, m)
+    states = [s for s in (_change_state(c, m) for c in _changes(hunk)) if s[0] != "trivial"]
+    kinds = {state for state, _ in states}
+    if not kinds:
+        return "trivial", [], None
+    if kinds == {"applied"}:
+        return "applied", next((ev[:1] for _, ev in states if ev), []), None
+    if kinds == {"reverted"}:
+        return "reverted", [e for _, ev in states for e in ev], None
+    return "unknown", [], None
 
 
 def check(diff_text: str, tree: Tree) -> Finding:
@@ -288,16 +441,22 @@ def check(diff_text: str, tree: Tree) -> Finding:
     for fp in files:
         m = _Matcher(tree, fp.path, evidence_paths)
         states = []
+        shares: list[tuple[int, int]] = []
         for hunk in fp.hunks:
-            state, ev = hunk_state(hunk, fp, m)
+            state, ev, share = _hunk_state(hunk, fp, m)
             counts[state] += 1
             states.append(state)
+            if share is not None:
+                shares.append(share)
             (applied_ev if state == "applied" else reverted_ev).extend(ev)
         d = per_file.setdefault(
             fp.path, {"hunks": [], "found_in": [], "new_file": fp.is_new, "deleted": fp.is_deleted}
         )
         d["hunks"].extend(states)
         d["found_in"] = sorted(set(d["found_in"]) | m.found_in)
+        if shares:  # lines of a context-free hunk found, for a new or deleted file judged by them
+            found, total = d.get("lines_found", [0, 0])
+            d["lines_found"] = [found + sum(s[0] for s in shares), total + sum(s[1] for s in shares)]
 
     a, r, u = counts["applied"], counts["reverted"], counts["unknown"]
     n = a + r + u

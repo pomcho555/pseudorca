@@ -1,13 +1,20 @@
-"""The OpenAI-compatible and Anthropic backends against fake SDK modules (no network, no real SDK calls)."""
+"""The OpenAI-compatible and Anthropic backends against fake SDK modules (no network, no real SDK calls).
+
+The exception is the proxy test, which drives the real openai SDK with every connection attempt intercepted
+and refused before it leaves the process.
+"""
 
 from __future__ import annotations
 
 import copy
 import json
 import random
+import socket
+import ssl
 import string
 import sys
 import types
+from dataclasses import replace
 from types import SimpleNamespace as NS
 from typing import Any
 
@@ -93,14 +100,30 @@ def install_openai(monkeypatch: pytest.MonkeyPatch, replies: list[Any]) -> Recor
     rec = Recorder(replies)
     module = types.ModuleType("openai")
 
+    class DefaultHttpxClient:
+        def __init__(self, **options: Any) -> None:
+            self.options = options
+
     class OpenAI:
-        def __init__(self, *, base_url: str | None = None, api_key: str | None = None, **kwargs: Any) -> None:
-            rec.clients.append({"base_url": base_url, "api_key": api_key})
+        def __init__(
+            self,
+            *,
+            base_url: str | None = None,
+            api_key: str | None = None,
+            http_client: DefaultHttpxClient | None = None,
+            **kwargs: Any,
+        ) -> None:
+            options = None if http_client is None else http_client.options
+            rec.clients.append({"base_url": base_url, "api_key": api_key, "http_client": options})
             self.chat = NS(completions=NS(create=rec.create))
 
     module.OpenAI = OpenAI  # type: ignore[attr-defined]
+    module.DefaultHttpxClient = DefaultHttpxClient  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "openai", module)
     return rec
+
+
+DIRECT = {"trust_env": False, "follow_redirects": False}  # the HTTP client options for a local endpoint
 
 
 def oa_calls(*calls: tuple[str, dict[str, Any]], text: str = "") -> Any:
@@ -124,7 +147,9 @@ def test_openai_tool_loop(monkeypatch: pytest.MonkeyPatch):
     f = judge_idea(IDEA, None, tree(), [], LOCAL)
     assert f.status == "present" and f.evidence[0].line == 3 and f.model == "openai:local-model"
     assert f.detail["steps"] == 1 and f.detail["usage"] == {"input_tokens": 200, "output_tokens": 40}
-    assert rec.clients == [{"base_url": "http://localhost:8000/v1", "api_key": "EMPTY"}]
+    assert rec.clients == [
+        {"base_url": "http://localhost:8000/v1", "api_key": "EMPTY", "http_client": DIRECT}
+    ]
     first, second = rec.requests
     assert first["model"] == "local-model" and first["tool_choice"] == "auto" and first["temperature"] == 0.0
     assert [t["function"]["name"] for t in first["tools"]] == NAMES
@@ -216,7 +241,7 @@ def test_openai_errors_never_show_the_key(monkeypatch: pytest.MonkeyPatch):
     message = str(e.value)
     assert key not in message and masked not in message and key[-4:] + ")" not in message
     assert "HTTP 401" in message and "api.openai.com" in message and "\n" not in message
-    assert rec.clients == [{"base_url": None, "api_key": key}]
+    assert rec.clients == [{"base_url": None, "api_key": key, "http_client": None}]
 
 
 def test_openai_network_errors_become_llm_errors(monkeypatch: pytest.MonkeyPatch):
@@ -242,11 +267,81 @@ def test_openai_keys(monkeypatch: pytest.MonkeyPatch):
     assert "MY_LLM_KEY" in str(e.value) and "not set" in str(e.value)
 
 
-def test_a_missing_sdk_suggests_the_extra(monkeypatch: pytest.MonkeyPatch):
+def test_a_missing_sdk_says_how_to_add_the_extra(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "openai", None)
     with pytest.raises(LLMError) as e:
         judge_idea(IDEA, None, tree(), [], LOCAL)
-    assert 'pip install "pseudorca[llm]"' in str(e.value)
+    message = str(e.value)
+    # both ways to install from git; a bare "pseudorca[llm]" would be looked up on PyPI
+    assert 'pip install "pseudorca[llm] @ git+https://github.com/pomcho555/pseudorca"' in message
+    assert (
+        'uv tool install --reinstall "pseudorca[llm] @ git+https://github.com/pomcho555/pseudorca"' in message
+    )
+
+
+# ----- local endpoints are reached directly ----------------------------------------------------------
+
+PROXY_VARIABLES = [f"{scheme}_proxy" for scheme in ("http", "https", "all", "no")]
+PROXY_VARIABLES += [name.upper() for name in PROXY_VARIABLES]
+
+
+class Dialed(BaseException):
+    """Raised in place of opening a connection. A BaseException, so neither httpx nor the SDK retries it."""
+
+
+def refuse_connections(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
+    """Record the address of every connection attempt and stop it there: nothing reaches the network."""
+    dialed: list[tuple[Any, ...]] = []
+
+    def dial(address: Any, *args: Any, **kwargs: Any) -> Any:
+        dialed.append(tuple(address)[:2])
+        raise Dialed
+
+    monkeypatch.setattr(socket, "create_connection", dial)
+    monkeypatch.setattr(socket.socket, "connect", lambda self, address: dial(address))
+    return dialed
+
+
+@pytest.mark.parametrize("variable", ["HTTP_PROXY", "ALL_PROXY", "http_proxy"])
+def test_a_local_endpoint_is_reached_directly_despite_a_proxy_in_the_environment(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+):
+    pytest.importorskip("openai")  # the real SDK and its HTTP client
+    for name in PROXY_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, "http://192.0.2.1:3128")  # TEST-NET-1: an address that is never in use
+    dialed = refuse_connections(monkeypatch)
+    with pytest.raises(Dialed):
+        judge_idea(IDEA, None, tree(), [], LOCAL)
+    assert dialed == [("localhost", 8000)]  # not the proxy, which would receive the notebook's code
+    # an allowed remote endpoint still goes through the proxy, which a company network may require
+    monkeypatch.setenv("OPENAI_API_KEY", "test-value-not-a-key")
+    remote = LLMSettings("openai", "m", base_url="http://192.0.2.7:8000/v1", allow_remote=True)
+    with pytest.raises(Dialed):
+        judge_idea(IDEA, None, tree(), [], remote)
+    assert dialed[1:] == [("192.0.2.1", 3128)]
+
+
+def test_only_a_local_endpoint_gets_a_direct_client_without_redirects(monkeypatch: pytest.MonkeyPatch):
+    rec = install_openai(monkeypatch, [oa_calls(("submit_verdict", VERDICT))] * 3)
+    assert judge_idea(IDEA, None, tree(), [], LOCAL).status == "present"
+    assert judge_idea(IDEA, None, tree(), [], replace(LOCAL, allow_remote=True)).status == "present"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-value-not-a-key")
+    remote = LLMSettings("openai", "m", base_url="https://llm.example.com/v1", allow_remote=True)
+    assert judge_idea(IDEA, None, tree(), [], remote).status == "present"
+    assert [c["http_client"] for c in rec.clients] == [DIRECT, DIRECT, None]
+
+
+def test_a_local_https_endpoint_keeps_the_certificate_settings(monkeypatch: pytest.MonkeyPatch):
+    certifi = pytest.importorskip("certifi")  # any file of PEM certificates will do
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    rec = install_openai(monkeypatch, [oa_calls(("submit_verdict", VERDICT))] * 2)
+    judge_idea(IDEA, None, tree(), [], replace(LOCAL, base_url="https://localhost:8443/v1"))
+    options = rec.clients[0]["http_client"]
+    assert options["trust_env"] is False and isinstance(options["verify"], ssl.SSLContext)
+    assert options["verify"].cert_store_stats()["x509_ca"] > 0  # the certificates from SSL_CERT_FILE
+    judge_idea(IDEA, None, tree(), [], LOCAL)  # plain http has no certificates to check
+    assert rec.clients[1]["http_client"] == DIRECT
 
 
 # ----- Anthropic -------------------------------------------------------------------------------------

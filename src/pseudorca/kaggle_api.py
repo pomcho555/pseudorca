@@ -103,9 +103,7 @@ def get_api() -> Any:
         with contextlib.redirect_stdout(chatter):
             from kaggle.api.kaggle_api_extended import KaggleApi
     except ImportError as e:
-        raise KaggleError(
-            f'cannot import the Kaggle client ({e}); install it with: pip install "pseudorca[kaggle]"'
-        ) from None
+        raise KaggleError(f"cannot import the Kaggle client ({e}); {util.install_hint('kaggle')}") from None
     except Exception as e:  # importing kaggle also creates its config directory, which can fail
         raise KaggleError(f"cannot load the Kaggle client: {_reason(e)}") from None
     try:

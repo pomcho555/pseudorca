@@ -166,11 +166,16 @@ class CellMagic:
     name: str  # e.g. "writefile" for %%writefile
     args: str  # the rest of the magic line
     head: str  # the magic line, stripped
-    body: str  # the cell after the magic line
+    body: str  # what IPython passes to the magic: the cell after the magic line, ending with a newline
+    lead: str  # the cell up to the body: blank lines as they are, the magic line as `# %%bash`
+    line: int  # the magic line's line in the cell; the body starts on the next one
 
 
 def cell_magic(source: str) -> CellMagic | None:
-    """The cell magic of a cell whose first non-blank line starts with %%, else None."""
+    """The cell magic of a cell whose first non-blank line starts with %%, else None.
+
+    `lead + body` has the cell's lines, so line N of a file built from it is line N of the cell.
+    """
     lines = split_lines(source)
     k = next((k for k, line in enumerate(lines) if line.strip()), None)
     if k is None:
@@ -184,7 +189,11 @@ def cell_magic(source: str) -> CellMagic | None:
     rest = lines[k + 1 :]
     if indent:  # IPython removes the cell's common indentation before it looks for %%
         rest = [x[len(indent) :] if x.startswith(indent) else x for x in rest]
-    return CellMagic(m.group(1), m.group(2).strip(), head, "".join(rest))
+    body = "".join(rest)
+    if body and not body.endswith("\n"):
+        body += "\n"  # IPython ends a cell with a newline before the magic gets its body
+    lead = "".join(lines[:k]) + f"# {head}" + line[len(line.rstrip("\r\n")) :]
+    return CellMagic(m.group(1), m.group(2).strip(), head, body, lead, k + 1)
 
 
 def split_args(args: str) -> list[str]:

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 MIN_DECODED = 32  # bytes a text decoding (base64, ...) must yield to count
 LZMA_MEMLIMIT = 128 << 20  # xz/lzma decoder memory; enough for `xz -9`, refuses absurd dictionary sizes
+MAX_STREAMS = 64  # concatenated compressed streams followed in one payload (`cat a.gz b.gz`, pbzip2)
+DECOMPRESS_WINDOW = 64 << 10  # compressed input given to a decompressor at a time
 
 # ----- candidates ------------------------------------------------------------------------------------
 
@@ -106,38 +108,59 @@ def _run_re(min_chars: int) -> re.Pattern[str]:
 
 
 _LITERAL_START_RE = re.compile(r"""[#'"]""")
+_LINE_END_RE = re.compile(r"\r\n|\r|\n")
+# what can end a string's body: a backslash (it escapes the next character), its closing quote, and for a
+# one-quote string a line end
+_STRING_STOP_RE = {
+    "'": re.compile(r"[\\'\r\n]"),
+    '"': re.compile(r'[\\"\r\n]'),
+    "'''": re.compile(r"\\|'''"),
+    '"""': re.compile(r'\\|"""'),
+}
+
+
+def _string_end(text: str, start: int, quote: str) -> tuple[bool, int]:
+    """(True, index of the closing quote) for the string whose body begins at `start`, or (False, where
+    the scan stopped) when it is not closed: at a one-quote string's line end, or at the end of the text."""
+    stops = _STRING_STOP_RE[quote]
+    j = start
+    while (m := stops.search(text, j)) is not None:
+        k = m.start()
+        c = text[k]
+        if c == "\\":
+            j = k + 3 if text.startswith("\r\n", k + 1) else k + 2
+        else:
+            return c not in "\r\n", k
+    return False, len(text)
 
 
 def _string_literals(text: str) -> Iterator[tuple[int, int, str]]:
-    """(start, end, body) of each quoted string, skipping `#` comments; a linear, best-effort scan."""
+    """(start, end, body) of each quoted string, skipping `#` comments; a best-effort scan in linear time.
+
+    After an opening quote whose string is never closed, the scan goes on right after that quote. Any
+    later opening quote of the same kind before the point where that string's scan stopped is skipped
+    without a scan of its own: it was an escaped character of that string, so its scan would run in step
+    with the first one and stop at the same point (scanning it again made `"` and many `\\"` quadratic).
+    """
+    stopped: dict[str, int] = {}  # quote -> where the scan of an unclosed string of that kind stopped
     i = 0
-    while True:
-        m = _LITERAL_START_RE.search(text, i)
-        if m is None:
-            return
+    while (m := _LITERAL_START_RE.search(text, i)) is not None:
         i = m.start()
         c = text[i]
         if c == "#":
-            i = text.find("\n", i) + 1
-            if not i:
+            eol = _LINE_END_RE.search(text, i)
+            if eol is None:
                 return
+            i = eol.end()
             continue
         quote = c * 3 if text.startswith(c * 3, i) else c
-        start = j = i + len(quote)
-        end = -1
-        while (k := text.find(quote, j)) >= 0:
-            if len(quote) == 1:
-                newline = text.find("\n", j, k)
-                if newline >= 0 and text[newline - 1 : newline] != "\\":
-                    break  # a one-quote string ends at the line end
-            p = k
-            while p > j and text[p - 1] == "\\":
-                p -= 1
-            if (k - p) % 2 == 0:  # the quote is not escaped
-                end = k
-                break
-            j = k + 1
-        if end < 0:
+        start = i + len(quote)
+        if i < stopped.get(quote, 0):
+            i = start
+            continue
+        closed, end = _string_end(text, start, quote)
+        if not closed:
+            stopped[quote] = end
             i = start
             continue
         yield i, end + len(quote), text[start:end]
@@ -165,7 +188,7 @@ def pattern_candidates(text: str, min_chars: int, *, bare_runs: bool = False) ->
             found.append((m.start(), m.group()))
     if not found:
         return []
-    line_starts = [0, *(m.end() for m in re.finditer("\n", text))]
+    line_starts = [0, *(m.end() for m in _LINE_END_RE.finditer(text))]  # lines as the tree counts them
     out = []
     for offset, value in sorted(found):
         line = bisect.bisect_right(line_starts, offset)
@@ -359,29 +382,50 @@ def _decompressor(kind: str) -> Any:
 
 def decompress(kind: str, data: bytes, cap: int) -> tuple[bytes, str]:
     """At most `cap` bytes of decompressed output (never more than cap + 1 are produced), plus what went
-    wrong: "", "truncated", "damaged stream" or "stream ended early". Concatenated streams are followed.
-    Raises _NotDecodable when nothing decodes at all."""
+    wrong: "", "truncated", "damaged stream", "stream ended early", "empty stream" (a stream that decodes
+    to nothing ends the decoding) or "more than MAX_STREAMS streams". Concatenated streams are followed, up
+    to MAX_STREAMS of them. Raises _NotDecodable when nothing decodes at all.
+
+    The input is fed a window at a time, so the end of a stream copies at most a window of what follows,
+    and the time stays linear in the input however many streams it holds.
+    """
+    view = memoryview(data)
     chunks: list[bytes] = []
-    size, rest, problem = 0, data, ""
-    while True:
+    size = pos = 0
+    problem = ""
+    for _ in range(MAX_STREAMS):
         d = _decompressor(kind)
-        try:
-            chunk = d.decompress(rest, cap + 1 - size)  # max_length >= 1 (0 would mean "no limit" to zlib)
-        except (zlib.error, lzma.LZMAError, OSError, EOFError, ValueError):
-            problem = "damaged stream"
+        before = size
+        while not problem:
+            window = view[pos : pos + DECOMPRESS_WINDOW]
+            try:
+                chunk = d.decompress(window, cap + 1 - size)  # max_length >= 1 (0 means "no limit" to zlib)
+            except (zlib.error, lzma.LZMAError, OSError, EOFError, ValueError):
+                problem = "damaged stream"
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > cap:
+                chunks[-1] = chunk[: len(chunk) - (size - cap)]
+                problem = "truncated"
+            elif d.eof:
+                pos += len(window) - len(d.unused_data)
+                break
+            else:
+                pos += len(window)  # below max_length, a decompressor takes in all of its input
+                if pos >= len(data):
+                    problem = "stream ended early"
+        if problem:
             break
-        chunks.append(chunk)
-        size += len(chunk)
-        if size > cap:
-            chunks[-1] = chunk[: len(chunk) - (size - cap)]
-            problem = "truncated"
+        follows = pos < len(data) and sniff(data[pos : pos + 512]) == kind
+        if size == before:  # an empty stream: hostile input repeats them, and they cost no output
+            if follows:
+                problem = "empty stream"
             break
-        if not d.eof:
-            problem = "stream ended early"
+        if not follows:
             break
-        rest = d.unused_data
-        if not rest or sniff(rest) != kind:
-            break
+    else:
+        problem = f"more than {MAX_STREAMS} streams"
     if not size:
         raise _NotDecodable(kind)
     return b"".join(chunks), problem
