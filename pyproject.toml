@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pseudorca"
+version = "0.1.0.dev0"
+description = "Experiment ledger for LLM work without training: which improvements are in which notebook, and whether a change beats the noise."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "pomcho555" }]
+requires-python = ">=3.11"
+keywords = ["kaggle", "llm", "evaluation", "experiment-tracking", "notebook", "prompt-engineering", "inference"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "click>=8.1",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+llm = ["openai>=1.40", "anthropic>=0.34"]
+kaggle = ["kaggle>=1.6"]
+all = ["pseudorca[llm,kaggle]"]
+
+[project.scripts]
+pseudorca = "pseudorca.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pomcho555/pseudorca"
+Issues = "https://github.com/pomcho555/pseudorca/issues"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "ipython>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pseudorca"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "SIM108"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
