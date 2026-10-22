@@ -165,6 +165,35 @@ def _set_fields(obj: Any, data: dict[str, Any], allowed: Iterable[str]) -> None:
             setattr(obj, key, list(value) if isinstance(value, (list, tuple)) else value)
 
 
+def _score(value: Any) -> float | None:
+    """A leaderboard score from event data: a finite number, or None for empty."""
+    if value is None or value == "":
+        return None
+    score = float(value)
+    if score != score or score in (float("inf"), float("-inf")):
+        raise ValueError(f"score {value!r} is not a finite number")
+    return score
+
+
+VERDICT_FIELDS = ("nb", "idea", "idea_rev", "status", "method", "evidence", "note", "model", "detail")
+KNOWN_FIELDS = {
+    "idea.add": {"id", *IDEA_FIELDS},
+    "idea.update": {"id", *IDEA_FIELDS},
+    "nb.add": {"id", *NOTEBOOK_FIELDS},
+    "nb.update": {"id", *NOTEBOOK_FIELDS},
+    "sub.upsert": {"id", *SUBMISSION_FIELDS},
+    "run.add": {"id", *RUN_FIELDS},
+    "audit.verdict": set(VERDICT_FIELDS),
+}
+
+
+def _version(record: VerdictRecord, key: str) -> int:
+    try:
+        return int(record.detail.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class State:
     """Everything in the ledger, as of the last replayed event."""
 
@@ -176,26 +205,58 @@ class State:
         self.verdicts: dict[tuple[str, str], list[VerdictRecord]] = {}
         self.events: list[Event] = []
         self.warnings: list[str] = []
+        self._warned: set[tuple[str, str]] = set()
 
     @classmethod
     def replay(cls, events: Iterable[Event]) -> State:
         st = cls()
         for ev in events:
-            st.events.append(ev)
-            handler = getattr(st, "_on_" + ev.type.replace(".", "_"), None)
-            if handler is None:
-                st.warnings.append(f"ignored event {ev.id} of unknown type {ev.type!r} (newer Pseudorca?)")
-                continue
-            try:
-                handler(ev)
-            except (KeyError, TypeError, ValueError) as e:
-                st.warnings.append(f"ignored malformed event {ev.id} ({ev.type}): {e}")
+            st.apply(ev)
         return st
 
-    # ----- event handlers --------------------------------------------------------------------------
+    def _warn_once(self, key: tuple[str, str], message: str) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            self.warnings.append(message)
+
+    def apply(self, ev: Event) -> None:
+        """Apply one event. Events must come in id order (Store.append guarantees the new one is last)."""
+        from pseudorca.store import SCHEMA
+
+        self.events.append(ev)
+        if ev.schema > SCHEMA:
+            self._warn_once(
+                ("schema", str(ev.schema)),
+                f"some events were written by a newer Pseudorca (schema {ev.schema}); upgrade to read them fully",
+            )
+        handler = getattr(self, "_on_" + ev.type.replace(".", "_"), None)
+        if handler is None:
+            self._warn_once(
+                ("type", ev.type), f"ignored events of unknown type {ev.type!r} (newer Pseudorca?)"
+            )
+            return
+        for key in sorted(set(ev.data) - KNOWN_FIELDS.get(ev.type, set())):
+            self._warn_once(
+                (ev.type, key), f"ignored field {key!r} of {ev.type} events (written by a newer Pseudorca?)"
+            )
+        try:
+            handler(ev)
+        except (KeyError, TypeError, ValueError) as e:
+            self.warnings.append(f"ignored malformed event {ev.id} ({ev.type}): {e}")
+
+    # ----- event handlers (validate first, then change state) --------------------------------------
+
+    def _idea_data(self, ev: Event) -> dict[str, Any]:
+        data = dict(ev.data)
+        patch = data.get("patch")
+        if patch is not None and not util.is_sha256(patch):
+            self.warnings.append(f"ignored invalid patch id in event {ev.id} (not a sha256)")
+            data.pop("patch")
+        return data
 
     def _on_idea_add(self, ev: Event) -> None:
         iid = str(ev.data["id"])
+        data = self._idea_data(ev)
         idea = self.ideas.get(iid)
         if idea is None:
             idea = self.ideas[iid] = Idea(id=iid, created=ev.time, created_by=ev.actor)
@@ -203,26 +264,40 @@ class State:
             self.warnings.append(
                 f"idea {iid!r} was added twice; the later add ({ev.id}) is applied as an update"
             )
-        _set_fields(idea, ev.data, IDEA_FIELDS)
+        _set_fields(idea, data, IDEA_FIELDS)
         idea.updated, idea.updated_by = ev.time, ev.actor
 
     def _on_idea_update(self, ev: Event) -> None:
         iid = str(ev.data["id"])
+        data = self._idea_data(ev)
         idea = self.ideas.get(iid)
         if idea is None:
             self.warnings.append(f"update for unknown idea {iid!r} ({ev.id}) created it")
             idea = self.ideas[iid] = Idea(id=iid, created=ev.time, created_by=ev.actor)
-        _set_fields(idea, ev.data, IDEA_FIELDS)
+        _set_fields(idea, data, IDEA_FIELDS)
         idea.updated, idea.updated_by = ev.time, ev.actor
 
     def _on_nb_add(self, ev: Event) -> None:
         nid = str(ev.data["id"])
+        if not util.is_sha256(nid):
+            raise ValueError("notebook id is not a sha256")
         nb = self.notebooks.get(nid)
         if nb is None:
             nb = self.notebooks[nid] = Notebook(
                 id=nid, added=ev.time, added_by=ev.actor, seq=len(self.notebooks) + 1
             )
-        _set_fields(nb, ev.data, NOTEBOOK_FIELDS)
+            _set_fields(nb, ev.data, NOTEBOOK_FIELDS)
+            return
+        # registered again (two clones before a pull): merge, never wipe what the first add recorded
+        d = ev.data
+        for key in ("tags", "applies"):
+            extra = [v for v in d.get(key) or [] if v not in getattr(nb, key)]
+            setattr(nb, key, [*getattr(nb, key), *extra])
+        for key in ("name", "path", "kernel", "version", "note", "parent"):
+            if not getattr(nb, key) and d.get(key):
+                setattr(nb, key, d[key])
+        nb.stored = bool(nb.stored or d.get("stored"))
+        nb.size = nb.size or int(d.get("size") or 0)
 
     def _on_nb_update(self, ev: Event) -> None:
         nid = str(ev.data["id"])
@@ -234,18 +309,26 @@ class State:
 
     def _on_sub_upsert(self, ev: Event) -> None:
         sid = str(ev.data["id"])
+        data = dict(ev.data)
+        for key in ("public_score", "private_score"):
+            if key in data:
+                try:
+                    data[key] = _score(data[key])
+                except (TypeError, ValueError):
+                    self.warnings.append(f"ignored invalid {key} {data[key]!r} in event {ev.id}")
+                    data.pop(key)
         sub = self.subs.get(sid)
         if sub is None:
             sub = self.subs[sid] = Submission(id=sid)
-        _set_fields(sub, ev.data, SUBMISSION_FIELDS)
-        for key in ("public_score", "private_score"):
-            value = getattr(sub, key)
-            setattr(sub, key, None if value in (None, "") else float(value))
+        _set_fields(sub, data, SUBMISSION_FIELDS)
         sub.updated = ev.time
 
     def _on_run_add(self, ev: Event) -> None:
         rid = str(ev.data["id"])
-        run = self.runs[rid] = Run(id=rid, results=str(ev.data["results"]), added=ev.time, added_by=ev.actor)
+        results = ev.data["results"]
+        if not util.is_sha256(results):
+            raise ValueError("results is not a blob id (sha256)")
+        run = self.runs[rid] = Run(id=rid, results=results, added=ev.time, added_by=ev.actor)
         _set_fields(run, ev.data, RUN_FIELDS)
 
     def _on_audit_verdict(self, ev: Event) -> None:
@@ -260,7 +343,7 @@ class State:
             idea_rev=str(d.get("idea_rev", "")),
             status=status,
             method=method,
-            evidence=list(d.get("evidence") or []),
+            evidence=[e for e in d.get("evidence") or [] if isinstance(e, dict)],
             note=str(d.get("note") or ""),
             model=str(d.get("model") or ""),
             detail=dict(d.get("detail") or {}),
@@ -318,15 +401,31 @@ class State:
 
     # ----- verdicts --------------------------------------------------------------------------------
 
+    def current_records(self, nb_id: str, idea_id: str) -> dict[str, VerdictRecord]:
+        """Per machine method, the record that counts for the idea's current rev: the one made with the
+        newest extractor (deterministic) or prompt (llm) version, latest first among equals. So a teammate
+        on an older Pseudorca cannot override a newer one's verdict."""
+        idea = self.ideas.get(idea_id)
+        rev = idea.rev if idea else ""
+        best: dict[str, VerdictRecord] = {}
+        for r in self.verdicts.get((nb_id, idea_id), []):
+            if r.method == "human" or r.idea_rev != rev:
+                continue
+            key = "prompt_version" if r.method == "llm" else "extractor_version"
+            cur = best.get(r.method)
+            if cur is None or _version(r, key) >= _version(cur, key):
+                best[r.method] = r
+        return best
+
     def effective_verdict(self, nb_id: str, idea_id: str) -> Effective | None:
         """Combine every recorded method into the one verdict to show.
 
         1. The latest human verdict wins.
-        2. Otherwise, among verdicts made for the idea's current rev: the deterministic methods
-           (fingerprint, patch) win when they agree on present or absent and none says partial;
-           if they contradict each other the result is "conflict".
-        3. Otherwise a non-unknown LLM verdict.
-        4. Otherwise "partial" if a deterministic method said so, else "unknown".
+        2. Otherwise, among verdicts for the idea's current rev (see `current_records`): the deterministic
+           methods (fingerprint, patch) win when they agree on present or absent and none says partial.
+        3. Otherwise a non-unknown LLM verdict (this also settles a fingerprint/patch contradiction).
+        4. Otherwise "conflict" if the deterministic methods contradict each other, "partial" if one said
+           so, else "unknown".
         If only verdicts for an older rev exist, the latest one is shown with stale=True.
         """
         records = self.verdicts.get((nb_id, idea_id))
@@ -338,24 +437,21 @@ class State:
         if humans:
             r = humans[-1]
             return Effective(r.status, "human", bool(rev) and r.idea_rev != rev, [r])
-        latest: dict[str, VerdictRecord] = {}
-        for r in records:
-            if r.idea_rev == rev:
-                latest[r.method] = r
+        latest = self.current_records(nb_id, idea_id)
         if not latest:
             r = records[-1]
             return Effective(r.status, r.method, True, [r])
         det = [latest[m] for m in DETERMINISTIC if m in latest]
         conclusive = {r.status for r in det if r.status in ("present", "absent")}
         has_partial = any(r.status == "partial" for r in det)
-        if len(conclusive) == 2:
-            return Effective("conflict", "det", False, det)
         if len(conclusive) == 1 and not has_partial:
             status = conclusive.pop()
             return Effective(status, "+".join(r.method for r in det if r.status == status), False, det)
         llm = latest.get("llm")
         if llm is not None and llm.status != "unknown":
             return Effective(llm.status, "llm", False, [llm, *det])
+        if len(conclusive) == 2:
+            return Effective("conflict", "det", False, det)
         if has_partial:
             return Effective("partial", "det", False, det)
         return Effective("unknown", "+".join(latest), False, list(latest.values()))

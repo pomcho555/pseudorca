@@ -177,6 +177,9 @@ def _events(store: Store) -> int:
 
 
 def _nb(store: Store, data: bytes, name: str) -> str:
+    """Register a minimal notebook whose bytes are unique to `data`."""
+    if name.endswith(".ipynb"):
+        data = json.dumps({"cells": [], "metadata": {"label": data.decode()}}).encode()
     return register_bytes(store, data, name=name)[0].id
 
 

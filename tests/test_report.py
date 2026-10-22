@@ -48,3 +48,15 @@ def test_report_command_writes_to_cache_by_default(store: Store):
     assert out.exit_code == 0, out.output
     path = store.root / "cache" / "report.html"
     assert path.exists() and "Which ideas are in which notebook" in path.read_text()
+
+
+def test_long_linear_lineage_is_flat_and_complete(store: Store):
+    parent = None
+    for i in range(80):
+        sha = store.put_blob(f"v{i}".encode())
+        store.append("nb.add", {"id": sha, "name": f"v{i}.ipynb", "parent": parent})
+        parent = sha
+    page = render(store.state(), store_name="t")
+    lineage = page.split("<h2>Notebooks</h2>")[1].split("<h2>")[0]
+    assert all(f"v{i}.ipynb" in lineage for i in range(80))
+    assert "margin-left:18px" not in lineage  # a single chain never indents

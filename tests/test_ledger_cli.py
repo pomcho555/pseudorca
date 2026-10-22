@@ -386,10 +386,11 @@ def test_nb_add_records_a_repo_relative_path_never_an_absolute_one(
     assert fresh(store).notebooks[util.sha256_file(script)].path == "notebooks/sub/agent.py"
 
     outside = write(tmp_path / "elsewhere" / "draft.ipynb", '{"cells": [1]}')
-    r = cli(store, "nb", "add", str(outside), "--no-store")
-    nb = fresh(store).notebooks[util.sha256_file(outside)]
-    assert nb.path == "draft.ipynb" and not nb.stored and not store.has_blob(nb.id)
-    assert "bytes not stored" in r.output
+    r = cli(store, "nb", "add", str(outside), "--no-store", code=1)
+    assert "outside the repository" in r.output  # audits could never find it again
+    assert util.sha256_file(outside) not in fresh(store).notebooks
+    r = cli(store, "nb", "add", str(outside))
+    assert fresh(store).notebooks[util.sha256_file(outside)].path == "draft.ipynb"
 
     for p in (store.root / "events").rglob("*.json"):
         text = p.read_text(encoding="utf-8")

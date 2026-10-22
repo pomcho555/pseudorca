@@ -15,13 +15,15 @@ _RAND_MASK = (1 << 80) - 1
 _last_ulid = [0, 0]
 
 
-def new_ulid() -> str:
+def new_ulid(min_ms: int = 0) -> str:
     """A 26-character ULID: 48 bits of milliseconds then 80 random bits, Crockford base32.
 
     Ids sort by creation time, and they stay strictly increasing within one process, so events written
-    in the same millisecond keep their order.
+    in the same millisecond keep their order. `min_ms` raises the time part (a hybrid logical clock: the
+    store passes one more than the newest id it has seen, so a new event always sorts after them, even
+    when this machine's clock is behind).
     """
-    ms = time.time_ns() // 1_000_000
+    ms = max(time.time_ns() // 1_000_000, min_ms)
     if ms <= _last_ulid[0]:
         ms = _last_ulid[0]
         rnd = (_last_ulid[1] + 1) & _RAND_MASK
@@ -34,6 +36,17 @@ def new_ulid() -> str:
         chars.append(_CROCKFORD[value & 31])
         value >>= 5
     return "".join(reversed(chars))
+
+
+def ulid_ms(ulid: str) -> int:
+    """The millisecond time part of a ULID (0 if it is not one)."""
+    value = 0
+    for ch in ulid[:10].upper():
+        idx = _CROCKFORD.find(ch)
+        if idx < 0:
+            return 0
+        value = value * 32 + idx
+    return value
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -53,9 +66,34 @@ def now_iso() -> str:
     return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
+def local_time(iso: str) -> str:
+    """An event time ("2026-01-05T18:30:00+09:00") as "2026-01-05 10:30" in the viewer's time zone.
+
+    Writers record their own offset; converting keeps a team spread over time zones in order.
+    """
+    if not isinstance(iso, str) or len(iso) <= 10:  # a bare date stays a date
+        return str(iso or "")
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso[:16].replace("T", " ")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def local_day(iso: str) -> str:
+    return local_time(iso)[:10]
+
+
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
-IDEA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-HEX_RE = re.compile(r"^[0-9a-f]+$")
+IDEA_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+HEX_RE = re.compile(r"\A[0-9a-f]+\Z")
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def is_sha256(value: object) -> bool:
+    return isinstance(value, str) and SHA256_RE.match(value) is not None
 
 
 def slug(text: str, max_len: int = 40) -> str:
@@ -89,6 +127,17 @@ def clip(text: str, width: int) -> str:
         out.append(c)
         used += w
     return "".join(out) + "…"
+
+
+def excerpt(text: str, col: int | None, width: int, match_len: int = 0) -> str:
+    """One line of `text` clipped to `width`, keeping the part starting at `col` (the match) visible."""
+    line = " ".join(text.split()) if col is None else text
+    if col is None or display_width(line) <= width:
+        return clip(" ".join(line.split()), width)
+    start = max(0, min(col - width // 4, len(line) - width + 2))
+    window = line[start:]
+    out = clip(" ".join(window.split()), width - (1 if start else 0))
+    return ("…" + out) if start else out
 
 
 def format_table(

@@ -13,9 +13,13 @@ class Evidence:
     path: str  # a path in the notebook's Tree
     line: int | None  # 1-based line of the quote's first line, when known
     quote: str  # text that occurs in that file (whitespace differences allowed)
+    col: int | None = None  # where in the quote the match starts, so displays can show that part
 
     def to_dict(self) -> dict[str, Any]:
-        return {"path": self.path, "line": self.line, "quote": self.quote}
+        d: dict[str, Any] = {"path": self.path, "line": self.line, "quote": self.quote}
+        if self.col is not None:
+            d["col"] = self.col
+        return d
 
 
 @dataclass

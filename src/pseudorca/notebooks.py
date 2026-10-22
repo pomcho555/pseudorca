@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pseudorca import util
@@ -23,11 +24,39 @@ def display_path(store: Store, path: Path) -> str:
         return p.name
 
 
+def inside_repo(store: Store, path: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(store.root.parent)
+    except ValueError:
+        return False
+    return True
+
+
+def check_notebook_bytes(data: bytes, label: str) -> None:
+    """Refuse an .ipynb that is not notebook JSON (for example a Git LFS pointer)."""
+    try:
+        doc = json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        doc = None
+    if not (isinstance(doc, dict) and ("cells" in doc or "worksheets" in doc)):
+        first = data[:60].decode("utf-8", "replace").splitlines()[0] if data.strip() else "(empty)"
+        raise ValueError(f"{label} is not notebook JSON (it starts with {first!r}; a Git LFS pointer?)")
+
+
 def register_file(
     store: Store, path: Path, *, name: str | None = None, **kwargs: Any
 ) -> tuple[Notebook, bool]:
-    """Register a notebook file; see `register_bytes`."""
+    """Register a notebook file; see `register_bytes`.
+
+    With keep_bytes=False the file must be inside the repository: the ledger records its repo-relative path
+    and later audits read it from there.
+    """
     p = Path(path)
+    if kwargs.get("keep_bytes") is False and not inside_repo(store, p):
+        raise ValueError(
+            f"{p} is outside the repository ({store.root.parent}), so audits could not find it again; "
+            "store its bytes (drop --no-store) or move it into the repository"
+        )
     return register_bytes(store, p.read_bytes(), name=name or p.name, path=display_path(store, p), **kwargs)
 
 
@@ -50,6 +79,8 @@ def register_bytes(
     `parent` must be the full id of a registered notebook. Returns (notebook, created).
     """
     applies, tags = list(dict.fromkeys(applies)), list(dict.fromkeys(tags))
+    if any(PurePosixPath(x).suffix.lower() == ".ipynb" for x in (name, path) if x):
+        check_notebook_bytes(data, path or name)
     sha = util.sha256_bytes(data)
     st = store.state()
     unknown = [a for a in applies if a not in st.ideas]
@@ -70,9 +101,10 @@ def register_bytes(
         for key, value in (("kernel", kernel), ("version", version), ("note", note), ("parent", parent)):
             if value and getattr(existing, key) != value:
                 changes[key] = value
-        if keep_bytes and not existing.stored:
-            store.put_blob(data)
-            changes["stored"] = True
+        if keep_bytes and not store.has_blob(sha):
+            store.put_blob(data)  # also repairs a blob that was never pushed or got lost
+            if not existing.stored:
+                changes["stored"] = True
         if changes:
             store.append("nb.update", {"id": sha, **changes})
         return store.state().notebooks[sha], False

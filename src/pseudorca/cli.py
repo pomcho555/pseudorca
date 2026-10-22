@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import importlib
+import os
+import sys
 from pathlib import Path
 
 import click
 
 from pseudorca import __version__
 from pseudorca.commands._common import Ctx
+from pseudorca.store import StoreError
 
 # name -> "module:attribute", in the order `pseudorca --help` lists them
 COMMANDS: dict[str, str] = {
@@ -32,6 +35,20 @@ COMMANDS: dict[str, str] = {
 class LazyGroup(click.Group):
     def list_commands(self, ctx: click.Context) -> list[str]:
         return list(COMMANDS)
+
+    def invoke(self, ctx: click.Context) -> object:
+        """Run the command; expected failures become one-line errors (set PSEUDORCA_DEBUG=1 for tracebacks)."""
+        if os.environ.get("PSEUDORCA_DEBUG"):
+            return super().invoke(ctx)
+        try:
+            return super().invoke(ctx)
+        except BrokenPipeError:  # output piped into `head` and closed early
+            sys.stderr.close()
+            raise SystemExit(0) from None
+        except KeyError:
+            raise
+        except (StoreError, LookupError, ValueError, OSError) as e:
+            raise click.ClickException(str(e) or type(e).__name__) from e
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         target = COMMANDS.get(cmd_name)

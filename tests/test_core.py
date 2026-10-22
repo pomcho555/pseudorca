@@ -188,12 +188,23 @@ def test_register_notebook_merges_metadata(store: Store, tmp_path: Path):
     assert created and nb.path == "nbs/main.ipynb" and nb.stored and store.has_blob(nb.id)
     nb2, created2 = register_file(store, f, tags=["a", "b"], applies=["i1"])
     assert not created2 and nb2.tags == ["a", "b"] and nb2.applies == ["i1"]
+    store.blob_path(nb.id).unlink()  # a blob that never got pushed
+    register_file(store, f)
+    assert store.has_blob(nb.id)  # re-adding the file repairs it
+    inside = store.root.parent / "nbs" / "draft.py"
+    inside.write_bytes(b"print(1)")
+    nb3, _ = register_file(store, inside, keep_bytes=False, parent=nb.id)
+    assert nb3.path == "nbs/draft.py" and not nb3.stored and nb3.parent == nb.id
     outside = tmp_path / "elsewhere.ipynb"
-    outside.write_bytes(b"other")
-    nb3, _ = register_file(store, outside, keep_bytes=False, parent=nb.id)
-    assert nb3.path == "elsewhere.ipynb" and not nb3.stored and nb3.parent == nb.id
+    outside.write_bytes(b'{"cells": [1]}')
+    with pytest.raises(ValueError, match="outside the repository"):
+        register_file(store, outside, keep_bytes=False)
     with pytest.raises(LookupError):
         register_file(store, outside, applies=["missing"])
+    lfs = tmp_path / "pointer.ipynb"
+    lfs.write_bytes(b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\n")
+    with pytest.raises(ValueError, match="not notebook JSON"):
+        register_file(store, lfs)
 
 
 def test_split_lines_counts_like_python():
@@ -226,3 +237,87 @@ def test_null_note_and_model_are_empty_strings(store: Store):
 def test_format_table_column_widths():
     out = util.format_table(["a", "b"], [["x" * 30, "y" * 30]], col_widths={0: 10})
     assert "x" * 9 + "…" in out and "y" * 30 in out
+
+
+def test_blob_ids_must_be_sha256_and_bytes_must_match(store: Store):
+    with pytest.raises(StoreError, match="not a blob id"):
+        store.get_blob("../../outside/marker.txt")
+    assert not store.has_blob("/etc/passwd")
+    sha = store.put_blob(b"real bytes")
+    store.blob_path(sha).write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+    with pytest.raises(StoreError, match="Git LFS"):
+        store.get_blob(sha)
+    store.append("idea.add", {"id": "evil", "title": "t", "patch": "../../outside/marker.txt"})
+    state = Store.at(store.root).state()
+    assert state.ideas["evil"].patch is None
+    assert any("invalid patch id" in w for w in state.warnings)
+
+
+def test_new_events_sort_after_everything_seen_even_with_a_slow_clock(store: Store, monkeypatch):
+    store.append("idea.add", {"id": "fast", "title": "t", "status": "testing"})
+    future_ms = util.ulid_ms(store.events()[-1].id) + 10 * 60_000
+    future_id = util.new_ulid(future_ms)
+    month = next((store.root / "events").iterdir())
+    (month / f"{future_id}-other.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "id": future_id,
+                "type": "idea.update",
+                "time": "t",
+                "actor": "other",
+                "data": {"id": "fast", "status": "parked"},
+            }
+        )
+    )
+    s2 = Store.at(store.root)
+    s2.append("idea.update", {"id": "fast", "status": "adopted"})  # made after seeing the future event
+    assert s2.events()[-1].id > future_id
+    assert Store.at(store.root).state().ideas["fast"].status == "adopted"
+    assert any("clock" in w for w in s2.state().warnings)
+
+
+def test_init_completes_a_partial_store_without_overwriting(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".pseudorca").mkdir(parents=True)
+    (repo / ".pseudorca" / "config.toml").write_text('[store]\nname = "kept"\n')
+    with pytest.raises(StoreError, match="no events/ folder"):
+        Store.find(repo)
+    s = Store.init(repo, name="new")
+    assert "events/" in s.created and "config.toml" not in s.created and ".gitattributes" in s.created
+    assert s.setting("store", "name") == "kept"
+    assert "blobs/** -text" in (s.root / ".gitattributes").read_text()
+
+
+def test_replay_merges_duplicate_registrations_and_warns_on_unknown_fields(store: Store):
+    sha = store.put_blob(b"nb")
+    store.append(
+        "nb.add", {"id": sha, "name": "a.ipynb", "tags": ["candidate"], "applies": ["x"], "kernel": "me/a"}
+    )
+    store.append("nb.add", {"id": sha, "name": "b.ipynb", "tags": [], "applies": [], "kernel": ""})
+    store.append("idea.add", {"id": "i", "title": "t", "priority": "high"})
+    store.append("sub.upsert", {"id": "9", "public_score": "pending", "description": "rerun"})
+    st = Store.at(store.root).state()
+    nb = st.notebooks[sha]
+    assert (nb.name, nb.tags, nb.applies, nb.kernel) == ("a.ipynb", ["candidate"], ["x"], "me/a")
+    assert any("'priority'" in w for w in st.warnings)
+    assert st.subs["9"].public_score is None and st.subs["9"].description == "rerun"
+
+
+def test_newer_extractor_verdict_beats_a_later_one_from_an_older_client(store: Store):
+    nb = _nb(store, b"nb")
+    store.append("idea.add", {"id": "i", "title": "t", "fingerprints": ["X"]})
+    _verdict(store, nb, "i", "present", "fingerprint", detail={"extractor_version": 2})
+    _verdict(store, nb, "i", "absent", "fingerprint", detail={"extractor_version": 1})
+    assert store.state().effective_verdict(nb, "i").status == "present"
+
+
+def test_llm_settles_a_deterministic_conflict(store: Store):
+    nb = _nb(store, b"nb")
+    store.append("idea.add", {"id": "i", "title": "t"})
+    _verdict(store, nb, "i", "present", "fingerprint")
+    _verdict(store, nb, "i", "absent", "patch")
+    assert store.state().effective_verdict(nb, "i").status == "conflict"
+    _verdict(store, nb, "i", "present", "llm", model="m")
+    eff = store.state().effective_verdict(nb, "i")
+    assert (eff.status, eff.method) == ("present", "llm")

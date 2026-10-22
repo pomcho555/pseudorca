@@ -37,7 +37,7 @@ td.ok { color:var(--ok); background:var(--ok-bg); } td.part { color:var(--part);
 td.no { color:var(--no); background:var(--no-bg); } td.unk { color:var(--unk); background:var(--unk-bg); }
 td.conf { color:var(--conf); background:var(--conf-bg); } td.none { color:var(--muted); }
 td.num { text-align:right; font-variant-numeric:tabular-nums; }
-ul.tree { margin:0; padding-left:20px; } ul.tree li { margin:2px 0; }
+ul.tree { margin:0; padding-left:20px; } ul.tree li { margin:2px 0; } ul.flat { list-style:none; padding-left:0; }
 .tag { display:inline-block; border:1px solid var(--line); border-radius:9px; padding:0 7px; font-size:12px; margin-right:3px; }
 footer { margin-top:40px; color:var(--muted); font-size:12.5px; }
 """
@@ -63,7 +63,7 @@ def _cell(eff: Effective | None, claimed: bool) -> str:
             lines.append(f"{rec.method}: {where} {util.clip(str(ev.get('quote', '')), 120)}")
         if rec.note:
             lines.append(f"{rec.method}: {util.clip(rec.note, 160)}")
-        lines.append(f"{rec.time} by {rec.actor}")
+        lines.append(f"{util.local_time(rec.time)} by {rec.actor}")
     mark = SYMBOLS.get(eff.status, "?") + ("*" if eff.stale else "")
     return (
         f'<td class="c {CELL_CLASS.get(eff.status, "unk")}" title="{_e(chr(10).join(lines))}">{_e(mark)}</td>'
@@ -94,26 +94,41 @@ def _board(state: State, ideas: list[Idea], notebooks: list[Notebook]) -> str:
 
 
 def _lineage(state: State) -> str:
+    """Notebooks as a family tree. A single child continues at its parent's indent and only branches
+    indent, so a long linear history stays flat; nothing is ever dropped."""
     ordered = state.notebooks_in_order()
     if not ordered:
         return '<p class="muted">No notebooks yet.</p>'
     children: dict[str | None, list[Notebook]] = {}
     for nb in ordered:
-        parent = nb.parent if nb.parent in state.notebooks else None
+        parent = nb.parent if nb.parent in state.notebooks and nb.parent != nb.id else None
         children.setdefault(parent, []).append(nb)
-
-    def render(parent: str | None, depth: int) -> str:
-        items = []
-        for nb in children.get(parent, []):
-            applies = f" · applies {', '.join(_e(a) for a in nb.applies)}" if nb.applies else ""
-            sub = render(nb.id, depth + 1) if depth < 50 else ""
-            items.append(
-                f"<li><b>{_e(nb.label)}</b> <code>{_e(util.short(nb.id))}</code> {_tags(nb.tags)}"
-                f'<span class="muted">{_e(nb.added[:10])} by {_e(nb.added_by)}{applies}</span>{sub}</li>'
-            )
-        return f'<ul class="tree">{"".join(items)}</ul>' if items else ""
-
-    return render(None, 0)
+    rows: list[tuple[int, Notebook]] = []
+    seen: set[str] = set()
+    stack = [(nb, 0) for nb in reversed(children.get(None, []))]
+    while stack:
+        nb, depth = stack.pop()
+        if nb.id in seen:
+            continue
+        seen.add(nb.id)
+        rows.append((depth, nb))
+        kids = children.get(nb.id, [])
+        for kid in reversed(kids):
+            stack.append((kid, depth if len(kids) == 1 else depth + 1))
+    rows.extend((0, nb) for nb in ordered if nb.id not in seen)  # notebooks caught in a parent loop
+    items = []
+    for depth, nb in rows:
+        parent = state.notebooks.get(nb.parent or "")
+        bits = [f"{_e(util.local_day(nb.added))} by {_e(nb.added_by)}"]
+        if parent is not None:
+            bits.append(f"from {_e(parent.label)}")
+        if nb.applies:
+            bits.append(f"applies {', '.join(_e(a) for a in nb.applies)}")
+        items.append(
+            f'<li style="margin-left:{min(depth, 12) * 18}px"><b>{_e(nb.label)}</b> <code>{_e(util.short(nb.id))}</code> '
+            f'{_tags(nb.tags)}<span class="muted">{" · ".join(bits)}</span></li>'
+        )
+    return f'<ul class="tree flat">{"".join(items)}</ul>'
 
 
 def _submissions(state: State, lb_noise: Any) -> str:
@@ -124,7 +139,7 @@ def _submissions(state: State, lb_noise: Any) -> str:
     for s in subs:
         nb = state.notebooks.get(s.nb or "")
         rows.append(
-            f"<tr><td>{_e(s.date[:16])}</td><td><code>{_e(s.id)}</code></td><td>{_e(nb.label if nb else '')}</td>"
+            f"<tr><td>{_e(util.local_time(s.date))}</td><td><code>{_e(s.id)}</code></td><td>{_e(nb.label if nb else '')}</td>"
             f'<td class="num">{_e(s.public_score if s.public_score is not None else "")}</td>'
             f'<td class="num">{_e(s.private_score if s.private_score is not None else "")}</td>'
             f"<td>{_e(s.status)}</td><td>{_e(util.clip(s.description, 80))}</td></tr>"
@@ -175,7 +190,7 @@ def _activity(state: State, n: int = 30) -> str:
         what = d.get("id") or f"{d.get('idea', '')} on {util.short(d.get('nb'), 8)}"
         extra = d.get("status", "")
         rows.append(
-            f"<tr><td>{_e(ev.time[:16])}</td><td>{_e(ev.actor)}</td><td>{_e(ev.type)}</td>"
+            f"<tr><td>{_e(util.local_time(ev.time))}</td><td>{_e(ev.actor)}</td><td>{_e(ev.type)}</td>"
             f"<td>{_e(util.clip(str(what), 60))} {_e(extra)}</td></tr>"
         )
     if not rows:
