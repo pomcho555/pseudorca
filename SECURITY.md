@@ -9,9 +9,13 @@ that reading them is safe and that a team's code and results stay private.
   text. Nothing from a notebook, an embedded payload or an archive is executed, imported, evaluated or
   unpickled. Pickled payloads are recorded as opaque binary entries.
 - **Decoding is bounded.** Embedded payloads (base64, zlib, gzip, xz/lzma, bz2, tar, zip) are decoded with
-  caps on bytes per payload, bytes per notebook, decode depth and archive members. Archive member names are
-  normalised into virtual paths. The extracted tree is never written to disk under those names; the cache
-  stores contents under their sha256.
+  caps on bytes per payload, bytes per notebook, decode depth and archive members.
+  - Decompression memory is bounded too: an xz/lzma dictionary is lowered to what the output cap needs,
+    and a stream that would still need more than 128 MiB is left undecoded with a warning.
+  - Archive member names are normalised into virtual paths. The extracted tree is never written to disk
+    under those names; the cache stores contents under their sha256.
+  - The local cache is treated as untrusted input: symlinked cache folders are refused, and links inside
+    a cache entry are never followed.
 - **Code leaves your machine only when you allow it.** The LLM audit is off until you configure a model.
   Any endpoint that is not on localhost needs `allow_remote = true`, including the Anthropic API.
   - A localhost endpoint of the OpenAI-compatible provider is always contacted directly. It is never reached
@@ -20,9 +24,11 @@ that reading them is safe and that a team's code and results stay private.
   - Before any text goes to an LLM, common secret formats are replaced with `[REDACTED]`:
     - API keys and tokens for OpenAI, Anthropic, GitHub, Hugging Face, Google, Slack and Kaggle;
     - AWS access keys and secret keys, including credentials files;
-    - JWTs, Bearer and Basic credentials, private key blocks, and passwords in URLs;
+    - JWTs, Bearer and Basic credentials, and private key blocks;
+    - passwords in URLs, also with an empty user name;
     - values assigned to secret-like names (`key`, `token`, `secret`, `credential`, `password`, `pwd`,
-      `passphrase`), quoted or on YAML, INI and `.env` lines.
+      `passphrase`): quoted, on YAML, INI and `.env` lines, or in shell commands (also a notebook's `!`
+      lines and strings passed to `os.system` or `subprocess`).
   - Redaction is best effort. Do not rely on it as your only protection.
 - **LLM answers are not trusted.** Notebook text is treated as untrusted data in the prompt. Any quote the
   LLM gives as evidence must be found in the notebook; otherwise the verdict becomes `unknown`. The LLM

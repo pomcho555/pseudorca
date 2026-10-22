@@ -449,3 +449,31 @@ def test_a_future_store_does_not_leak_future_ids_into_other_stores(tmp_path: Pat
     other.append("idea.add", {"id": "y", "title": "t"})
     assert util.ulid_ms(other.events()[-1].id) < util.ulid_ms(future_id)
     assert not any("clock" in w for w in Store.at(other.root).state().warnings)
+
+
+def test_snippet_search_is_linear_and_exact():
+    import time
+
+    t = Tree()
+    body = "".join(f"x{i} = compute({i})\n" for i in range(60_000))
+    t.add_text("big.py", body + "def target():\n    return  42\n", "cell 0")
+    started = time.perf_counter()
+    for _ in range(20):
+        assert t.find_snippet("def target():\n return 42", partial_ends=False) == [("big.py", 60_001)]
+    assert time.perf_counter() - started < 2.0
+    assert t.find_snippet("compute(59999)\ndef tar") == [("big.py", 60_000)]
+    assert t.find_snippet("ute(1)") == [("big.py", 2)]
+    assert t.find_snippet("x1 = compute(1)", partial_ends=False) == [("big.py", 2)]
+
+
+def test_tree_cache_keeps_line_endings_and_never_writes_through_links(tmp_path: Path):
+    t = Tree("s", meta={"extractor_version": 1})
+    t.add_text("a.sh", "# %%bash\r\necho hi\r\n", "cell 0")
+    (tmp_path / "c" / "files").mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    (tmp_path / "c" / "files" / t.files["a.sh"].sha256).symlink_to(victim)
+    (tmp_path / "c" / "manifest.json").symlink_to(tmp_path / "victim2.txt")
+    t.save(tmp_path / "c")
+    assert not victim.exists() and not (tmp_path / "victim2.txt").exists()
+    u = Tree.load(tmp_path / "c")
+    assert u is not None and u.text("a.sh") == "# %%bash\r\necho hi\r\n"

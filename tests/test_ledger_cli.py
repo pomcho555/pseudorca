@@ -607,7 +607,7 @@ def test_nb_add_merges_metadata_and_validates_references(store: Store):
 
     notes = write(repo / "notes.txt", "hello")
     r = cli(store, "nb", "add", str(notes))
-    assert "neither a .ipynb nor a .py" in r.stderr and "registered notes.txt" in r.stdout
+    assert "has no .ipynb or .py suffix" in r.stderr and "registered notes.txt" in r.stdout
 
 
 def test_nb_list_columns_filters_and_json(store: Store):

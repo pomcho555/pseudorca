@@ -103,9 +103,13 @@ the OS user.
 5. `partial` if a deterministic method said so.
 6. `unknown`.
 
-For each machine method, the record that counts is the one made with the newest extractor version
-(deterministic) or prompt version (llm), and the latest among equals. A teammate on an older Pseudorca
-therefore cannot override a newer one's verdict.
+For each machine method, the record that counts is the one made by the newest code, and the latest
+among equals:
+- for fingerprint and patch, the highest (extractor version, matcher version);
+- for the LLM, the highest prompt version.
+
+A teammate on an older Pseudorca therefore cannot override a newer one's verdict. The audit engine
+records these versions in each verdict's `detail`.
 
 ## Tree and extraction (`pseudorca.tree`, `pseudorca.extract`)
 
@@ -151,6 +155,10 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 **File writes**
 - A literal path written with literal text becomes `files/<path>`.
 - This covers `Path(p).write_text(s)`, `open(p, "w").write(s)` and `with open(p, "w") as f: f.write(s)`.
+- What a write puts in a file is searched for payloads like a `%%writefile` body: as Python for a `.py`
+  path, and by the pattern scan otherwise.
+- Bytes written with `write_bytes` or in a binary mode are searched when they are text.
+- A written file counts as one nesting level.
 
 **Payloads**
 - Every `str` or `bytes` constant of at least `min_payload_chars` is tried in three steps:
@@ -171,6 +179,12 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 - The pattern scan for quoted strings runs in linear time. It is used for code that does not parse, for
   shell and other cell magics, and for written files that are not `.py`. A one-quote string ends at a line
   end that no backslash escapes, as in Python's tokenizer.
+- **Decoder memory is bounded too.**
+  - An xz or lzma header that declares a dictionary of 128 MiB or more has that dictionary lowered to what
+    the output cap needs (96 MiB at the default `max_payload_bytes`). A decoder never looks back further
+    than it has decoded, so the output is unchanged.
+  - Only headers liblzma accepts are lowered, and an xz stream's blocks are followed up to 256 per stream.
+  - A stream that would still need more is kept as a binary `.xz`/`.lzma` entry with a warning.
 - Origins name the xz container step `lzma`.
 
 **Never:** `exec`, `eval`, importing notebook code, `pickle.loads`, or writing tree paths to disk.
@@ -178,7 +192,11 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 **Line numbers** count only `\n`, `\r\n` and `\r` (`tree.split_lines`), as Python's tokenizer does.
 
 **`tree_for(store, nb)`** caches in `cache/trees/<nb.id>/`.
-- The cache is valid while `meta["extractor_version"] == EXTRACTOR_VERSION` (now 2).
+- The cache is valid while `meta["extractor_version"] == EXTRACTOR_VERSION` (now 3).
+- Links inside a cache entry (`manifest.json`, its temporary file, entries of `files/`) are removed, never
+  followed, before the entry is read or written. A rebuild prunes only regular files directly inside
+  `files/`.
+- Cached text keeps its line breaks (`\n`, `\r\n` or `\r`) exactly.
 - The bytes come from the blob.
 - If the notebook was added with `--no-store`, the bytes come from `nb.path`, but only if that file still
   has the same sha256.
@@ -194,8 +212,12 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
     the `(?m)` flag is searched over each whole file with `re.MULTILINE`.
   - `!text` and `!re:<regex>` must be absent.
 - **Scope:** only evidence paths (no markdown, no binary files).
-- **Evidence** records `col`, where the match starts in its quote, so tables can show a window around
-  the match.
+- **Evidence:**
+  - the quote is the lines the match touches, without their outer whitespace, cut to 300 characters
+    around the match;
+  - `line` is the quote's first line, so a match that starts on a blank line points at the first line
+    with text;
+  - `col` is where the match starts in the quote, so tables can show a window around it.
 - **Status with positives** (a positive is something that must be present):
   - `present` when all positives are found and no negative is;
   - `absent` when no positive is found;
@@ -207,8 +229,12 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 
 ### Patch
 - **Input:** a unified diff (git or plain), read as UTF-8. A leading byte order mark is ignored.
-- **Lines:** they are compared after whitespace normalisation. Blank and trivial lines are ignored
-  (`pass`, `else:`, lone brackets, and lines under 4 characters).
+- **Lines:**
+  - Lines are compared after whitespace normalisation, and blank lines are skipped.
+  - Trivial lines (`pass`, `else:`, lone brackets, and lines under 4 characters) are never anchors, and a
+    change made only of trivial lines (or only of whitespace) is ignored.
+  - Next to changed lines, trivial lines are part of the change and must match like any other line. So
+    when a trivial line changes later, its change becomes `unknown`.
 - **Candidate files**, tried in this order:
   1. paths ending with the diff's path;
   2. the same basename;
@@ -216,16 +242,22 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 - **Matching:**
   - A hunk's non-trivial context lines split it into changes. Each change is anchored by the nearest
     non-trivial context line before it and after it.
-  - **New side in place:** the added lines sit next to an anchor. For a change that only removes lines,
-    the two anchors are adjacent instead.
+  - **New side in place:** the added lines sit next to an anchor.
+    - When the change's old side is also in place, they must sit between both anchors. A change at a hunk
+      edge has only its one anchor.
+    - For a change that only removes lines, the two anchors are adjacent instead.
   - **Old side in place:** the removed lines sit between both anchors. For a change that only adds lines,
     the two anchors are adjacent instead.
   - A lone anchor at a hunk edge must be the first or last line of its file.
 - **Hunk state:**
   - `applied`: every change's new side is in place (and, for a pure removal, its old side is not);
   - `reverted`: every change's old side is in place and its new side is not;
-  - `unknown`: anything else, including added lines found only away from their context.
-- **Hunks without context** (a new or deleted file, or a `-U0` diff) are matched by their blocks alone:
+  - `unknown`: anything else. This includes added lines found only away from their context, and added
+    lines next to only one anchor while the change's old side is still in place.
+- **Hunks without non-trivial context** are matched by their blocks alone. These are hunks for a new or
+  deleted file, `-U0` diffs, and hunks whose context lines are all trivial.
+  - **Where blocks are looked for:** in the diff's own file (same path, then same basename) when the
+    notebook has it. Otherwise, and for a new or deleted file, in every evidence path.
   - `applied` when every added block is found;
   - `reverted` when every removed block is found and no added block is;
   - for a hunk that only adds or only removes lines, "not there" when at most 20% of its distinct
@@ -237,6 +269,9 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
   - no hunk applied or reverted: `unknown`;
   - anything else: `partial`.
 - **`detail`** holds the counts and the files.
+- **Speed:** matching normalises and indexes the notebook's lines once per tree, and every check in an
+  audit shares that index. A run of lines is looked for only where its rarest line occurs, so checks take
+  near-linear time; an 8,000-line formatter diff takes well under a second.
 
 ### Orchestration
 1. An audit reads the ledger once. Effective verdicts are computed at the end, from that snapshot plus
@@ -248,19 +283,26 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
    - with `llm = "auto"`, only when the deterministic result is inconclusive: there is no single agreed
      `present`/`absent`, and a fingerprint/patch conflict also counts as inconclusive. The LLM's verified
      verdict then settles it, and audit and check show its quote.
-4. A method is skipped, unless `--force` is given, when the verdict that counts for it
-   (`State.current_records`) is at least as new as what this run would record:
-   - for fingerprint and patch, `detail.extractor_version >= EXTRACTOR_VERSION`;
-   - for the LLM, the same model with `detail.prompt_version >= PROMPT_VERSION`, or any model with a newer
-     prompt version.
+4. A method is skipped, unless `--force` is given, when what is recorded for it is at least as new as
+   what this run would record:
+   - **Fingerprint and patch:** skipped when the verdict that counts (`State.current_records`) has
+     `(detail.extractor_version, detail.matcher_version) >= (EXTRACTOR_VERSION, MATCHER_VERSION)`.
+     - Each method has its own `MATCHER_VERSION` (now 2), bumped when its matching changes.
+     - So a matcher fix redoes older verdicts without rebuilding cached trees.
+   - **LLM:** skipped when any verdict recorded for this rev, not only the one that counts, comes from:
+     - the same model with `detail.prompt_version >= PROMPT_VERSION`; or
+     - any model with a newer prompt version.
 
-   Versions compare as integers. An older Pseudorca never redoes a newer one's verdicts, and an upgrade
-   redoes older ones.
+     So each model is asked once per prompt version.
+
+   Versions compare as integers, and a missing one counts as 0. An older Pseudorca never redoes a newer
+   one's verdicts, and an upgrade redoes older ones.
 5. Every finding is written as one `audit.verdict` event.
 
 **`audit NB_REF`**
-- When `NB_REF` is a notebook file, the registered version with that file's sha256 is audited, whatever
-  its name.
+- When `NB_REF` names an existing file, whatever its suffix, the registered version with that file's
+  sha256 is audited, whatever its name.
+- Without `NB_REF`, the latest registered notebook is audited, and a file named `latest` is not read.
 - A file whose version is not registered is an error. If its name resolves to another registered
   version, it is a warning instead. Both suggest `pseudorca nb add FILE` or `pseudorca check FILE`.
 - `audit` and `check` take `--json`.
@@ -279,8 +321,10 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
   - each prompt piece is redacted before it is cut to its length limit, and the whole message is redacted
     again.
 - **Verification:**
-  - each quote must be found by `Tree.find_snippet` in the cited file (never under `markdown/`);
-    unverified quotes are dropped;
+  - each quote must be found in the cited file (never under `markdown/`) by the rule of
+    `Tree.find_snippet` with partial ends. The search takes time linear in the file, and the match nearest
+    the cited line wins (the earlier one on a tie);
+  - only the first 10 quotes are checked, and unverified ones are dropped;
   - `present` or `partial` with no verified quote becomes `unknown`;
   - `absent` needs at least one tool call.
 - **Remote guard:**
@@ -293,18 +337,29 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 - **Redaction:** these are replaced by `[REDACTED]` before anything is sent:
   - OpenAI, Anthropic, GitHub, Hugging Face, Slack, Google and Kaggle keys;
   - AWS access key ids and secret access keys, including credentials files and `aws configure set`;
-  - JWTs, Bearer and Basic credentials, private key blocks, and passwords in URLs;
+  - JWTs, Bearer and Basic credentials, and private key blocks;
+  - passwords in URLs, also with an empty user name (`redis://:password@host`);
   - values assigned to secret-like names (key, token, secret, credential, password, passwd, pwd,
     passphrase):
     - quoted values with any string prefix, or in triple quotes;
-    - passwords of 6 or more characters, spaces included;
-    - unquoted secret-looking values on YAML, INI, `.env` or properties lines.
-- **What is not redacted:** environment variable names, templates, booleans, numbers and code-like names.
+    - unquoted secret-looking values on YAML, INI, `.env` or properties lines;
+    - `NAME=value` in shell commands, including a notebook's `!` lines and strings handed to a shell
+      (`os.system`, `subprocess`). There a value ends at whitespace, `;`, `&`, `|` or a quote, as in a
+      shell.
+  - **Passwords:** a name that ends in password, passwd, pwd or passphrase holds a password.
+    - An unquoted value of 6 or more characters on its line is redacted, words and numbers included.
+    - The exception is a value that reads as code: an environment variable's name, a dotted name, a
+      CamelCase name, or a variable named for a password.
+- **What is not redacted:** environment variable names, templates and code-like names, and (except on a
+  password line) booleans, numbers and short words.
+- Replacements keep every line break as it was, so line numbers in the redacted view match the notebook.
 - **Linear time:** redaction runs in time linear in the text.
 - Verification runs on the same redacted text.
 - **Transcripts:** saved in `cache/llm/`.
 - **Fallback:** for endpoints without tool calling, a single prompt with retrieved snippets, answered as
-  JSON.
+  JSON. The reply is read in linear time: `<think>` blocks are skipped and code fences are taken.
+- **Unreadable output:** tool arguments or a reply whose JSON is nested deeper than Python's recursion
+  limit count as unreadable, and the verdict becomes `unknown`.
 
 ### `check`
 `pseudorca check NOTEBOOK` registers the notebook (unless `--dry-run`) and audits it. It then compares
@@ -402,4 +457,6 @@ and `OSError`.
   replay warnings and the clock-skew note.
 - When output is piped into a reader that closes early, such as `head`, the command ends quietly with code
   0. `check` keeps its own exit code in that case.
+- `check` decides its exit code before it prints anything, so a closed stdout (`| head`) still ends with
+  0 or 1 by the outcome. If output is lost before the outcome is known, `check` exits 2.
 - Raise `LookupError` or `ValueError` for user mistakes, never `KeyError`, which is treated as a bug.

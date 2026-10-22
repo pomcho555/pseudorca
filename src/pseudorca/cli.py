@@ -46,7 +46,12 @@ class LazyGroup(click.Group):
             return self._run(ctx)
         except BrokenPipeError:  # output piped into `head` and closed early: exit quietly, no flush error
             with contextlib.suppress(OSError, ValueError):
-                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+                fd = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    for stream in (sys.stdout, sys.stderr):  # stderr too, for `2>&1 | head`
+                        os.dup2(fd, stream.fileno())
+                finally:
+                    os.close(fd)
             raise SystemExit(0) from None
         except KeyError:
             raise

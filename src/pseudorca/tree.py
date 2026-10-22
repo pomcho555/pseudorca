@@ -17,6 +17,7 @@ Path scheme used by the extractor:
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import json
 import os
@@ -75,6 +76,16 @@ def split_lines(text: str) -> list[str]:
     return lines
 
 
+def _write_new(target: Path, text: str) -> None:
+    """Write `target` through a fresh temporary file: O_EXCL never follows a planted link, os.replace swaps the
+    name itself, and newline="" keeps \r\n and \r exactly."""
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{util.new_ulid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with open(fd, "w", encoding="utf-8", errors="replace", newline="") as fh:
+        fh.write(text)
+    os.replace(tmp, target)
+
+
 def normalize_line(line: str) -> str:
     """Collapse all whitespace runs to one space and strip the ends."""
     return " ".join(line.split())
@@ -106,6 +117,7 @@ class Tree:
         self.warnings: list[str] = list(warnings)
         self.meta: dict[str, Any] = dict(meta or {})
         self._norm: dict[str, list[tuple[int, str]]] = {}
+        self._join: dict[str, tuple[str, list[int], list[int]]] = {}
 
     def __len__(self) -> int:
         return len(self.files)
@@ -132,6 +144,7 @@ class Tree:
         f = TreeFile(path=path, text=text, origin=origin, sha256=util.sha256_bytes(raw), size=len(raw))
         self.files[path] = f
         self._norm.pop(path, None)
+        self._join.pop(path, None)
         return f
 
     def add_bytes(self, path: str, data: bytes, origin: str, *, replace: bool = False) -> TreeFile:
@@ -147,6 +160,7 @@ class Tree:
         )
         self.files[path] = f
         self._norm.pop(path, None)
+        self._join.pop(path, None)
         return f
 
     # ----- reading ---------------------------------------------------------------------------------
@@ -224,25 +238,34 @@ class Tree:
         want = [normalize_line(line) for line in split_lines(snippet) if line.strip()]
         if not want:
             return []
-        n = len(want)
+        # The file's normalized non-blank lines joined by "\n": a substring match of the joined snippet is
+        # exactly a match with partial ends (the first line may end a line, the last may start one); padding
+        # both with "\n" makes every line whole. One str.find pass per occurrence keeps this linear.
+        needle = "\n".join(want)
+        if not partial_ends:
+            needle = f"\n{needle}\n"
         found: list[tuple[str, int]] = []
         for p in self.paths() if paths is None else paths:
             f = self.files.get(p)
             if f is None or f.binary:
                 continue
-            norm = self._normalized(p)
-            for k in range(len(norm) - n + 1):
-                first, last = norm[k][1], norm[k + n - 1][1]
-                if partial_ends:
-                    if n == 1:
-                        ok = want[0] in first
-                    else:
-                        ok = first.endswith(want[0]) and last.startswith(want[-1])
-                else:
-                    ok = first == want[0] and last == want[-1]
-                if ok and all(norm[k + j][1] == want[j] for j in range(1, n - 1)):
-                    found.append((p, norm[k][0]))
+            joined, offsets, numbers = self._joined(p)
+            hay = joined if partial_ends else f"\n{joined}\n"
+            start = hay.find(needle)
+            while start >= 0:
+                found.append((p, numbers[bisect.bisect_right(offsets, start) - 1]))
+                start = hay.find(needle, start + 1)
         return found
+
+    def _joined(self, path: str) -> tuple[str, list[int], list[int]]:
+        if path not in self._join:
+            norm = self._normalized(path)
+            offsets, pos = [], 0
+            for _, text in norm:
+                offsets.append(pos)
+                pos += len(text) + 1
+            self._join[path] = ("\n".join(t for _, t in norm), offsets, [i for i, _ in norm])
+        return self._join[path]
 
     # ----- cache -----------------------------------------------------------------------------------
 
@@ -258,8 +281,12 @@ class Tree:
         content_dir.mkdir(parents=True, exist_ok=True)
         for f in self.files.values():
             target = content_dir / f.sha256
-            if not f.binary and not target.exists():
-                target.write_text(f.text, encoding="utf-8", errors="replace")
+            if f.binary:
+                continue
+            if target.is_symlink():
+                target.unlink()
+            if not target.is_file():
+                _write_new(target, f.text)
         manifest = {
             "format": TREE_FORMAT,
             "source_sha256": self.source_sha256,
@@ -267,15 +294,13 @@ class Tree:
             "warnings": self.warnings,
             "files": self.manifest(),
         }
-        tmp = directory / "manifest.json.tmp"
-        tmp.write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
-        os.replace(tmp, directory / "manifest.json")
+        _write_new(directory / "manifest.json", json.dumps(manifest, ensure_ascii=True))
 
     @classmethod
     def load(cls, directory: Path) -> Tree | None:
         """A tree saved with `save`, or None if there is none or it has another format."""
         mp = directory / "manifest.json"
-        if not mp.is_file():
+        if mp.is_symlink() or not mp.is_file():
             return None
         try:
             m = json.loads(mp.read_text(encoding="utf-8"))
@@ -298,7 +323,8 @@ class Tree:
                     f = content_dir / e["sha256"]
                     if f.is_symlink() or not f.is_file():
                         return None
-                    text = f.read_text(encoding="utf-8")
+                    with open(f, encoding="utf-8", newline="") as fh:  # keep \r\n and \r as they were
+                        text = fh.read()
                 tree.files[e["path"]] = TreeFile(
                     e["path"], text, e["origin"], e["sha256"], e["size"], e["binary"]
                 )

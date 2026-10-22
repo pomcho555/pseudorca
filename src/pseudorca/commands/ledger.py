@@ -809,7 +809,7 @@ def nb_add(
     store = ctx.store()
     st = store.state()
     if file.suffix.lower() not in (".ipynb", ".py"):
-        warn(f"{file.name} is neither a .ipynb nor a .py file; audits may not be able to read it")
+        warn(f"{file.name} has no .ipynb or .py suffix; its format will be taken from its bytes")
     if name is not None and not name.strip():
         fail("--name cannot be empty")
     with user_errors():

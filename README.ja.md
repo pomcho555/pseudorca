@@ -251,7 +251,7 @@ git add .pseudorca && git commit -m "Update ledger" && git push
 | `markdown/cell_NNN.md` | マークダウンセル。読むだけで、判定の根拠にはしない |
 
 - 埋め込みは、base64・base85・hex の文字列を、zlib・gzip・xz/lzma・bz2 で解凍し、tar・zip を開くところまで展開します。
-- 展開には、サイズ・段数・アーカイブ内のファイル数の上限があります。
+- 展開には、サイズ・段数・アーカイブ内のファイル数・展開に使うメモリの上限があります。展開しなかったものは警告として表示します。
 - pickle は決して読み込みません。
 - `%env K=V` や `os.environ["K"] = "V"` のような環境変数の設定も集めます。
 

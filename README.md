@@ -257,7 +257,8 @@ The audit never runs a notebook. It builds a read-only tree of text:
 
 - **Payload formats:** base64, base85 or hex text, compressed with zlib, gzip, xz/lzma or bz2, possibly
   packed as tar or zip.
-- **Limits:** decoding is capped in size, depth and archive members.
+- **Limits:** decoding is capped in size, depth, archive members and decoder memory. Whatever is not
+  decoded is listed as a warning.
 - **Pickles** are never loaded.
 - **Environment settings** such as `%env K=V` and `os.environ["K"] = "V"` are collected as well.
 
