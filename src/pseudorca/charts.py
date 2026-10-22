@@ -37,7 +37,7 @@ LABEL_COLS = 30  # a change label is cut to about this many columns (the tooltip
 MIN_PLOT = 240  # the narrowest plot of a forest or waterfall: longer row labels are cut to keep it
 LIMIT = 1e300  # an axis over values beyond this could overflow: it becomes 0..1 instead
 TINY = 1e-12  # a noise SD below this share of the scores' scale is rounding: it is shown as 0
-GOOD, BAD, NEUTRAL = "ok", "no", "mu"  # mark colours: helps, hurts, neither
+GOOD, BAD, NEUTRAL, ZERO = "ok", "no", "mu", "zr"  # mark colours: helps, hurts, neither, nothing
 
 CSS = """
 svg.chart { display:block; width:100%; max-width:900px; min-width:720px; height:auto; font-size:12px;
@@ -61,6 +61,7 @@ svg.chart .ci.ok { stroke:var(--ok); } svg.chart .ci.no { stroke:var(--no); }
 svg.chart .ci.mu { stroke:var(--muted); }
 svg.chart .dot { stroke:var(--bg); stroke-width:2; }
 svg.chart .ok { fill:var(--ok); } svg.chart .no { fill:var(--no); } svg.chart .mu { fill:var(--muted); }
+svg.chart .zr { fill:var(--muted); opacity:.6; }
 svg.chart .total { fill:var(--fit); }
 svg.chart .wk { stroke:var(--fg); stroke-width:1.5; } svg.chart .link { stroke:var(--muted); stroke-width:1; }
 svg.chart .cut { stroke:var(--bg); stroke-width:2; fill:none; }
@@ -74,7 +75,7 @@ svg.chart .cut { stroke:var(--bg); stroke-width:2; fill:none; }
 .key.chg { width:2px; height:10px; background:var(--fg); }
 .key.dot { width:8px; height:8px; border-radius:50%; } .key.bar { width:14px; height:8px; border-radius:2px; }
 .key.total { background:var(--fit); } .key.ok { background:var(--ok); } .key.no { background:var(--no); }
-.key.mu { background:var(--muted); } .key.wk { width:14px; height:1.5px; background:var(--fg); }
+.key.mu { background:var(--muted); } .key.zr { background:var(--muted); opacity:.6; } .key.wk { width:14px; height:1.5px; background:var(--fg); }
 .key.cut { width:14px; height:8px; border-radius:2px;
            background:linear-gradient(115deg, var(--fit) 40%, var(--bg) 40% 60%, var(--fit) 60%); }
 """
@@ -487,7 +488,9 @@ def waterfall(fit: Fit, w: Waterfall) -> str:
     for s, shown in zip(w.steps, deltas, strict=True):
         whisker = (level + s.ci_low, level + s.ci_high) if _finite(s.ci_low) and _finite(s.ci_high) else None
         ci = f" [{signed(s.ci_low, dec)}, {signed(s.ci_high, dec)}]" if whisker else ""
-        if s.sign == 0 or s.delta == 0:  # a mix that cannot be split, or nothing at all
+        if s.delta == 0:  # it adds exactly nothing
+            cls = ZERO
+        elif s.sign == 0:  # a mix that cannot be split
             cls = NEUTRAL
         else:
             cls = GOOD if (s.delta > 0) == fit.higher_is_better else BAD
@@ -573,7 +576,7 @@ def waterfall(fit: Fit, w: Waterfall) -> str:
         names = ((GOOD, "adds"), (BAD, "takes away"))
     else:
         names = ((GOOD, "lowers it (better)"), (BAD, "raises it (worse)"))
-    for cls, text in (*names, (NEUTRAL, "cannot be separated")):
+    for cls, text in (*names, (NEUTRAL, "cannot be separated"), (ZERO, "adds nothing")):
         if any(b.cls == cls for b in bars):
             keys.append((f"bar {cls}", text))
     if any(b.whisker for b in bars):

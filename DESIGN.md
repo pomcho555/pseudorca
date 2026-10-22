@@ -579,15 +579,23 @@ It fits an additive model, `score = baseline + Σ effect(idea in it) + noise`, b
     most frequent; the rest are counted, and `--json` has each one). `--json` gives `{"dry_run",
     "notebooks": [the object of `audit NB --json`], "skipped", "totals"}`, counting audited notebooks
     only.
-- **Report:** `report` shows the same model as a submissions × ideas matrix (outlined cells changed
-  since the latest earlier verdict), a leaderboard chart with the fitted scores and a noise band, forest
-  plots of the effects (the leaderboard, then each protocol), and the breakdown, as inline SVG without
-  scripts.
+- **Report:** `report` is one HTML file of tabs, one view each, that switch without scripts: a hidden
+  radio button per tab, the labels as the tab bar, and generated CSS (`#id:checked ~ #id-panel`) that
+  shows the checked one's panel. The ids are made by the report, never taken from the ledger, so the CSS
+  holds no ledger string. Each panel starts with a heading that screen readers read and print shows;
+  printing shows every panel. On a narrow page the tab bars wrap.
+  - Tabs: Effects (when computed, and first when there are submissions or runs; else the board is
+    first), Board, Submissions, Notebooks, Ideas, Activity.
+  - The Effects tab holds one line on the model, then a tab per view of the same model: the ideas per
+    submission (outlined cells changed since the latest earlier verdict), what each idea adds (forest
+    plot), the breakdown, the score chart (fitted scores and a noise band), and the local runs of each
+    protocol. Each view is drawn on its own, so one that fails on odd numbers becomes a note and the
+    others are still drawn.
   - It fits public scores with `effects`' defaults, the direction and noise from `[effects]`, and
     `--metric`, `--resamples` (10,000 by default, as in `effects`) and `--all` for the runs and ideas.
     With submissions from several competitions it shows the store's competition, else a note.
-  - A bad `[effects]` value, or a part that cannot be computed or drawn (overflow, recursion, a missing
-    blob), becomes a note; the rest of the report is still written.
+  - A bad `[effects]` value, or a part that cannot be computed (overflow, recursion, a missing blob),
+    becomes a note; the rest of the report is still written.
   - Notes point to `pseudorca effects` options or `config.toml`, never to flags `report` lacks.
 
 ## Display conventions

@@ -295,7 +295,9 @@ Breakdown of 1006 (best in the model) from 1001 (first), by the model
 - **The breakdown** walks from the first submission to the best one, idea by idea. `--sub` and `--base`
   choose others.
 
-`pseudorca report` draws the same as charts.
+`pseudorca report` draws the same as charts in a single HTML file, one tab per view: the ideas in each
+submission, what each idea adds, the breakdown, the scores over time and each protocol's local runs, next
+to tabs for the board, the submissions, the notebooks, the ideas and the recent activity.
 
 ### 9. Share
 
@@ -441,7 +443,7 @@ whether a gap is bigger than that noise.
 | `sub add / list / link`, `kaggle sync`, `kaggle pull` | submissions and Kaggle kernels (read-only) |
 | `run add / list / show`, `compare`, `lb` | results and noise |
 | `effects` | which ideas each submission has, and what each idea adds to the score |
-| `report` | a single-file HTML report |
+| `report` | a single-file HTML report, one tab per view (no scripts) |
 | `log` | recent changes and who made them |
 
 `audit`, `check`, `status`, `log`, `lb`, `effects` and the `list` commands take `--json` for scripts. In

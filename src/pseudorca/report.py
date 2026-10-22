@@ -22,6 +22,7 @@ SYMBOLS = {"present": "✓", "partial": "◐", "absent": "✗", "unknown": "?", 
 CELL_CLASS = {"present": "ok", "partial": "part", "absent": "no", "unknown": "unk", "conflict": "conf"}
 MEANING = {"conflict": "methods disagree"}  # a status in the legends, when its name is not enough
 CONFIG = ".pseudorca/config.toml"
+TAB_COLS = 40  # a longer tab label (a protocol's name, say) is cut, with the whole of it as a tooltip
 # what drawing a part of the effects section may raise on odd numbers (hand-edited scores near the float
 # limits, say); that part then becomes a note, and the rest of the report is still written
 DRAW_ERRORS = (ValueError, LookupError, ArithmeticError, RecursionError)
@@ -63,10 +64,71 @@ table.mx th.v span { writing-mode:vertical-rl; transform:rotate(180deg); white-s
 table.mx tr.off td { opacity:.55; } table.mx td { white-space:nowrap; }
 table.mx td.chs { white-space:normal; min-width:24em; }
 .lg { white-space:nowrap; margin-right:.8em; } p.muted code { white-space:nowrap; }
+.tabs { position:relative; margin-top:18px; }
+.tabs > input.tab { position:absolute; top:0; left:0; width:1px; height:1px; margin:0; opacity:0; }
+.tabbar { display:flex; flex-wrap:wrap; gap:0 2px; border-bottom:1px solid var(--line); margin-bottom:16px; }
+.tabbar label { padding:8px 14px 7px; margin-bottom:-1px; border-bottom:2px solid transparent;
+                border-radius:6px 6px 0 0; color:var(--muted); cursor:pointer; white-space:nowrap; }
+.tabbar label:hover { color:var(--fg); background:var(--head); }
+.tabbar label .n { margin-left:5px; font-size:12px; color:var(--muted); font-weight:400; }
+.tabs.sub { margin-top:4px; } .tabs.sub > .tabbar { margin-bottom:12px; }
+.tabs.sub > .tabbar label { padding:5px 11px 4px; font-size:13px; }
+.tabs > .panel { display:none; }
+.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+@media print {
+  .tabbar { display:none; } .tabs > .panel { display:block !important; }
+  .sr { position:static; width:auto; height:auto; overflow:visible; clip:auto; white-space:normal; }
+}
 """
 
 
 _e = charts.escape
+
+
+@dataclass
+class Tab:
+    """One tab: its label (plain text), an optional count shown beside it, a heading for the panel (read
+    out by screen readers and printed; the label names it on screen), and the panel's HTML."""
+
+    label: str
+    html: str
+    heading: str = ""
+    count: int | None = None
+
+
+def _tabs(
+    group: str, tabs: Sequence[Tab], default: int = 0, *, sub: bool = False, level: int = 2
+) -> tuple[str, str]:
+    """(HTML, CSS) of tabs that switch without scripts: a hidden radio button per tab, the labels as the tab
+    bar, and CSS that shows the checked one's panel. Ids are made here (`group` is a plain name), never
+    from the ledger, so the CSS holds no ledger string. Printing shows every panel."""
+    ids = [f"{group}-{k}" for k in range(len(tabs))]
+    radios = "".join(
+        f'<input class="tab" type="radio" name="{group}" id="{i}"{" checked" if k == default else ""}>'
+        for k, i in enumerate(ids)
+    )
+    labels = "".join(
+        f'<label for="{i}"'
+        + (f' title="{_e(t.label)}"' if util.clip(t.label, TAB_COLS) != util.clean(t.label) else "")
+        + f">{_e(util.clip(t.label, TAB_COLS))}"
+        + (f'<span class="n">{t.count}</span>' if t.count is not None else "")
+        + "</label>"
+        for i, t in zip(ids, tabs, strict=True)
+    )
+    panels = "".join(
+        f'<div class="panel" id="{i}-panel"><h{level} class="sr">{_e(t.heading or t.label)}</h{level}>{t.html}</div>'
+        for i, t in zip(ids, tabs, strict=True)
+    )
+    css = "".join(
+        f"#{i}:checked ~ .tabbar label[for={i}] {{ color:var(--fg); border-bottom-color:var(--fit); font-weight:600; }}"
+        f"#{i}:checked ~ #{i}-panel {{ display:block; }}"
+        f"#{i}:focus-visible ~ .tabbar label[for={i}] {{ outline:2px solid var(--fit); outline-offset:-2px; }}"
+        for i in ids
+    )
+    html = (
+        f'<div class="tabs{" sub" if sub else ""}">{radios}<div class="tabbar">{labels}</div>{panels}</div>'
+    )
+    return html, css
 
 
 def _tags(tags: Iterable[str]) -> str:
@@ -203,29 +265,61 @@ class Effects:
     notes: list[str] = field(default_factory=list)
 
 
-def _effects(state: State, data: Effects) -> str:
-    """The section. Its parts (the leaderboard, then each protocol's runs) are drawn one by one: a part that
-    fails on odd numbers becomes a note, and the others are still drawn."""
+def _effects(state: State, data: Effects) -> tuple[str, str]:
+    """The Effects tab: one line on the model, then a tab per view (HTML, and the CSS of those tabs): the
+    ideas in each submission, what each idea adds, the breakdown, the scores over time, and each protocol's
+    local runs. Each view is drawn on its own: one that fails on odd numbers becomes a note, and the others
+    are still drawn."""
     fits = [f for f in (data.lb, *data.runs) if f is not None]
-    intro = (
-        "An additive model: score = baseline + what each idea in it adds + noise. A submission's ideas are "
-        "the verdicts on its notebook; ideas that always come and go together are measured together. "
-    )
+    intro = "An additive model: score = baseline + what each idea in it adds + noise. "
     if fits:
         intro += _direction(fits[0].higher_is_better) + " "
-    parts = [
-        f'<p class="muted">{intro}<code>pseudorca effects</code> prints the same model in the terminal.</p>'
-    ]
-    parts += [_note([note]) for note in data.notes]
-    if data.lb is not None:
-        parts.append(
-            _drawn("Leaderboard: this part", functools.partial(_lb_effects, state, data.lb, data.breakdown))
+    head = [f'<p class="muted">{intro}<code>pseudorca effects</code> prints the same in the terminal.</p>']
+    head += [_note([note]) for note in data.notes]
+    tabs: list[Tab] = []
+    lb = data.lb
+    if lb is not None and not lb.rows:
+        head.append(
+            '<p class="muted">No submissions yet (<code>pseudorca kaggle sync</code> or '
+            "<code>pseudorca sub add</code>).</p>"
         )
+    elif lb is not None:
+        board = f"Leaderboard: {lb.target}{_lower(lb)} ·"
+        tabs.append(
+            Tab(
+                "Ideas per submission",
+                _drawn("the table of submissions", functools.partial(_matrix, state, lb)),
+                f"{board} the ideas in each submission",
+            )
+        )
+        tabs.append(
+            Tab(
+                "What each idea adds",
+                _drawn("the effects", functools.partial(_terms, lb, "submissions")),
+                f"{board} what each idea adds",
+            )
+        )
+        if data.breakdown is not None:
+            broken = _drawn("the breakdown", functools.partial(_breakdown, lb, data.breakdown))
+            if broken:
+                tabs.append(Tab("Breakdown", broken, f"{board} the breakdown"))
+        chart = _drawn("the chart of the scores", functools.partial(charts.lb_chart, lb))
+        if chart:
+            caption = f'<p class="ct">{_e(lb.target.capitalize())} by submission, oldest first</p>'
+            tabs.append(Tab("Score chart", caption + chart, f"{board} the scores over time"))
     for fit in data.runs:
-        parts.append(
-            _drawn(f"Local runs ({_protocol(fit)}): this part", functools.partial(_run_effects, fit))
+        what = f"Local runs ({_protocol(fit)})"
+        tabs.append(
+            Tab(
+                f"Local runs · {fit.protocol or 'no protocol'}",
+                _drawn(f"{what}: this part", functools.partial(_run_effects, fit)),
+                f"{what}: {fit.target}{_lower(fit)}",
+            )
         )
-    return "".join(parts)
+    if not tabs:
+        return "".join(head), ""
+    html, css = _tabs("fx", tabs, sub=True, level=3)
+    return "".join(head) + html, css
 
 
 def _drawn(what: str, draw: Callable[[], str]) -> str:
@@ -253,22 +347,6 @@ def _lower(fit: Fit) -> str:
 
 def _protocol(fit: Fit) -> str:
     return f"protocol {fit.protocol}" if fit.protocol else "no protocol"
-
-
-def _lb_effects(state: State, fit: Fit, breakdown: Waterfall | None) -> str:
-    if not fit.rows:
-        return (
-            '<p class="muted">No submissions yet (<code>pseudorca kaggle sync</code> or '
-            "<code>pseudorca sub add</code>).</p>"
-        )
-    parts = [f"<h3>Leaderboard: {_e(fit.target + _lower(fit))}</h3>", _matrix(state, fit)]
-    chart = _drawn("the chart of the scores", functools.partial(charts.lb_chart, fit))
-    if chart:
-        parts.append(f'<p class="ct">{_e(fit.target.capitalize())} by submission, oldest first</p>{chart}')
-    parts.append(_terms(fit, "submissions"))
-    if breakdown is not None:
-        parts.append(_breakdown(fit, breakdown))
-    return "".join(parts)
 
 
 def _breakdown(fit: Fit, w: Waterfall) -> str:
@@ -314,8 +392,7 @@ def _run_effects(fit: Fit) -> str:
         lines.append("not used: " + "; ".join(left_out[:6]) + ("; …" if len(left_out) > 6 else ""))
     if any(r.why_not.startswith("no metric ") for r in fit.rows):
         lines.append("`pseudorca report --metric NAME` uses another metric of the results tables")
-    head = f"Local runs ({_protocol(fit)}): {fit.target}{_lower(fit)}"
-    return f"<h3>{_e(head)}</h3>{_note(lines)}{_terms(fit, 'runs')}"
+    return f"{_note(lines)}{_terms(fit, 'runs')}"  # the tab names the protocol
 
 
 def _terms(fit: Fit, what: str) -> str:
@@ -555,8 +632,8 @@ def render(
 ) -> str:
     """The whole report as an HTML string (the body of a page; it has its own <title> and <style>).
 
-    With `effects`, a section after the submissions shows which ideas each submission has and what each
-    idea adds to the score."""
+    The page is a row of tabs, one view each: what each idea added (with `effects`), the board, the
+    submissions, the notebooks, the ideas and the recent activity. They switch without scripts."""
     ideas = [i for i in state.ideas_in_order() if include_parked or i.status != "parked"]
     shown = notebooks if notebooks is not None else state.notebooks_in_order()[-8:]
     generated = generated or util.now_iso()
@@ -564,16 +641,26 @@ def render(
         f"{len(state.ideas)} ideas · {len(state.notebooks)} notebooks · {len(state.subs)} submissions · "
         f"{len(state.runs)} runs · generated {generated}"
     )
-    added = f"<h2>What each idea added</h2>{_effects(state, effects)}" if effects is not None else ""
+    tabs: list[Tab] = []
+    styles = [CSS, charts.CSS]
+    if effects is not None:
+        html, css = _effects(state, effects)
+        tabs.append(Tab("Effects", html, "What each idea added"))
+        styles.append(css)
+    tabs += [
+        Tab("Board", _board(state, ideas, shown), "Which ideas are in which notebook"),
+        Tab("Submissions", _submissions(state, lb_noise), "Submissions", count=len(state.subs)),
+        Tab("Notebooks", _lineage(state), "Notebooks", count=len(state.notebooks)),
+        Tab("Ideas", _ideas(ideas), "Ideas", count=len(ideas)),
+        Tab("Activity", _activity(state), "Recent activity"),
+    ]
+    has_effects = effects is not None and (bool(effects.lb and effects.lb.rows) or bool(effects.runs))
+    body, css = _tabs("tab", tabs, default=0 if has_effects or effects is None else 1)
+    styles.append(css)
     return (
         f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>{_e(store_name)} · Pseudorca</title><style>{CSS}{charts.CSS}</style></head><body>"
-        f"<h1>{_e(store_name)}</h1><div class='muted'>{_e(counts)}</div>"
-        f"<h2>Which ideas are in which notebook</h2>{_board(state, ideas, shown)}"
-        f"<h2>Notebooks</h2>{_lineage(state)}"
-        f"<h2>Submissions</h2>{_submissions(state, lb_noise)}{added}"
-        f"<h2>Ideas</h2>{_ideas(ideas)}"
-        f"<h2>Recent activity</h2>{_activity(state)}"
+        f"<title>{_e(store_name)} · Pseudorca</title><style>{''.join(styles)}</style></head><body>"
+        f"<h1>{_e(store_name)}</h1><div class='muted'>{_e(counts)}</div>{body}"
         f"<footer>Pseudorca {_e(__version__)}. This file contains your team's data: keep it private and do not "
         f"publish it (GitHub Pages sites are public even for private repositories).</footer></body></html>"
     )

@@ -11,7 +11,8 @@
   submissions that stray from the model more than resubmissions do. Defaults for the score's direction
   and a known noise can live in `[effects]` in `config.toml`.
 - `report` draws the same: a submissions × ideas matrix, a leaderboard chart, forest plots and a breakdown
-  (new options `--metric` and `--resamples`).
+  (new options `--metric` and `--resamples`). The page is now a row of tabs, one view each, that switch
+  without scripts; printing shows them all.
 - `audit --submitted` audits every notebook that has a submission, skipping (with a warning) those it
   cannot read, and counts LLM failures.
 - Terminal output replaces control characters and bidirectional overrides in ledger strings with `?`.

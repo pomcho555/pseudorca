@@ -69,7 +69,7 @@ def test_long_linear_lineage_is_flat_and_complete(store: Store):
         store.append("nb.add", {"id": sha, "name": f"v{i}.ipynb", "parent": parent})
         parent = sha
     page = render(store.state(), store_name="t")
-    lineage = page.split("<h2>Notebooks</h2>")[1].split("<h2>")[0]
+    lineage = page.split('<h2 class="sr">Notebooks</h2>')[1].split("<h2")[0]
     assert all(f"v{i}.ipynb" in lineage for i in range(80))
     assert "margin-left:18px" not in lineage  # a single chain never indents
 
@@ -112,7 +112,8 @@ def _report(store: Store, *args: str) -> str:
 
 
 def _section(page: str) -> str:
-    return page.split("<h2>What each idea added</h2>")[1].split("<h2>Ideas</h2>")[0]
+    """The Effects tab's panel (its views are tabs of their own, with h3 headings)."""
+    return page.split('<h2 class="sr">What each idea added</h2>')[1].split("<h2")[0]
 
 
 def _signed(x: float, dec: int) -> str:
@@ -199,7 +200,9 @@ def test_effects_section_has_matrix_charts_and_breakdown(store: Store):
     page = _report(store)
     section = _section(page)
     lb = effects.lb_fit(store.state())
-    assert page.index("<h2>Submissions</h2>") < page.index("<h2>What each idea added</h2>")
+    assert page.index('<h2 class="sr">What each idea added</h2>') < page.index(
+        '<h2 class="sr">Submissions</h2>'
+    )
     assert section.count("<svg") == 3  # the scores over time, the forest plot and the breakdown
     assert all('role="img" aria-label="' in svg for svg in section.split("<svg")[1:])
     assert "<script" not in page and "xmlns" not in page and "http" not in page.split("<footer>")[0]
@@ -355,7 +358,8 @@ def test_lower_is_better_comes_from_the_config(store: Store):
     assert (
         "From 1 to 3, idea by idea" in section and "3 fitted (best in the model)" in section
     )  # the lowest score
-    assert "lowers it (better)" in section and "adds</" not in section
+    legend = section.split("From 1 to 3, idea by idea")[1]  # the breakdown's legend, not the tab names
+    assert "lowers it (better)" in legend and "adds</" not in legend
 
 
 def test_a_bad_config_value_is_a_note_and_the_other_still_counts(store: Store):
@@ -626,7 +630,8 @@ def test_a_part_that_cannot_be_drawn_becomes_a_note(store: Store, monkeypatch: p
     assert section.count("<svg") == 3 and "Local runs (protocol p1): score" in section  # the rest is drawn
     monkeypatch.setattr(report, "_matrix", overflow)
     section = _section(_report(store))
-    assert "Leaderboard: this part cannot be drawn (OverflowError" in section and section.count("<svg") == 1
+    assert "the table of submissions cannot be drawn (OverflowError" in section
+    assert section.count("<svg") == 3  # only that view fails: the effects, the breakdown, the local runs
 
     def deep(*args: Any, **kwargs: Any) -> None:
         raise RecursionError("maximum recursion depth exceeded")
@@ -663,3 +668,63 @@ def test_a_difference_reads_as_one_in_its_tooltip(store: Store):
         assert f"<title>{html.escape(t.label)}\n" in forest
         assert f"a difference: what {left} adds minus what {right} adds" in forest
     assert "instead of" not in forest and "instead of" not in legend
+
+
+def test_the_page_is_tabs_that_switch_without_scripts(store: Store):
+    _effects_ledger(store, runs=True)
+    page = _report(store)
+    assert "<script" not in page.lower() and "javascript:" not in page.lower()
+    groups = {}
+    for name, ident, checked in re.findall(
+        r'<input class="tab" type="radio" name="([a-z]+)" id="([a-z]+-\d+)"( checked)?>', page
+    ):
+        groups.setdefault(name, []).append((ident, bool(checked)))
+    assert set(groups) == {"tab", "fx"}
+    for name, tabs in groups.items():
+        assert sum(checked for _, checked in tabs) == 1, name  # one view at a time
+        for ident, _ in tabs:  # each radio has its label in the bar, its panel, and CSS that shows the panel
+            assert f'<label for="{ident}">' in page and f'id="{ident}-panel"' in page
+            assert f"#{ident}:checked ~ #{ident}-panel {{ display:block; }}" in page
+    labels = re.findall(r'<label for="tab-\d+">([^<]+)', page)
+    assert labels == ["Effects", "Board", "Submissions", "Notebooks", "Ideas", "Activity"]
+    assert groups["tab"][0] == ("tab-0", True)  # the effects first, when there are some
+    views = re.findall(r'<label for="fx-\d+">([^<]+)', page)
+    assert views == [
+        "Ideas per submission",
+        "What each idea adds",
+        "Breakdown",
+        "Score chart",
+        "Local runs · p1",
+    ]
+    assert "@media print" in page and ".tabs > .panel { display:block !important; }" in page
+    css = page.split("<style>")[1].split("</style>")[0]
+    assert "retry" not in css and "p1" not in css  # the CSS holds only the ids it made, no ledger string
+    plain = render(store.state(), store_name="t")  # no effects computed: the board comes first
+    assert re.findall(r'<label for="tab-\d+">([^<]+)', plain)[0] == "Board" and 'id="tab-0" checked' in plain
+
+
+def test_hostile_tab_labels_are_escaped(store: Store):
+    _effects_ledger(store, runs=True)
+    run = next(iter(store.state().runs.values()))
+    store.append(
+        "run.add",
+        {
+            **{k: getattr(run, k) for k in ("results", "format", "nb", "label")},
+            "id": util.new_ulid(),
+            "protocol": "<b>x</b>\x1b[2J",
+        },
+    )
+    page = _report(store)
+    assert "Local runs · &lt;b&gt;x&lt;/b&gt;?[2J" in page and "<b>x</b>" not in page
+
+
+def test_a_long_tab_label_is_cut_with_a_tooltip(store: Store):
+    _effects_ledger(store, runs=True)
+    run = next(iter(store.state().runs.values()))
+    long = "a-protocol-whose-name-goes-on-and-on-for-a-long-while"
+    fields = {k: getattr(run, k) for k in ("results", "format", "nb", "label")}
+    store.append("run.add", {**fields, "id": util.new_ulid(), "protocol": long})
+    page = _report(store)
+    label = re.search(r'<label for="fx-\d+" title="([^"]+)">([^<]+)</label>', page)
+    assert label is not None and label.group(1) == f"Local runs · {long}"
+    assert label.group(2).endswith("…") and len(label.group(2)) <= 40
