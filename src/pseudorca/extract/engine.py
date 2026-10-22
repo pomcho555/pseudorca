@@ -20,7 +20,7 @@ from pseudorca.extract.payloads import (
     pattern_candidates,
 )
 from pseudorca.extract.writes import Write, find_env, find_writes, parse_python
-from pseudorca.tree import Tree, safe_path
+from pseudorca.tree import Tree, decode_text, safe_path
 
 if TYPE_CHECKING:
     from pseudorca.extract import Limits
@@ -218,34 +218,38 @@ class Extractor:
         """Payloads in non-Python text (shell, other cell magics, written data files)."""
         self._payloads(pattern_candidates(text, self.limits.min_payload_chars, bare_runs=True), src, offset)
 
-    def _scan_nested(self, text: str, src: _Source, *, offset: int = 0) -> None:
-        """Python that was decoded or written by the notebook, scanned again up to max_nesting levels."""
+    def _scan_nested(self, text: str, src: _Source, *, offset: int = 0, python: bool = True) -> None:
+        """Text that was decoded or written by the notebook, scanned again up to max_nesting levels: as
+        Python, or (a written file that is not .py) by pattern."""
         if src.level > self.limits.max_nesting:
             self.warn(
                 f"{src.origin}: not searched for nested payloads (max_nesting {self.limits.max_nesting})"
             )
             return
-        self._scan_python(text, src, offset=offset)
+        if python:
+            self._scan_python(text, src, offset=offset)
+        else:
+            self._scan_text(text, src, offset=offset)
 
     def _write(self, w: Write, src: _Source) -> None:
+        """A literal write becomes files/<path>; what it writes is searched like a %%writefile body (bytes
+        too, when they are text)."""
         target = "files/" + safe_path(w.path)
         origin = f"{src.origin} > {w.via} {label(w.path)}"
         existing = self.tree.files.get(target)
         base = existing if w.append and existing is not None and not existing.binary else None
+        full_origin = origin if base is None else f"{base.origin}; {origin}"
         if isinstance(w.content, bytes):
             data = w.content if base is None else base.text.encode("utf-8", "replace") + w.content
-            self.tree.add_bytes(
-                target, data, origin if base is None else f"{base.origin}; {origin}", replace=True
-            )
-            return
-        if base is None:
-            self.tree.add_text(target, w.content, origin, replace=True)
-            offset = 0
+            self.tree.add_bytes(target, data, full_origin, replace=True)
+            text = decode_text(w.content)
+            if text is None:  # binary: nothing to search
+                return
         else:
-            self.tree.add_text(target, base.text + w.content, f"{base.origin}; {origin}", replace=True)
-            offset = _lines_before(base.text, w.content)
-        if target.endswith(".py"):
-            self._scan_nested(w.content, src.nested(origin), offset=offset)
+            text = w.content
+            self.tree.add_text(target, text if base is None else base.text + text, full_origin, replace=True)
+        offset = 0 if base is None else _lines_before(base.text, text)
+        self._scan_nested(text, src.nested(origin), offset=offset, python=target.endswith(".py"))
 
     def _payloads(self, candidates: list[Candidate], src: _Source, offset: int) -> None:
         consumed: set[int] = set()

@@ -10,7 +10,9 @@
 
 A leading "!" always negates, so a literal "!" at the start needs a regex (`re:!pip`). Only evidence paths
 are searched: markdown is a claim, not evidence, and binary files have no text. Each piece of evidence
-records the column where the match starts in its quote, so displays can show that part of a long line.
+quotes the lines its match touches, without their outer whitespace (cut around the match when long). Its
+line is the quote's first line, and its column is where the match starts in the quote, so displays can
+show that part of a long line.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from dataclasses import dataclass
 from pseudorca.audit.types import Evidence, Finding
 from pseudorca.tree import Tree, normalize_line, split_lines
 
+MATCHER_VERSION = 2  # bump when matching changes, so that recorded fingerprint verdicts are redone
 MAX_EVIDENCE = 5
 QUOTE_CHARS = 300
 _LINE_BREAK = re.compile(r"\r\n|\r|\n")
@@ -117,7 +120,8 @@ def _find(spec: Spec, tree: Tree, paths: list[str]) -> list[Evidence]:
         out = []
         for h in tree.grep(spec.pattern, regex=spec.regex, paths=paths, max_hits=MAX_EVIDENCE):
             m = rx.search(h.text)
-            out.append(Evidence(h.path, h.line, *_quote(h.text, m.start() if m else 0)))
+            quote, col, _ = _quote(h.text, m.start() if m else 0)
+            out.append(Evidence(h.path, h.line, quote, col))
         return out
     if spec.regex:
         return _regex_hits(re.compile(spec.pattern, re.MULTILINE), tree, paths)
@@ -125,7 +129,8 @@ def _find(spec: Spec, tree: Tree, paths: list[str]) -> list[Evidence]:
 
 
 def _regex_hits(rx: re.Pattern[str], tree: Tree, paths: list[str]) -> list[Evidence]:
-    """Matches of a regex over each whole file; the quote is the lines the match touches."""
+    """Matches of a regex over each whole file; the quote is the lines the match touches, and the line the
+    quote's first one (a match may start on a blank line, or with the line break before its text)."""
     out: list[Evidence] = []
     for p in paths:
         text = _LINE_BREAK.sub("\n", tree.text(p))  # line numbers as tree.split_lines counts them
@@ -133,8 +138,9 @@ def _regex_hits(rx: re.Pattern[str], tree: Tree, paths: list[str]) -> list[Evide
             begin = text.rfind("\n", 0, m.start()) + 1
             end = m.end() - 1 if m.end() > m.start() and text[m.end() - 1] == "\n" else m.end()
             stop = text.find("\n", max(end, m.start()))
-            quote, col = _quote(text[begin : len(text) if stop < 0 else stop], m.start() - begin)
-            out.append(Evidence(p, text.count("\n", 0, m.start()) + 1, quote, col))
+            quote, col, offset = _quote(text[begin : len(text) if stop < 0 else stop], m.start() - begin)
+            first = begin + offset if quote else m.start()  # where the quote starts in the file
+            out.append(Evidence(p, text.count("\n", 0, first) + 1, quote, col))
             if len(out) >= MAX_EVIDENCE:
                 return out
     return out
@@ -152,8 +158,9 @@ def _snippet_hits(pattern: str, tree: Tree, paths: list[str]) -> list[Evidence]:
             j += 1
         first = normalize_line(lines[line - 1])
         start = first.find(want[0]) if len(want) == 1 else len(first) - len(want[0])
-        quote, col = _quote("\n".join(lines[line - 1 : j]), _raw_index(lines[line - 1], start))
-        out.append(Evidence(path, line, quote, col))
+        text = "\n".join(lines[line - 1 : j])
+        quote, col, offset = _quote(text, _raw_index(lines[line - 1], start))
+        out.append(Evidence(path, line + text.count("\n", 0, offset), quote, col))
     return out
 
 
@@ -184,14 +191,16 @@ def _evidence(specs: list[Spec], hits: dict[str, list[Evidence]]) -> list[Eviden
     return out
 
 
-def _quote(text: str, start: int) -> tuple[str, int]:
-    """(quote, col): `text` without its outer whitespace, cut to QUOTE_CHARS around position `start` when
-    longer, and where `start` is in that quote."""
+def _quote(text: str, start: int) -> tuple[str, int, int]:
+    """(quote, col, offset): `text` without its outer whitespace, cut to QUOTE_CHARS around position `start`
+    when longer; where `start` is in that quote; and where the quote starts in `text`."""
+    lead = len(text) - len(text.lstrip())
     body = text.strip()
-    col = min(max(0, start - (len(text) - len(text.lstrip()))), len(body))
+    col = min(max(0, start - lead), len(body))
     if len(body) <= QUOTE_CHARS:
-        return body, col
+        return body, col, lead
     begin = min(max(0, col - QUOTE_CHARS // 3), len(body) - QUOTE_CHARS)
     window = body[begin : begin + QUOTE_CHARS]
     quote = window.strip()
-    return quote, min(max(0, col - begin - (len(window) - len(window.lstrip()))), len(quote))
+    skip = len(window) - len(window.lstrip())
+    return quote, min(max(0, col - begin - skip), len(quote)), lead + begin + skip

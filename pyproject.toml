@@ -47,7 +47,7 @@ dev = ["pytest>=8", "ruff>=0.6", "ipython>=8"]
 packages = ["src/pseudorca"]
 
 [tool.hatch.build.targets.sdist]
-# an explicit list, so untracked files in a working copy (.env, a demo folder) never ship
+# an explicit list, so stray top-level files (.env, a demo folder) never ship; build releases from a clean checkout
 only-include = [
   "src", "tests", "examples", "pyproject.toml", "uv.lock", "LICENSE", "README.md", "README.ja.md",
   "CHANGELOG.md", "DESIGN.md", "SECURITY.md", "CONTRIBUTING.md",

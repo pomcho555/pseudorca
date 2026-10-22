@@ -64,6 +64,7 @@ class Notebook:
     note: str = ""
     stored: bool = True  # the bytes are in blobs/
     size: int = 0
+    aliases: list[str] = field(default_factory=list)  # other names it was registered under (derived)
     added: str = ""
     added_by: str = ""
     seq: int = 0  # registration order; "latest" is the highest
@@ -245,6 +246,14 @@ def _checked(data: dict[str, Any], warn: Any) -> dict[str, Any]:
     return out
 
 
+def record_version(record: VerdictRecord) -> tuple[int, ...]:
+    """How new the code that made a machine verdict was: (extractor_version, matcher_version) for
+    fingerprint and patch, (prompt_version,) for the LLM. Missing versions count as 0."""
+    if record.method == "llm":
+        return (_version(record, "prompt_version"),)
+    return (_version(record, "extractor_version"), _version(record, "matcher_version"))
+
+
 def _version(record: VerdictRecord, key: str) -> int:
     try:
         return int(record.detail.get(key) or 0)
@@ -348,13 +357,17 @@ class State:
             )
             _set_fields(nb, d, NOTEBOOK_FIELDS)
             return
-        # registered again (two clones before a pull): merge, never wipe what the first add recorded
+        # registered again (two clones before a pull, or more metadata added later): merge, never wipe
         for key in ("tags", "applies"):
             extra = [v for v in d.get(key) or [] if v not in getattr(nb, key)]
             setattr(nb, key, [*getattr(nb, key), *extra])
         for key in ("name", "path", "kernel", "version", "note", "parent"):
             if not getattr(nb, key) and d.get(key):
                 setattr(nb, key, d[key])
+        if d.get("name") and d["name"] != nb.name and d["name"] not in nb.aliases:
+            nb.aliases.append(d["name"])  # still resolves by that name
+        if d.get("note") and nb.note != d["note"] and d["note"] not in nb.note.split(" / "):
+            nb.note = f"{nb.note} / {d['note']}"
         nb.stored = bool(nb.stored or d.get("stored"))
         nb.size = nb.size or int(d.get("size") or 0)
 
@@ -429,7 +442,11 @@ class State:
             if not candidates:
                 raise LookupError(f"no notebook has the tag {tag!r}")
             return candidates[-1]
-        named = [n for n in ordered if n.name == ref] or [n for n in ordered if n.kernel and n.kernel == ref]
+        named = (
+            [n for n in ordered if n.name == ref]
+            or [n for n in ordered if ref in n.aliases]
+            or [n for n in ordered if n.kernel and n.kernel == ref]
+        )
         if named:
             return named[-1]  # a reused name means its newest notebook
         if len(ref) >= 6 and util.HEX_RE.match(ref.lower()):
@@ -454,18 +471,17 @@ class State:
     # ----- verdicts --------------------------------------------------------------------------------
 
     def current_records(self, nb_id: str, idea_id: str) -> dict[str, VerdictRecord]:
-        """Per machine method, the record that counts for the idea's current rev: the one made with the
-        newest extractor (deterministic) or prompt (llm) version, latest first among equals. So a teammate
-        on an older Pseudorca cannot override a newer one's verdict."""
+        """Per machine method, the record that counts for the idea's current rev: the one made by the newest
+        code (`record_version`), latest first among equals. So a teammate on an older Pseudorca cannot
+        override a newer one's verdict."""
         idea = self.ideas.get(idea_id)
         rev = idea.rev if idea else ""
         best: dict[str, VerdictRecord] = {}
         for r in self.verdicts.get((nb_id, idea_id), []):
             if r.method == "human" or r.idea_rev != rev:
                 continue
-            key = "prompt_version" if r.method == "llm" else "extractor_version"
             cur = best.get(r.method)
-            if cur is None or _version(r, key) >= _version(cur, key):
+            if cur is None or record_version(r) >= record_version(cur):
                 best[r.method] = r
         return best
 

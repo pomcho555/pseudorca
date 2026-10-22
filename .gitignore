@@ -11,8 +11,8 @@ htmlcov/
 .DS_Store
 # A store created while trying the tool holds notebooks and results: never commit one here.
 .pseudorca/
-# secrets and the README tour's demo folder
+# secrets and the README tour's demo folders, wherever they are created
 .env
 .env.*
-/demo/
-/pseudorca-demo/
+demo/
+pseudorca-demo/

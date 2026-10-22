@@ -2,16 +2,19 @@
 
 Everything the LLM sees comes from the redacted view of the tree (`redact.redact_tree`), and every quote it
 gives is looked up in that same view: a quote that is not found in the file it cites, or that cites a
-markdown cell, is dropped. A present or partial verdict left without a quote becomes unknown.
+markdown cell, is dropped. A present or partial verdict left without a quote becomes unknown. Only the first
+MAX_EVIDENCE quotes are checked, each in time linear in the file it cites.
 """
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import json
 import os
 import re
 import textwrap
+import weakref
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -23,7 +26,7 @@ from pseudorca.llm.backends import Backend, LoopResult, ToolsUnsupported, make_b
 from pseudorca.llm.redact import redact, redact_tree, redact_value
 from pseudorca.llm.tools import TOOL_SPECS, ToolHandler, find_path
 from pseudorca.model import VERDICT_STATUSES
-from pseudorca.tree import CONTEXT_ONLY_PREFIXES, Hit, Tree, safe_path
+from pseudorca.tree import CONTEXT_ONLY_PREFIXES, Hit, Tree, normalize_line, safe_path, split_lines
 
 if TYPE_CHECKING:
     from pseudorca.model import Idea
@@ -406,18 +409,22 @@ def make_finding(loop: LoopResult, view: Tree, settings: LLMSettings, *, looked:
 
 
 def verify_evidence(items: Any, view: Tree) -> tuple[list[Evidence], int]:
-    """The quotes found in the (non-markdown) file they cite, with corrected lines, and how many were dropped."""
+    """The quotes found in the (non-markdown) file they cite, with corrected lines, and how many were dropped.
+
+    Only the first MAX_EVIDENCE items are checked (the prompt asks for one to five); later ones are ignored,
+    so a model cannot make verification slow by sending thousands of quotes.
+    """
     verified: list[Evidence] = []
     seen: set[tuple[str, int | None]] = set()
     dropped = 0
-    for item in items if isinstance(items, list) else []:
+    for item in items[:MAX_EVIDENCE] if isinstance(items, list) else []:
         ev = _verify_one(item, view)
         if ev is None:
             dropped += 1
         elif (ev.path, ev.line) not in seen:
             seen.add((ev.path, ev.line))
             verified.append(ev)
-    return verified[:MAX_EVIDENCE], dropped
+    return verified, dropped
 
 
 def _verify_one(item: Any, view: Tree) -> Evidence | None:
@@ -432,13 +439,80 @@ def _verify_one(item: Any, view: Tree) -> Evidence | None:
     quote = clean_quote(quote[:QUOTE_CHARS], path)
     if len("".join(quote.split())) < MIN_QUOTE_CHARS:
         return None
-    found = view.find_snippet(quote, [path])
-    if not found:
-        return None
-    claimed = _as_int(item.get("line"))
-    lines = [line for _, line in found]
-    line = lines[0] if claimed is None else min(lines, key=lambda n: abs(n - claimed))
-    return Evidence(path, line, quote)
+    line = _quote_index(view, path).find(quote, _as_int(item.get("line")))
+    return None if line is None else Evidence(path, line, quote)
+
+
+class QuoteIndex:
+    """One file's non-blank lines with whitespace collapsed, joined by \\n, for finding quotes in linear time.
+
+    A quote matches as in `Tree.find_snippet` with partial ends: whitespace differences and blank lines are
+    ignored, the quote's first line may be the end of a line and its last line the start of one, and a
+    one-line quote may be anywhere in a line. In the joined text that is exactly an occurrence of the
+    quote's own lines, collapsed and joined the same way. So instead of comparing the quote with the lines
+    after every line, one `str.find` looks for it: CPython's two-way search keeps that linear, also for a
+    file of repeated lines and a quote that differs from them only at its end.
+    """
+
+    def __init__(self, text: str) -> None:
+        self.numbers: list[int] = []  # the file's line number of each non-blank line
+        lines: list[str] = []
+        for number, line in enumerate(split_lines(text), 1):
+            collapsed = normalize_line(line)
+            if collapsed:
+                self.numbers.append(number)
+                lines.append(collapsed)
+        self.text = "\n".join(lines)
+        self.starts = list(itertools.accumulate((len(s) + 1 for s in lines[:-1]), initial=0)) if lines else []
+        self._backwards: str | None = None  # self.text reversed, made when first needed
+
+    def find(self, quote: str, near: int | None = None) -> int | None:
+        """The line where `quote` starts, or None if it is not in the file.
+
+        With several matches: the first one, or the one nearest to line `near` (the earlier of two at the
+        same distance), found with one search forwards and one backwards from `near`.
+        """
+        needle = "\n".join(c for c in (normalize_line(line) for line in split_lines(quote)) if c)
+        if not needle:
+            return None
+        if near is None:
+            return self._line(self.text.find(needle))
+        k = bisect.bisect_left(self.numbers, near)  # non-blank lines from k on are at or after `near`
+        cut = self.starts[k] if k < len(self.starts) else len(self.text) + 1
+        after = self._line(self.text.find(needle, cut)) if k < len(self.starts) else None
+        before = self._line(self._find_before(needle, cut))
+        found = [n for n in (before, after) if n is not None]
+        return min(found, key=lambda n: abs(n - near)) if found else None
+
+    def _line(self, at: int) -> int | None:
+        return None if at < 0 else self.numbers[bisect.bisect_right(self.starts, at) - 1]
+
+    def _find_before(self, needle: str, end: int) -> int:
+        """Where the last occurrence of `needle` that starts before `end` starts, or -1.
+
+        str.rfind can take time quadratic in the needle, so the reversed needle is searched for, forwards,
+        in the reversed text.
+        """
+        if self._backwards is None:
+            self._backwards = self.text[::-1]
+        size, length = len(self.text), len(needle)
+        found = self._backwards.find(needle[::-1], max(0, size - end - length + 1))
+        return -1 if found < 0 else size - found - length
+
+
+_QUOTE_INDEXES: weakref.WeakKeyDictionary[Tree, dict[str, tuple[str, QuoteIndex]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _quote_index(view: Tree, path: str) -> QuoteIndex:
+    """The QuoteIndex of one file of `view`, kept while the view lives and the file is unchanged."""
+    f = view.files[path]
+    indexes = _QUOTE_INDEXES.setdefault(view, {})
+    cached = indexes.get(path)
+    if cached is None or cached[0] != f.sha256:
+        cached = indexes[path] = (f.sha256, QuoteIndex(f.text))
+    return cached[1]
 
 
 def _as_int(value: Any) -> int | None:

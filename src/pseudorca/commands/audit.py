@@ -6,12 +6,13 @@ import json
 import os
 import re
 import shlex
+import sys
 import traceback
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TextIO
 
 import click
 
@@ -43,7 +44,6 @@ SECTIONS = ("MISSING", "UNKNOWN", "FORBIDDEN PRESENT", "CLAIMED BUT NOT FOUND", 
 SECTION_KEYS = {title: title.lower().replace(" ", "_") for title in SECTIONS}  # in --json
 EVIDENCE_WIDTH = 60  # display columns of the EVIDENCE/NOTE cell (util.format_table's default)
 CHECK_FAILED, CHECK_ERROR = 1, 2  # check's exit codes besides 0
-NOTEBOOK_SUFFIXES = (".ipynb", ".py")
 _EVIDENCE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d*):(?P<quote>.*)$", re.DOTALL)
 
 
@@ -232,13 +232,15 @@ def _select(st: State, idea_refs: tuple[str, ...], statuses: tuple[str, ...]) ->
     return ideas if idea_refs else [i for i in ideas if i.status != "parked"]
 
 
-def _audit_target(st: State, nb_ref: str) -> Notebook:
-    """The notebook NB_REF names. When NB_REF is also a notebook file, that file's version is audited if it
+def _audit_target(st: State, nb_ref: str | None) -> Notebook:
+    """The notebook NB_REF names (default: the latest registered one). When NB_REF is also an existing file,
+    whatever its suffix (as in `check`: `solver-v1.5` may name a file), that file's version is audited if it
     is registered (under any name); a file that is not is pointed out, never silently replaced by the
     registered notebook of the same name."""
+    if nb_ref is None:
+        return st.resolve_nb("latest")
     path = Path(nb_ref)
-    looks_like_file = path.suffix.lower() in NOTEBOOK_SUFFIXES or "/" in nb_ref or os.sep in nb_ref
-    if not (looks_like_file and path.is_file()):
+    if not path.is_file():
         return st.resolve_nb(nb_ref)
     sha = util.sha256_file(path)
     if sha in st.notebooks:
@@ -254,7 +256,7 @@ def _audit_target(st: State, nb_ref: str) -> Notebook:
 
 
 @click.command("audit")
-@click.argument("nb_ref", required=False, default="latest")
+@click.argument("nb_ref", required=False)
 @click.option("--idea", "idea_refs", multiple=True, metavar="ID", help="Audit only this idea (repeatable).")
 @click.option(
     "--status",
@@ -270,7 +272,7 @@ def _audit_target(st: State, nb_ref: str) -> Notebook:
 @pass_ctx
 def audit_cmd(
     c: Ctx,
-    nb_ref: str,
+    nb_ref: str | None,
     idea_refs: tuple[str, ...],
     statuses: tuple[str, ...],
     llm_mode: str | None,
@@ -284,10 +286,10 @@ def audit_cmd(
 ) -> None:
     """Check which ideas are in a notebook (default: the latest registered one).
 
-    NB_REF is a notebook reference, or a notebook file whose version is registered. Fingerprints and
-    patches are checked first, without running anything; the LLM is asked only when they are inconclusive
-    (see --llm). Each new verdict is recorded as an event, and methods already recorded for the same idea
-    revision are skipped.
+    NB_REF is a notebook reference, or a notebook file whose version is registered (an existing file is
+    always read as a file). Fingerprints and patches are checked first, without running anything; the LLM is
+    asked only when they are inconclusive (see --llm). Each new verdict is recorded as an event, and methods
+    already recorded for the same idea revision are skipped.
     """
     store = c.store()
     show_warnings(store)
@@ -419,9 +421,12 @@ def check_cmd(c: Ctx, **options: Any) -> None:
       2  the check could not run: any error, including a usage error
     """
     try:
-        _check(c, **options)
-    except (click.exceptions.Exit, BrokenPipeError):  # passed (0) or failed (1); `| head` is not an error
+        _check(c, **options)  # a pipe closed early while the outcome is printed keeps that outcome
+    except click.exceptions.Exit:  # passed (0) or failed (1)
         raise
+    except BrokenPipeError:  # stderr closed before the outcome was known: the check did not run to its end
+        _drop_output(sys.stdout, sys.stderr)
+        raise click.exceptions.Exit(CHECK_ERROR) from None
     except click.ClickException as e:  # one-line errors, usage errors included
         e.exit_code = CHECK_ERROR
         raise
@@ -506,53 +511,80 @@ def _check(
     if strict and sections["UNKNOWN"]:
         problems.append(f"{len(sections['UNKNOWN'])} unknown (--strict)")
     listed = [iid for title in SECTIONS for iid in sections[title]]
+    code = CHECK_FAILED if problems else 0  # decided before anything is printed: a cut pipe cannot change it
 
-    if as_json:
-        shown = list(dict.fromkeys([*by_id, *listed]))
-        _echo_json(
-            {
-                "notebook": asdict(nb),
-                "registration": how,  # newly or already registered, a dry run, or "" for a reference
-                "dry_run": dry_run,
-                "strict": strict,
-                "passed": not problems,
-                "problems": problems,
-                "expected": expected,
-                "forbidden": forbidden,
-                "sections": {SECTION_KEYS[title]: sections[title] for title in SECTIONS},
-                "ideas": [_idea_json(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in shown],
-                "messages": list(rows.messages),
-            }
-        )
-        if problems:
-            click.get_current_context().exit(CHECK_FAILED)
-        return
+    try:
+        if as_json:
+            shown = list(dict.fromkeys([*by_id, *listed]))
+            _echo_json(
+                {
+                    "notebook": asdict(nb),
+                    "registration": how,  # newly or already registered, a dry run, or "" for a reference
+                    "dry_run": dry_run,
+                    "strict": strict,
+                    "passed": not problems,
+                    "problems": problems,
+                    "expected": expected,
+                    "forbidden": forbidden,
+                    "sections": {SECTION_KEYS[title]: sections[title] for title in SECTIONS},
+                    "ideas": [_idea_json(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in shown],
+                    "messages": list(rows.messages),
+                }
+            )
+        else:
+            table = util.format_table(
+                HEADERS, [_cells(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in listed]
+            ).splitlines()[2:]
+            click.echo(f"check of {nb.label} ({util.short(nb.id)})" + (f", {how}" if how else ""))
+            _show_sections(sections, table)
+            click.echo(_check_outcome(problems, expected, expect_status, sections))
+    except BrokenPipeError:  # stdout closed early (`| head`): the outcome stands
+        _drop_output(sys.stdout)
+    if code:
+        click.get_current_context().exit(code)
 
-    lines = util.format_table(
-        HEADERS, [_cells(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in listed]
-    ).splitlines()[2:]
-    click.echo(f"check of {nb.label} ({util.short(nb.id)})" + (f", {how}" if how else ""))
-    k = 0
+
+def _show_sections(sections: dict[str, list[str]], table: list[str]) -> None:
+    """Each non-empty section with its rows of `table` (one row per idea, in section order)."""
+    lines = iter(table)
     for title in SECTIONS:
         if sections[title]:
             click.echo()
             click.echo(f"{title} ({len(sections[title])})")
             for _ in sections[title]:
-                click.echo("  " + lines[k])
-                k += 1
+                click.echo("  " + next(lines))
     click.echo()
+
+
+def _check_outcome(
+    problems: list[str], expected: list[str], expect_status: list[str], sections: dict[str, list[str]]
+) -> str:
+    """The last line of a check: why it failed, or that it passed (and what that pass rests on)."""
     if problems:
-        click.echo("check failed: " + ", ".join(problems))
-        click.get_current_context().exit(CHECK_FAILED)
+        return "check failed: " + ", ".join(problems)
     if not expected:
         why = "[audit] expect_status is empty"
         if expect_status:
             why = f"no idea has status {' or '.join(expect_status)}"
-        click.echo(f"check passed (nothing is expected: {why}; pass --expect ID to expect one)")
-    elif sections["UNKNOWN"]:
-        click.echo(f"check passed ({len(sections['UNKNOWN'])} expected unknown; --strict fails on them)")
-    else:
-        click.echo("check passed")
+        return f"check passed (nothing is expected: {why}; pass --expect ID to expect one)"
+    if sections["UNKNOWN"]:
+        return f"check passed ({len(sections['UNKNOWN'])} expected unknown; --strict fails on them)"
+    return "check passed"
+
+
+def _drop_output(*streams: TextIO) -> None:
+    """Point these streams' file descriptors at os.devnull once a reader closed the pipe early (`| head`),
+    so that nothing more fails on it, not even the flush at exit (which would make the exit code 120)."""
+    for stream in streams:
+        try:
+            fd = stream.fileno()
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, fd)
+            finally:
+                os.close(devnull)
+        except (OSError, ValueError):  # no file descriptor (a test runner's buffer): nothing to flush there
+            pass
 
 
 # ----- verdict -------------------------------------------------------------------------------------

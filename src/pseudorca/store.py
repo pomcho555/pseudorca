@@ -37,7 +37,7 @@ CONFIG_TEMPLATE = """\
 # Pseudorca store settings. Commit this file; never put secrets in it.
 
 [store]
-name = {name}
+{name_line}
 # Kaggle competition slug used by `pseudorca kaggle sync`.
 competition = {competition}
 
@@ -107,6 +107,7 @@ class Store:
         self.actor_override: str | None = None
         self.load_warnings: list[str] = []
         self.created: list[str] = []  # what `init` created (relative to the store root)
+        self.shown_warnings: set[str] = set()  # warnings this process already printed
         self._events: list[Event] | None = None
         self._state: State | None = None
         self._config: dict[str, Any] | None = None
@@ -153,7 +154,11 @@ class Store:
             ".gitignore": "cache/\n",
             ".gitattributes": "# blobs are stored byte for byte; their file names are their sha256\nblobs/** -text -diff\n",
             "config.toml": CONFIG_TEMPLATE.format(
-                name=json.dumps(name or root.parent.name, ensure_ascii=False),
+                name_line=(
+                    f"name = {json.dumps(name, ensure_ascii=False)}"
+                    if name
+                    else '# name = "..."   # default: the repository folder\'s name'
+                ),
                 competition=json.dumps(competition, ensure_ascii=False),
             ),
         }
@@ -308,10 +313,18 @@ class Store:
     def has_blob(self, sha: str) -> bool:
         return util.is_sha256(sha) and self.blob_path(sha).is_file()
 
+    def blob_ok(self, sha: str) -> bool:
+        """The blob exists and its bytes match its name."""
+        p = self.blob_path(sha) if util.is_sha256(sha) else None
+        try:
+            return p is not None and p.is_file() and util.sha256_file(p) == sha
+        except OSError:
+            return False
+
     def put_blob(self, data: bytes) -> str:
         sha = util.sha256_bytes(data)
         p = self.blob_path(sha)
-        if not p.exists():
+        if not self.blob_ok(sha):  # missing, or damaged (LFS pointer, line-ending conversion): (re)write it
             tmp = p.with_name(p.name + ".tmp")
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -337,11 +350,28 @@ class Store:
             raise StoreError(
                 f"blob {sha[:12]} does not match its sha256: it is probably a Git LFS pointer (run `git lfs pull`) "
                 "or was changed by a line-ending conversion (.pseudorca/.gitattributes should contain "
-                "`blobs/** -text -diff`; run `pseudorca init` to add it)"
+                "`blobs/** -text -diff`; run `pseudorca init` to add it); adding the original file again "
+                "(`pseudorca nb add FILE`) restores it"
             )
         return data
 
     def cache_dir(self, *parts: str) -> Path:
-        p = self.root.joinpath("cache", *parts)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        """A local cache folder. Refuses symlinks and anything that would leave .pseudorca/cache: the cache
+        may have arrived with a repository, and code later writes and deletes files inside it."""
+        base = self.root / "cache"
+        cur = base
+        if cur.is_symlink():
+            raise StoreError(f"{cur} is a symlink; delete it (the cache is local and is rebuilt)")
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part or "\\" in part:
+                raise StoreError(f"invalid cache path part {part!r}")
+            cur = cur / part
+            if cur.is_symlink():
+                raise StoreError(f"{cur} is a symlink; delete it (the cache is local and is rebuilt)")
+        try:
+            cur.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise StoreError(f"cannot create {cur}: {e.strerror or e}") from e
+        if not cur.resolve().is_relative_to(base.resolve()):
+            raise StoreError(f"{cur} resolves outside {base}")
+        return cur

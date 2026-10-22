@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import random
 import string
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,13 +16,18 @@ from pseudorca.llm import PROMPT_VERSION, LLMError, LLMSettings, judge_idea
 from pseudorca.llm.backends import STEP_LIMIT, FakeBackend
 from pseudorca.llm.judge import (
     DESCRIPTION_CHARS,
+    MAX_EVIDENCE,
+    MIN_QUOTE_CHARS,
     PATCH_CHARS,
+    QUOTE_CHARS,
     SYSTEM_SINGLE,
     SYSTEM_TOOLS,
     build_user_message,
+    clean_quote,
     gather_snippets,
     patch_paths,
     transcript_name,
+    verify_evidence,
 )
 from pseudorca.llm.redact import REDACTED, redact_tree
 from pseudorca.model import Idea
@@ -176,6 +182,86 @@ def test_evidence_is_capped_at_ten_quotes():
     assert len(f.evidence) == 10 and f.detail["dropped_quotes"] == 0
 
 
+def test_only_the_first_ten_quotes_are_checked():
+    made_up = [{"path": "cells/cell_000.py", "quote": f"temperature=0.{i}9,"} for i in range(MAX_EVIDENCE)]
+    real = {"path": "cells/cell_000.py", "quote": "temperature=0.2,"}
+    f = run(FakeBackend([("grep", {"text": "temperature"})], {**PRESENT, "evidence": [*made_up, real]}))
+    assert f.status == "unknown" and f.evidence == [] and f.detail["dropped_quotes"] == MAX_EVIDENCE
+
+
+def _expected_line(view: Tree, path: str, quote: str, claimed: int | None) -> int | None:
+    """The line verification gave when it searched with Tree.find_snippet and kept the nearest match."""
+    quote = clean_quote(quote[:QUOTE_CHARS], path)
+    if len("".join(quote.split())) < MIN_QUOTE_CHARS:
+        return None
+    lines = [line for _, line in view.find_snippet(quote, [path])]
+    if not lines:
+        return None
+    return lines[0] if claimed is None else min(lines, key=lambda n: abs(n - claimed))
+
+
+def test_quotes_are_found_where_find_snippet_finds_them():
+    """Short, repetitive lines give one-line and multi-line quotes, several matches and ties around `line`."""
+    rng = random.Random(16)
+    pieces = ["abab", "baba", "ab ab", "abab abab", "aab", "ba", "x = 1;", "", "  "]
+    for _ in range(4000):
+        eol = rng.choice(["\n", "\r\n", "\r"])
+        lines = [rng.choice(pieces) for _ in range(rng.randint(0, 14))]
+        tree = Tree("same")
+        tree.add_text("cells/cell_000.py", eol.join(lines) + rng.choice(["", eol]), "cell 0")
+        if lines and rng.random() < 0.85:  # a run of the file's lines, maybe cut at either end
+            start = rng.randrange(len(lines))
+            run_ = lines[start : start + rng.randint(1, 4)]
+            run_[0] = run_[0][rng.randint(0, len(run_[0]) // 2) :]
+            run_[-1] = run_[-1][: len(run_[-1]) - rng.randint(0, len(run_[-1]) // 2)]
+            quote = rng.choice(["\n", "\n\n", "\r\n"]).join(run_).replace(" ", rng.choice([" ", "   "]))
+        else:
+            quote = "\n".join(rng.choice(pieces) for _ in range(rng.randint(1, 3)))
+        claimed = rng.choice([None, rng.randint(-1, 16)])
+        item = {"path": "cells/cell_000.py", "quote": quote, "line": claimed}
+        found, dropped = verify_evidence([item], tree)
+        expected = _expected_line(tree, "cells/cell_000.py", quote, claimed)
+        assert (found[0].line if found else None) == expected, (lines, eol, quote, claimed)
+        assert dropped == (expected is None)
+
+
+def test_quote_verification_takes_linear_time():
+    tree = Tree("big")
+    tree.add_text("files/data.txt", "a\n" * 200_000, "cell 0 > %%writefile data.txt")
+    near_miss = "a\n" * 997 + "c\na"  # compared line by line, it fails only at its end, from every start
+    everywhere = "a\n" * 999  # found at almost every line
+    evidence = [{"path": "files/data.txt", "line": 100_000, "quote": q} for q in (near_miss, everywhere)]
+    start = time.perf_counter()
+    found, dropped = verify_evidence(evidence, tree)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"{elapsed:.2f} s"  # linear: well under 0.1 s
+    assert found == [Evidence("files/data.txt", 100_000, everywhere.strip())] and dropped == 1
+
+
+def test_many_long_quotes_do_not_stall_the_judge():
+    tree = Tree("big")
+    tree.add_text("files/data.txt", "a\n" * 100_000, "cell 0 > %%writefile data.txt")
+    near_miss = {"path": "files/data.txt", "quote": "a\n" * 997 + "c\na"}
+    start = time.perf_counter()
+    f = run(FakeBackend([("list_files", {})], {**PRESENT, "evidence": [near_miss] * 20}), tree=tree)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 3.0, f"{elapsed:.2f} s"  # each quote compared line by line from every start took minutes
+    assert f.status == "unknown" and f.detail["dropped_quotes"] == MAX_EVIDENCE
+
+
+def test_lines_after_a_redacted_block_keep_their_numbers_with_cr_line_breaks():
+    key = "\r".join(fake_secret("", 64) for _ in range(3))
+    pem = "-----BEGIN " + "PRIVATE KEY-----\r" + key + "\r-----END " + "PRIVATE KEY-----"
+    tree = Tree("cr")
+    tree.add_text("cells/cell_000.py", f"KEY = '''{pem}'''\rx = 1\rtemperature = 0.2\r", "cell 0")
+    quote = {"path": "cells/cell_000.py", "quote": "temperature = 0.2"}
+    backend = FakeBackend([("grep", {"text": "temperature"})], {**PRESENT, "evidence": [quote]})
+    f = run(backend, tree=tree)
+    assert backend.outputs[0].splitlines()[1] == "cells/cell_000.py:7: temperature = 0.2"
+    assert f.status == "present" and f.evidence == [Evidence("cells/cell_000.py", 7, "temperature = 0.2")]
+    assert key not in "".join(backend.outputs)
+
+
 def test_secrets_never_reach_the_llm_and_redacted_quotes_still_verify():
     secret = fake_secret("sk-", 48)
     tree = notebook()
@@ -227,6 +313,23 @@ def test_an_invalid_verdict_is_sent_back_for_a_retry():
     )
     f = run(backend)
     assert f.status == "present" and backend.outputs[-1].startswith("error: status must be one of")
+
+
+def test_deeply_nested_json_from_the_model_gives_unknown(tmp_path: Path):
+    deep = '{"status": "present", "evidence": ' + "[" * 100_000 + "]" * 100_000 + "}"
+    nested: list = []
+    for _ in range(100_000):
+        nested = [nested]
+    backends = [
+        FakeBackend([("submit_verdict", deep)]),  # arguments as a JSON string, as OpenAI-compatible APIs send
+        FakeBackend(tools=False, reply=deep),  # a verdict written as text
+        FakeBackend([], {"status": "present", "evidence": nested, "reasoning": nested}),  # parsed by an SDK
+    ]
+    for backend in backends:
+        f = run(backend, cache_dir=tmp_path / "llm")
+        assert f.status == "unknown" and f.evidence == []
+        (transcript,) = (tmp_path / "llm").iterdir()
+        assert json.loads(transcript.read_text(encoding="utf-8"))["result"]["status"] == "unknown"
 
 
 def test_the_fake_provider_without_a_script_answers_unknown():

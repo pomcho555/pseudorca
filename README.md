@@ -288,7 +288,8 @@ allow_remote = true                      # notebook code will be sent to this pr
 - Pseudorca checks every quote against the notebook. A quote that is not found is dropped. A `present`
   verdict with no verified quote becomes `unknown`.
 - Before anything is sent, common secret formats are replaced with `[REDACTED]`.
-- A local server is always contacted directly, even when your shell has a proxy configured.
+- With the OpenAI-compatible provider, a localhost server is always contacted directly, even when your shell
+  has a proxy configured. Hosted providers use your normal network settings.
 
 **When the LLM is asked**
 - By default (`--llm auto`), only for ideas the deterministic checks could not settle.
@@ -344,8 +345,9 @@ whether a gap is bigger than that noise.
 | `report` | a single-file HTML report |
 | `log` | recent changes and who made them |
 
-`audit`, `check`, `status`, `log`, `lb` and the `list` commands take `--json` for scripts. `-n N` limits
-lists to the latest N, and `-n 0` shows all. Times are shown in your time zone.
+`audit`, `check`, `status`, `log`, `lb` and the `list` commands take `--json` for scripts. In `status`,
+`log`, `nb list`, `sub list`, `run list`, `lb` and `report`, `-n N` shows the latest N and `-n 0` shows all.
+Times are shown in your time zone.
 
 Every command has `--help`. The design and the exact rules are in [DESIGN.md](DESIGN.md), and the safety
 model is in [SECURITY.md](SECURITY.md).

@@ -129,3 +129,29 @@ def test_store_problems_are_one_line_errors_in_every_command(store: Store, monke
         assert out.exit_code == 1, (args, out.output)
         assert out.output.startswith("Error: ") and "Traceback" not in out.output, (args, out.output)
         assert "config.toml" in out.output or "store" in out.output
+
+
+def test_replay_warnings_are_printed_once_by_any_command(store: Store):
+    store.append("idea.add", {"id": "i", "title": "t", "priority": "high"})
+    out = CliRunner().invoke(main, ["--store", str(store.root), "idea", "list"])
+    assert out.exit_code == 0
+    assert out.output.count("ignored field 'priority'") == 1
+
+
+def test_a_closed_pipe_ends_quietly(store: Store):
+    import subprocess
+    import sys
+
+    for i in range(400):
+        store.append("idea.add", {"id": f"idea-{i}", "title": "x" * 200})
+    p = subprocess.Popen(
+        [sys.executable, "-m", "pseudorca", "--store", str(store.root), "log", "-n", "0", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert p.stdout is not None and p.stderr is not None
+    p.stdout.read(10)
+    p.stdout.close()
+    err = p.stderr.read().decode()
+    assert p.wait(timeout=60) == 0, err
+    assert "Traceback" not in err and "Exception ignored" not in err

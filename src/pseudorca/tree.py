@@ -282,8 +282,23 @@ class Tree:
             if m.get("format") != TREE_FORMAT:
                 return None
             tree = cls(m.get("source_sha256", ""), m.get("warnings", []), m.get("meta", {}))
+            content_dir = directory / "files"
             for e in m["files"]:
-                text = "" if e["binary"] else (directory / "files" / e["sha256"]).read_text(encoding="utf-8")
+                # the cache is untrusted input: content names must be hashes, contents regular files
+                if not (
+                    util.is_sha256(e["sha256"])
+                    and isinstance(e["path"], str)
+                    and isinstance(e["origin"], str)
+                    and isinstance(e["binary"], bool)
+                    and isinstance(e["size"], int)
+                ):
+                    return None
+                text = ""
+                if not e["binary"]:
+                    f = content_dir / e["sha256"]
+                    if f.is_symlink() or not f.is_file():
+                        return None
+                    text = f.read_text(encoding="utf-8")
                 tree.files[e["path"]] = TreeFile(
                     e["path"], text, e["origin"], e["sha256"], e["size"], e["binary"]
                 )

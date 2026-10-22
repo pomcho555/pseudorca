@@ -133,7 +133,10 @@ class ToolError(Exception):
 
 
 def parse_arguments(raw: Any) -> dict[str, Any]:
-    """Tool arguments as a dict, from a dict or a JSON object string (empty means no arguments)."""
+    """Tool arguments as a dict, from a dict or a JSON object string (empty means no arguments).
+
+    JSON nested deeper than Python's recursion limit is an error like any other invalid JSON.
+    """
     if raw is None or raw == "":
         return {}
     if isinstance(raw, dict):
@@ -141,11 +144,21 @@ def parse_arguments(raw: Any) -> dict[str, Any]:
     if isinstance(raw, str):
         try:
             value = json.loads(raw)
+        except RecursionError:
+            raise ToolError("the arguments are nested too deeply") from None
         except ValueError:
             raise ToolError("the arguments are not valid JSON") from None
         if isinstance(value, dict):
             return value
     raise ToolError("the arguments must be a JSON object")
+
+
+def _as_text(value: Any) -> str:
+    """A JSON value as text; "" when it cannot be written (nested deeper than the recursion limit)."""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        return ""
 
 
 def parse_verdict(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -162,7 +175,7 @@ def parse_verdict(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
     if isinstance(evidence, str):  # some models send the list as a JSON string
         try:
             evidence = json.loads(evidence)
-        except ValueError:
+        except (ValueError, RecursionError):
             return None, "evidence must be a list of {path, line, quote} objects"
     if isinstance(evidence, dict):
         evidence = [evidence]
@@ -170,7 +183,7 @@ def parse_verdict(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
         return None, "evidence must be a list of {path, line, quote} objects"
     reasoning = args.get("reasoning") or ""
     if not isinstance(reasoning, str):
-        reasoning = json.dumps(reasoning, ensure_ascii=False)
+        reasoning = _as_text(reasoning)
     return {"status": status, "evidence": evidence, "reasoning": reasoning}, None
 
 

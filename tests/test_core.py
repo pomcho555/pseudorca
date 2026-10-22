@@ -357,3 +357,95 @@ def test_deeply_nested_json_is_not_a_notebook(tmp_path: Path, store: Store):
     deep.write_bytes(b"[" * 100_000 + b"]" * 100_000)
     with pytest.raises(ValueError, match="not notebook JSON"):
         register_file(store, deep)
+
+
+def test_cache_paths_refuse_symlinks_and_escapes(store: Store, tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (store.root / "cache" / "trees").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(StoreError, match="symlink"):
+        store.cache_dir("trees", "a" * 64)
+    with pytest.raises(StoreError, match="invalid cache path"):
+        store.cache_dir("..", "x")
+
+
+def test_tree_cache_with_non_hash_names_or_symlinks_is_ignored(tmp_path: Path):
+    t = Tree("src", meta={"extractor_version": 1})
+    t.add_text("a.py", "x = 1\n", "cell 0")
+    t.save(tmp_path / "c")
+    manifest = json.loads((tmp_path / "c" / "manifest.json").read_text())
+    manifest["files"][0]["sha256"] = "../../../etc/hosts"
+    (tmp_path / "c" / "manifest.json").write_text(json.dumps(manifest))
+    assert Tree.load(tmp_path / "c") is None
+    t.save(tmp_path / "d")
+    content = next((tmp_path / "d" / "files").iterdir())
+    content.unlink()
+    content.symlink_to(tmp_path / "c" / "manifest.json")
+    assert Tree.load(tmp_path / "d") is None
+
+
+def test_a_damaged_blob_is_repaired_by_adding_the_file_again(store: Store):
+    from pseudorca.notebooks import register_file
+
+    f = store.root.parent / "nb.ipynb"
+    f.write_bytes(b'{"cells": []}')
+    nb, _ = register_file(store, f)
+    store.blob_path(nb.id).write_bytes(b'{"cells": []}\r\n')  # a line-ending conversion
+    assert store.has_blob(nb.id) and not store.blob_ok(nb.id)
+    register_file(store, f)
+    assert store.blob_ok(nb.id) and store.get_blob(nb.id) == f.read_bytes()
+
+
+def test_registrations_on_two_clones_merge_without_losing_anything(store: Store):
+    from pseudorca.notebooks import register_bytes
+
+    store.append("idea.add", {"id": "a", "title": "t"})
+    store.append("idea.add", {"id": "b", "title": "t"})
+    data = b'{"cells": [], "metadata": {}}'
+    nb, _ = register_bytes(
+        store, data, name="next.ipynb", tags=["candidate"], applies=["a"], note="alice: v7"
+    )
+    # what bob's clone wrote before pulling: his own first registration of the same bytes
+    store.append(
+        "nb.add", {"id": nb.id, "name": "cand-7", "tags": ["fast"], "applies": ["b"], "note": "bob: c7"}
+    )
+    register_bytes(store, data, name="next.ipynb", tags=["ci"])  # a later re-add only adds
+    st = Store.at(store.root).state()
+    merged = st.notebooks[nb.id]
+    assert merged.tags == ["candidate", "fast", "ci"] and merged.applies == ["a", "b"]
+    assert merged.name == "next.ipynb" and "cand-7" in merged.aliases
+    assert merged.note == "alice: v7 / bob: c7"
+    assert st.resolve_nb("cand-7").id == nb.id
+    assert [e.type for e in st.events if e.data.get("id") == nb.id].count("nb.update") == 0
+
+
+def test_init_without_a_name_leaves_it_out_of_the_config(tmp_path: Path):
+    a = Store.init(tmp_path / "alice")
+    b = Store.init(tmp_path / "bob")
+    assert (a.root / "config.toml").read_bytes() == (b.root / "config.toml").read_bytes()
+    assert a.setting("store", "name") is None
+
+
+def test_a_future_store_does_not_leak_future_ids_into_other_stores(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PSEUDORCA_ACTOR", "t")
+    ahead = Store.init(tmp_path / "ahead")
+    ahead.append("idea.add", {"id": "x", "title": "t"})
+    future_id = util.new_ulid(util.ulid_ms(ahead.events()[-1].id) + 30 * 60_000)
+    month = next((ahead.root / "events").iterdir())
+    (month / f"{future_id}-o.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "id": future_id,
+                "type": "idea.update",
+                "time": "t",
+                "actor": "o",
+                "data": {"id": "x"},
+            }
+        )
+    )
+    Store.at(ahead.root).append("idea.update", {"id": "x", "status": "testing"})
+    other = Store.init(tmp_path / "other")
+    other.append("idea.add", {"id": "y", "title": "t"})
+    assert util.ulid_ms(other.events()[-1].id) < util.ulid_ms(future_id)
+    assert not any("clock" in w for w in Store.at(other.root).state().warnings)

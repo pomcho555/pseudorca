@@ -3,17 +3,28 @@
 Known key formats are replaced by [REDACTED]: OpenAI (sk-, sk-proj-), Anthropic (sk-ant-), GitHub (ghp_,
 gho_, ghu_, ghs_, ghr_, github_pat_), Hugging Face (hf_), AWS access key ids (AKIA, ASIA) and secret access
 keys, Google (AIza), Slack (xox?-), JSON web tokens, bearer tokens, Basic auth credentials, private key
-blocks, passwords in URLs and kaggle.json keys. Values assigned to secret-like names are replaced too (the
-name stays, the value goes):
+blocks, passwords in URLs (also without a user name: redis://:password@host) and kaggle.json keys. Values
+assigned to secret-like names are replaced too (the name stays, the value goes):
 - quoted, with any string prefix or triple quotes: `api_key = "..."`, `client_secret = f"..."`;
 - passwords and passphrases, which may be short or hold spaces: `password = "correct horse battery"`;
-- unquoted, in YAML, INI and .env files: `api_key: ...`, `aws_secret_access_key = ...`;
-- in magics and shell commands: `%env MY_TOKEN=...`, `export MY_TOKEN=...`, `MY_TOKEN=... python run.py`.
+- unquoted, in YAML, INI and .env files: `api_key: ...`, `aws_secret_access_key = ...`, `DB_PASSWORD=changeme`;
+- in magics and shell commands, also in a notebook's `!` lines and in strings handed to a shell:
+  `%env MY_TOKEN=...`, `export MY_TOKEN=...`, `!MY_TOKEN=... python run.py`,
+  `os.system("MY_TOKEN=... python run.py")`.
 
-Replacements keep every line break, so a redacted file has the line numbers of the original, and quotes
-verified against the redacted view point at the right lines. Every rule takes time linear in the text:
-where a match can fail late, its quantifiers are bounded or possessive, and private key blocks are found
-in one pass over their BEGIN and END lines.
+An unquoted value on a line whose name holds a password (it ends in password, passwd, pwd or passphrase:
+DB_PASSWORD, self.password, but not password_auth) is the password when it has 6 or more characters, whatever
+they are (`changeme`, `123456`), as it would be in quotes. On a settings line, values that read as code stay:
+names of environment variables, dotted names, CamelCase class names and variables named for a password
+(`password: SecretStr`, `self.password = password`, `password = args.password`). In a shell command or magic
+a bare word is text, so only an environment variable's name stays, and, below 12 characters, a variable
+named for a password, which a keyword argument looks like (`password=password`).
+
+Replacements keep every line break (\\n, \\r\\n and \\r), so a redacted file has the line numbers of the
+original, and quotes verified against the redacted view point at the right lines. Every rule takes time
+linear in the text: where a match can fail late, its quantifiers are bounded or possessive, a shell
+assignment never starts inside a value that an earlier attempt scanned, and private key blocks are found in
+one pass over their BEGIN and END lines.
 """
 
 from __future__ import annotations
@@ -29,20 +40,30 @@ from pseudorca import util
 from pseudorca.tree import Tree, TreeFile
 
 REDACTED = "[REDACTED]"
+TOO_DEEP = "[nested too deeply]"
+MAX_DEPTH = 64  # levels of lists and dicts redact_value keeps; deeper ones become TOO_DEEP
 
 Replace = Callable[[re.Match[str]], str]
+
+# the line breaks of tree.split_lines
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def _breaks(text: str, start: int = 0, end: int | None = None) -> str:
+    """The line breaks in text[start:end], in order, as they are (\\n, \\r\\n or \\r)."""
+    return "".join(_LINE_BREAK.findall(text, start, len(text) if end is None else end))
 
 
 def _whole(m: re.Match[str]) -> str:
     """Replace the whole match, keeping its line breaks."""
-    return REDACTED + "\n" * m.group(0).count("\n")
+    return REDACTED + _breaks(m.group(0))
 
 
 def _span(m: re.Match[str], group: str) -> str:
     """Replace one group, keeping the rest of the match (such as the variable name) and its line breaks."""
     text, base = m.group(0), m.start()
     start, end = m.start(group) - base, m.end(group) - base
-    return text[:start] + REDACTED + "\n" * text[start:end].count("\n") + text[end:]
+    return text[:start] + REDACTED + _breaks(text, start, end) + text[end:]
 
 
 def _value(m: re.Match[str]) -> str:
@@ -55,6 +76,19 @@ _SECRET_NAME = re.compile(r"key|secret|passw(?:or)?d|pwd|passphrase|credential|t
 # secrets that people choose: they can be short and can hold spaces
 _PASSWORD_WORD = r"passw(?:or)?d|pwd|passphrase"
 _PASSWORD_NAME = re.compile(_PASSWORD_WORD, re.I)
+# a name that ends in a password word holds a password (DB_PASSWORD, self.password, admin_pwd, passwords);
+# other names with one hold a setting about passwords (password_auth, password_hash, passphrase_iterations)
+_HOLDS_PASSWORD = re.compile(r"(?:" + _PASSWORD_WORD + r")s?\d*$", re.I)
+MIN_PASSWORD_CHARS = 6  # passwords can be short
+MIN_KEY_CHARS = 12  # keys and tokens are long, and a shorter value is usually a setting
+# unquoted values on a password line that are code, not the password: dotted names (args.password), CamelCase
+# class names (SecretStr) and variables with a password word among their words (password, user_password,
+# dbPassword, password_mgr), unless they end in a digit (password1 is a password)
+_DOTTED_NAME = re.compile(r"[A-Za-z_]+(?:\.[A-Za-z_]+)+")
+_CLASS_NAME = re.compile(r"(?:[A-Z][a-z]+){2,}")
+_VARIABLE = re.compile(r"[A-Za-z_]\w*[A-Za-z_]")
+_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])")  # the words of a snake_case or camelCase name
+_PASSWORD_WORD_ONLY = re.compile(r"(?:" + _PASSWORD_WORD + r")s?", re.I)
 # names that hold where a secret is, or text about it, not the secret: KEY_PATH, token_file, api_key_env,
 # SECRET_NAME, password_prompt, key_size
 _NOT_SECRET_NAME = re.compile(
@@ -69,7 +103,7 @@ _ENV_VAR_VALUE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
 # can be a key.
 _PLAIN_VALUE = re.compile(
     r"(?i:true|false|yes|no|on|off|null|none|nil)|[-+]?\d[\d_]*(?:\.\d+)?(?:[eE][-+]?\d+)?"
-    r"|[A-Za-z_]{1,15}|[A-Za-z_]+(?:\.[A-Za-z_]+)+"
+    r"|[A-Za-z_]{1,15}|" + _DOTTED_NAME.pattern
 )
 # names made of words, in snake_case or CamelCase without digits (resolved_api_key, InputTokensDetails):
 # code, not a key or token, which are random. Passwords are exempt, as passphrases can look like this.
@@ -85,7 +119,19 @@ def _is_secret_name(name: str) -> bool:
 
 def _min_chars(name: str) -> int:
     """Passwords can be short; keys and tokens are long, and a short value is usually a setting."""
-    return 6 if _PASSWORD_NAME.search(name) else 12
+    return MIN_PASSWORD_CHARS if _PASSWORD_NAME.search(name) else MIN_KEY_CHARS
+
+
+def _password_variable(value: str) -> bool:
+    """A variable named for a password (password, user_password, dbPassword), not a password."""
+    return bool(_VARIABLE.fullmatch(value)) and any(
+        _PASSWORD_WORD_ONLY.fullmatch(word) for word in _WORD.findall(value)
+    )
+
+
+def _password_code(value: str) -> bool:
+    """An unquoted value on a password line that reads as code rather than as the password itself."""
+    return bool(_DOTTED_NAME.fullmatch(value) or _CLASS_NAME.fullmatch(value)) or _password_variable(value)
 
 
 def _is_code(name: str, value: str) -> bool:
@@ -114,13 +160,35 @@ def _password(m: re.Match[str]) -> str:
 
 
 def _unquoted(m: re.Match[str]) -> str:
+    """A value on a settings line (YAML, INI, .env, properties).
+
+    On a line that holds a password, words and numbers are passwords (DB_PASSWORD=changeme), as they are in
+    quotes. On other secret lines they are settings: true, 4096, required, SecretStr.
+    """
     name, value = m.group("name"), m.group("value")
-    if (
-        not _is_secret_name(name)
-        or len(value) < _min_chars(name)
-        or _is_code(name, value)
-        or _PLAIN_VALUE.fullmatch(value)
-    ):
+    if not _is_secret_name(name) or len(value) < _min_chars(name) or _is_code(name, value):
+        return m.group(0)
+    if _HOLDS_PASSWORD.search(name):
+        keep = _password_code(value)
+    else:
+        keep = bool(_PLAIN_VALUE.fullmatch(value))
+    return m.group(0) if keep else _value(m)
+
+
+def _command(m: re.Match[str]) -> str:
+    """A value in a magic or a shell command: %env NAME=value, export NAME=value, NAME=value cmd.
+
+    A shell reads a bare word as text, so a value of MIN_KEY_CHARS or more is redacted unless `_is_code`
+    says it names something (an environment variable; for keys and tokens also a name made of words, or a
+    template). On a line that holds a password, so is a shorter one of MIN_PASSWORD_CHARS or more, unless it
+    is a variable named for a password: a keyword argument looks the same (password=password).
+    """
+    name, value = m.group("name"), m.group("value")
+    if not _is_secret_name(name) or _is_code(name, value):
+        return m.group(0)
+    if len(value) >= MIN_KEY_CHARS:
+        return _value(m)
+    if len(value) < MIN_PASSWORD_CHARS or not _HOLDS_PASSWORD.search(name) or _password_variable(value):
         return m.group(0)
     return _value(m)
 
@@ -159,7 +227,7 @@ def _private_keys(text: str) -> str:
             more_ends = False
             quote = _LITERAL_END.search(text, begin.end())
             stop = len(text) if quote is None else quote.start()
-        parts += [text[pos : begin.start()], REDACTED + "\n" * text.count("\n", begin.start(), stop)]
+        parts += [text[pos : begin.start()], REDACTED + _breaks(text, begin.start(), stop)]
         pos = stop
     parts.append(text[pos:])
     return "".join(parts)
@@ -222,8 +290,8 @@ _RULES: list[tuple[Callable[[str], str], tuple[str, ...]]] = [
         _sub(r"(?i)\bbasic[ \t]+(?P<value>[A-Za-z0-9+/]{4,}+={0,2})(?![A-Za-z0-9+/=])", _basic),
         ("asic", "ASIC"),
     ),
-    # scheme://user:password@host
-    (_sub(r"(?<=://)(?P<value>[^\s/:@'\"]+:[^\s/@'\"]+)@", _value), ("://",)),
+    # scheme://user:password@host, and scheme://:password@host (Redis has no user name)
+    (_sub(r"(?<=://)(?P<value>[^\s/:@'\"]*:[^\s/@'\"]+)@", _value), ("://",)),
     # api_key = "...", password: str = "...", "token": "...", os.environ["X_SECRET"] = "...",
     # login(token="..."), os.environ.setdefault("X_TOKEN", "..."), API_TOKEN = """...""", key = f"..."
     (
@@ -258,22 +326,14 @@ _RULES: list[tuple[Callable[[str], str], tuple[str, ...]]] = [
     (
         _sub(
             r"(?:%env|%set_env|\bexport)[ \t]+(?P<name>[A-Za-z_]\w{0,80}+)(?:[ \t]*=[ \t]*|[ \t]+)"
-            r"(?P<value>[^\s\"'`$(){}\[\],;<>|]{12,4096})",
-            _assignment,
+            r"(?P<value>[^\s\"'`$(){}\[\],;<>|]{6,4096})",
+            _command,
         ),
         ("%env", "%set_env", "export"),
     ),
-    # NAME=value in .env files and shell commands (HF_TOKEN=... python run.py)
-    (
-        _sub(
-            r"(?:^|(?<=[\s;&|]))(?P<name>[A-Za-z_]\w{0,80}+)=(?P<value>[^\s\"'`$(){}\[\],;<>|]{12,4096}+)(?=\s|$)",
-            _assignment,
-            re.M,
-        ),
-        ("=",),
-    ),
     # unquoted settings, one per line (YAML, INI, .env, properties): `api_key: ...`, `password = ...`,
-    # `- token: ...`, with an optional comment after the value
+    # `- token: ...`, with an optional comment after the value. Before the shell rule below, which stops a
+    # value at a shell separator such as &, so that a .env value holding one is redacted whole.
     (
         _sub(
             r"^[ \t]*(?:-[ \t]+)?"
@@ -283,6 +343,19 @@ _RULES: list[tuple[Callable[[str], str], tuple[str, ...]]] = [
             re.M,
         ),
         (),
+    ),
+    # NAME=value in shell commands: `HF_TOKEN=... python run.py`, also in a notebook's `!` line and in the
+    # strings handed to a shell, `os.system("HF_TOKEN=... python run.py")`. A match starts at a line start
+    # or after a shell separator (whitespace, ; & | or a quote), and a value holds none of them: no match can
+    # start inside a value that an earlier attempt scanned, so every character is scanned once.
+    (
+        _sub(
+            r"(?:^|(?<=[\s;&|'\"`]))!?(?P<name>[A-Za-z_]\w{0,80}+)="
+            r"(?P<value>[^\s\"'`$(){}\[\],;<>|&]{6,4096}+)(?=[\s;&|'\"`]|$)",
+            _command,
+            re.M,
+        ),
+        ("=",),
     ),
 ]
 
@@ -299,16 +372,29 @@ def redact(text: str) -> str:
 
 
 def redact_value(value: Any) -> Any:
-    """A JSON-ready copy of `value` with every string redacted; other objects become redacted strings."""
-    if isinstance(value, str):
-        return redact(value)
-    if value is None or isinstance(value, bool | int | float):
-        return value
-    if isinstance(value, dict):
-        return {redact(str(k)): redact_value(v) for k, v in value.items()}
-    if isinstance(value, list | tuple):
-        return [redact_value(v) for v in value]
-    return redact(str(value))
+    """A JSON-ready copy of `value` with every string redacted; other objects become redacted strings.
+
+    Lists and dicts nested more than MAX_DEPTH levels deep (which a model's tool arguments can be) become
+    "[nested too deeply]", so the copy can always be written as JSON.
+    """
+
+    def copy(value: Any, depth: int) -> Any:
+        if isinstance(value, str):
+            return redact(value)
+        if value is None or isinstance(value, bool | int | float):
+            return value
+        if depth >= MAX_DEPTH:
+            return TOO_DEEP
+        if isinstance(value, dict):
+            return {redact(str(k)): copy(v, depth + 1) for k, v in value.items()}
+        if isinstance(value, list | tuple):
+            return [copy(v, depth + 1) for v in value]
+        try:
+            return redact(str(value))
+        except RecursionError:  # the repr of a deeply nested object
+            return TOO_DEEP
+
+    return copy(value, 0)
 
 
 _VIEWS: weakref.WeakKeyDictionary[Tree, tuple[tuple[tuple[str, str], ...], Tree]] = (

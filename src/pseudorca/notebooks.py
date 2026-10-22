@@ -95,20 +95,35 @@ def register_bytes(
 
     existing = st.notebooks.get(sha)
     if existing is not None:
-        changes: dict[str, Any] = {}
+        # Record only what this registration adds, as another nb.add: replay merges it (tags and applies are
+        # unioned, empty fields filled, another name becomes an alias), so two clones that register the same
+        # notebook before pulling never wipe each other's metadata. `nb update` is for deliberate changes.
+        added: dict[str, Any] = {}
         if new_tags := [t for t in tags if t not in existing.tags]:
-            changes["tags"] = [*existing.tags, *new_tags]
+            added["tags"] = new_tags
         if new_applies := [a for a in applies if a not in existing.applies]:
-            changes["applies"] = [*existing.applies, *new_applies]
-        for key, value in (("kernel", kernel), ("version", version), ("note", note), ("parent", parent)):
-            if value and getattr(existing, key) != value:
-                changes[key] = value
-        if keep_bytes and not store.has_blob(sha):
-            store.put_blob(data)  # also repairs a blob that was never pushed or got lost
+            added["applies"] = new_applies
+        for key, value in (
+            ("name", name),
+            ("kernel", kernel),
+            ("version", version),
+            ("note", note),
+            ("parent", parent),
+        ):
+            if (
+                value
+                and getattr(existing, key) != value
+                and not (key == "name" and value in existing.aliases)
+            ):
+                added[key] = value
+        if not existing.path and path:
+            added["path"] = path
+        if keep_bytes and not store.blob_ok(sha):
+            store.put_blob(data)  # also repairs a blob that was never pushed, got lost or was damaged
             if not existing.stored:
-                changes["stored"] = True
-        if changes:
-            store.append("nb.update", {"id": sha, **changes})
+                added["stored"] = True
+        if added:
+            store.append("nb.add", {"id": sha, **added})
         return store.state().notebooks[sha], False
 
     if keep_bytes:

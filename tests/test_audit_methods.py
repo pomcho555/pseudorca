@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from pseudorca.audit import fingerprint, patch
 from pseudorca.audit.types import Evidence
 from pseudorca.tree import Tree
@@ -554,6 +556,169 @@ def test_a_hunk_with_two_changes_needs_both_in_place():
     assert f.status == "unknown" and f.detail["unknown"] == 1
 
 
+TWO_SOLVERS_DIFF = (
+    "--- a/agent.py\n+++ b/agent.py\n"
+    "@@ -1,4 +1,5 @@\n def solve_math(llm, q):\n     out = llm.generate(MATH_PROMPT + q)\n"
+    "+    out = out.strip()\n     return out\n"
+    "@@ -6,4 +7,5 @@\n def solve_code(llm, q):\n     out = llm.generate(CODE_PROMPT + q)\n"
+    "+    out = out.strip()\n     return out\n"
+)
+TWO_SOLVERS = (
+    "def solve_math(llm, q):\n    out = llm.generate(MATH_PROMPT + q)\n"
+    "    out = out.strip()\n    return out\n\n"
+    "def solve_code(llm, q):\n    out = llm.generate(CODE_PROMPT + q)\n"
+    "    out = out.strip()\n    return out\n"
+)
+
+
+def test_added_lines_next_to_one_anchor_do_not_count_while_the_old_side_is_in_place():
+    # only solve_math is patched: solve_code's hunk finds its added line above solve_math's "return out",
+    # but solve_code's own anchors are still next to each other
+    half = TWO_SOLVERS.replace("CODE_PROMPT + q)\n    out = out.strip()\n", "CODE_PROMPT + q)\n")
+    f = patch.check(TWO_SOLVERS_DIFF, make_tree({"files/agent.py": half}))
+    assert f.status == "partial" and f.detail["files"]["agent.py"]["hunks"] == ["applied", "unknown"]
+    assert f.evidence == [Evidence("files/agent.py", 3, "out = out.strip()")]
+    f = patch.check(TWO_SOLVERS_DIFF, make_tree({"files/agent.py": TWO_SOLVERS}))
+    assert f.status == "present" and [e.line for e in f.evidence] == [3, 8]
+    none = half.replace("    out = out.strip()\n", "")
+    assert patch.check(TWO_SOLVERS_DIFF, make_tree({"files/agent.py": none})).status == "absent"
+
+    # an unpatched solve() next to a helper that has the added line before the same after-anchor
+    diff = (
+        "--- a/agent.py\n+++ b/agent.py\n@@ -1,3 +1,4 @@\n def solve(llm, prompt):\n"
+        "     out = llm.generate(prompt)\n+    out = out.strip()\n     return out\n"
+    )
+    solve = "def solve(llm, prompt):\n    out = llm.generate(prompt)\n    return out\n"
+    assert patch.check(diff, make_tree({"cells/cell_000.py": HELPER + solve})).status == "unknown"
+    patched = HELPER + solve.replace("(prompt)\n", "(prompt)\n    out = out.strip()\n")
+    f = patch.check(diff, make_tree({"cells/cell_000.py": patched}))
+    assert f.status == "present" and f.evidence == [Evidence("cells/cell_000.py", 8, "out = out.strip()")]
+
+    # a hunk that adds a copy of its own before-anchor: unpatched code has the "new side" by accident
+    dup = (
+        "--- a/run.py\n+++ b/run.py\n@@ -1,2 +1,3 @@\n model.warmup(batch)\n+model.warmup(batch)\n"
+        " results = model.run(batch)\n"
+    )
+    once = "model.warmup(batch)\nresults = model.run(batch)\n"
+    assert patch.check(dup, make_tree({"files/run.py": once})).status == "unknown"
+    twice = "model.warmup(batch)\nmodel.warmup(batch)\nresults = model.run(batch)\n"
+    assert patch.check(dup, make_tree({"files/run.py": twice})).status == "present"
+
+
+def test_hunks_without_context_look_for_their_blocks_in_the_diffs_own_file():
+    unpatched = "def solve(llm, prompt):\n    out = llm.generate(prompt)\n    return parse(out)\n"
+    # a -U0 change: the file still has the old line, and an unrelated cell happens to have the new one
+    change = (
+        "--- a/src/agent.py\n+++ b/src/agent.py\n@@ -2 +2 @@\n-    out = llm.generate(prompt)\n"
+        "+    out = llm.generate(prompt, temperature=0.2)\n"
+    )
+    other = "    out = llm.generate(prompt, temperature=0.2)\n"
+    f = patch.check(change, make_tree({"files/src/agent.py": unpatched, "cells/cell_009.py": other}))
+    assert f.status == "absent" and f.evidence == [
+        Evidence("files/src/agent.py", 2, "out = llm.generate(prompt)")
+    ]
+    # without the file in the notebook, every evidence path is searched
+    assert patch.check(change, make_tree({"cells/cell_009.py": other})).status == "present"
+    # a -U0 addition: the file is unpatched, a helper cell has the added line
+    addition = "--- a/src/agent.py\n+++ b/src/agent.py\n@@ -2,0 +3 @@\n+    out = out.strip()\n"
+    files = {"files/src/agent.py": unpatched, "cells/cell_000.py": HELPER}
+    assert patch.check(addition, make_tree(files)).status == "absent"
+    # a -U0 removal: the file is patched, an unrelated cell still has the removed line
+    removal = "--- a/src/agent.py\n+++ b/src/agent.py\n@@ -3 +2,0 @@\n-    print(out)\n"
+    patched = "def answer(q):\n    out = generate(q)\n    return out\n"
+    files = {"files/src/agent.py": patched, "cells/cell_000.py": "def debug(out):\n    print(out)\n"}
+    assert patch.check(removal, make_tree(files)).status == "present"
+    # a hunk whose only context lines are trivial ones
+    trivial_context = (
+        "--- a/agent.py\n+++ b/agent.py\n@@ -10,4 +10,5 @@\n     )\n \n+    retries = 3\n     return\n"
+    )
+    files = {"files/agent.py": "x = f(\n    a,\n    )\n\n    return\n", "cells/cell_001.py": "retries = 3\n"}
+    assert patch.check(trivial_context, make_tree(files)).status == "absent"
+    files["files/agent.py"] = "x = f(\n    a,\n    )\n\n    retries = 3\n    return\n"
+    assert patch.check(trivial_context, make_tree(files)).status == "present"
+
+
+def test_trivial_lines_inside_a_change_are_compared_like_other_lines():
+    """Trivial lines are never anchors and never a change by themselves, but next to changed lines they are
+    part of the change's text: they can pin its place, and when they drift the change is not recognised."""
+    diff = (
+        "--- a/f.py\n+++ b/f.py\n@@ -1,4 +1,5 @@\n def f(x):\n     y = g(x)\n+    y = y.strip()\n"
+        "     pass\n     return y\n"
+    )
+    applied = "def f(x):\n    y = g(x)\n    y = y.strip()\n    pass\n    return y\n"
+    assert patch.check(diff, make_tree({"files/f.py": applied})).status == "present"
+    # the `pass` removed later: neither side is in place any more, so the hunk is unknown (never a guess)
+    assert patch.check(diff, make_tree({"files/f.py": applied.replace("    pass\n", "")})).status == "unknown"
+    # a -U1 hunk: the trivial `pass` is all that places the change, and it still does
+    u1 = (
+        "--- a/agent.py\n+++ b/agent.py\n@@ -11,3 +11,3 @@ class Agent:\n     def warmup(self):\n"
+        '-        pass\n+        self.client.generate("ping", max_tokens=1)\n \n'
+    )
+    agent = "class Agent:\n    def warmup(self):\n        pass\n\n    def run(self, q):\n        return q\n"
+    assert patch.check(u1, make_tree({"files/agent.py": agent})).status == "absent"
+    warm = agent.replace("pass", 'self.client.generate("ping", max_tokens=1)')
+    assert patch.check(u1, make_tree({"files/agent.py": warm})).status == "present"
+
+
+def test_checks_of_one_tree_share_its_index_until_the_tree_changes():
+    tree = make_tree({"files/src/agent.py": OLD_AGENT})
+    assert patch.check(AGENT_DIFF, tree).status == "absent"
+    assert patch.check(CONFIG_DIFF + AGENT_DIFF, tree).detail["files"]["src/agent.py"]["hunks"] == [
+        "reverted",
+        "reverted",
+    ]
+    tree.add_text("files/src/agent.py", NEW_AGENT, "edited", replace=True)
+    f = patch.check(AGENT_DIFF, tree)
+    assert f.status == "present" and f.evidence[0].quote == 'SYSTEM = "Be brief. Answer with one number."'
+    tree.add_text("cells/cell_000.py", OLD_AGENT, "a cell")  # one more file: the diff's file still wins
+    assert patch.check(AGENT_DIFF, tree).status == "present"
+
+
+def _formatter_diff(n: int) -> tuple[str, str, str]:
+    """A diff that changes the quotes on every other line of an n-line file: (diff, old file, new file)."""
+    old, new = [], []
+    for i in range(n):
+        if i % 2:
+            old.append(f"    key_{i} = 'value {i}'")
+            new.append(f'    key_{i} = "value {i}"')
+        else:
+            old.append(f"    other_{i} = compute({i})")
+            new.append(f"    other_{i} = compute({i})")
+    lines = ["--- a/src/m.py", "+++ b/src/m.py", f"@@ -1,{n} +1,{n} @@"]
+    for o, w in zip(old, new, strict=True):
+        lines += [" " + o] if o == w else ["-" + o, "+" + w]
+    return "\n".join(lines) + "\n", "\n".join(old) + "\n", "\n".join(new) + "\n"
+
+
+def test_patch_matching_takes_near_linear_time():
+    diff, old, new = _formatter_diff(8000)
+    filler = {f"cells/cell_{i:03d}.py": "".join(f"v_{i}_{j} = {j}\n" for j in range(500)) for i in range(40)}
+    for files, status in (
+        ({"files/src/m.py": new}, "present"),
+        ({"files/src/m.py": old}, "absent"),
+        ({**filler, "cells/cell_999.py": new}, "present"),  # inlined in a cell: every path is a candidate
+    ):
+        tree = make_tree(files)
+        start = time.perf_counter()
+        f = patch.check(diff, tree)
+        elapsed = time.perf_counter() - start
+        assert f.status == status and elapsed < 1.0, (status, elapsed)
+    # many small hunks over a long file
+    hunks, body = [], []
+    for i in range(1000):
+        body += [f"def f_{i}(x):", f"    y_{i} = g(x)", f"    return y_{i}"]
+        hunks.append(
+            f"@@ -{3 * i + 1},3 +{3 * i + 1},3 @@\n def f_{i}(x):\n-    y_{i} = g(x)\n+    y_{i} = h(x)\n"
+            f"     return y_{i}\n"
+        )
+    diff = "--- a/big.py\n+++ b/big.py\n" + "".join(hunks)
+    tree = make_tree({"files/big.py": "\n".join(body) + "\n"})
+    start = time.perf_counter()
+    f = patch.check(diff, tree)
+    elapsed = time.perf_counter() - start
+    assert f.status == "absent" and f.detail["reverted"] == 1000 and elapsed < 1.0, elapsed
+
+
 # ----- multi-line fingerprints and match columns ------------------------------------------------------
 
 SOLVER = (
@@ -596,6 +761,22 @@ def test_regex_fingerprints_spanning_lines_search_whole_files():
     f = fingerprint.check([r"re:(?m)^\s+answer = parse_answer\(out\)$"], t)
     assert f.status == "present" and f.evidence[0].line == 6
     assert fingerprint.check([r"!re:(?m)^import re$\n^def solve"], t).status == "present"
+
+
+def test_multi_line_regex_evidence_starts_at_the_first_line_of_its_quote():
+    solver = SOLVER.replace("        answer", "\n        answer")  # a blank line 6, the answer on line 7
+    spec = r"re:(?m)^\s*answer = parse_answer\(out\)$"
+    (ev,) = fingerprint.check([spec], make_tree({"files/solver.py": solver})).evidence
+    assert (ev.line, ev.quote, ev.col) == (7, "answer = parse_answer(out)", 0)
+    (ev,) = fingerprint.check([spec], make_tree({"cells/cell_000.py": solver.replace("\n", "\r\n")})).evidence
+    assert (ev.line, ev.quote) == (7, "answer = parse_answer(out)")
+    spaced = solver.replace("\n\n        answer", "\n   \t \n        answer")  # a whitespace-only line 6
+    (ev,) = fingerprint.check([spec], make_tree({"files/solver.py": spaced})).evidence
+    assert (ev.line, ev.quote) == (7, "answer = parse_answer(out)")
+    # a long match is cut around where it starts: the line is the one its cut quote starts on
+    text = "x = 1" + " " * 150 + "\n    call(" + "a" * 400 + ")\n    done = True\n"
+    (ev,) = fingerprint.check([r"re:\n\s*call\(a+\)"], make_tree({"files/long.py": text})).evidence
+    assert (ev.line, ev.col) == (2, 0) and ev.quote.startswith("call(aaa")
 
 
 def test_fingerprint_evidence_records_where_the_match_starts():

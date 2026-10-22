@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -374,6 +377,80 @@ def test_audit_of_a_file_audits_that_files_version(
     Path("other.ipynb").write_bytes(ipynb("x = 1\n"))
     out = run(ledger, "audit", "other.ipynb", code=1).output
     assert "other.ipynb is not registered" in out and "pseudorca check other.ipynb" in out
+
+
+def test_audit_of_a_file_whose_suffix_is_a_label_audits_that_files_version(
+    ledger: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Any existing file is a file, as in `check`: `solver-v1.5` is not only a notebook name."""
+    monkeypatch.chdir(tmp_path)
+    Path("solver-v1.5").write_bytes(BAD)
+    register_bytes(ledger, BAD, name="solver-v1.5")
+    Path("solver-v1.5").write_bytes(GOOD)  # edited after it was registered
+    result = run(ledger, "audit", "solver-v1.5", "--llm", "never")
+    assert "solver-v1.5 on disk is not the registered version" in result.stderr
+    assert "pseudorca nb add solver-v1.5" in result.stderr
+    register_bytes(ledger, GOOD, name="solver-next")
+    result = run(ledger, "audit", "solver-v1.5", "--llm", "never")
+    assert "on disk" not in result.stderr and "audit of solver-next" in result.stdout
+    # the default NB_REF is the latest registered notebook, whatever files the directory holds
+    Path("latest").write_bytes(ipynb("x = 1\n"))
+    result = run(ledger, "audit", "--llm", "never")
+    assert "audit of solver-next" in result.stdout and "on disk" not in result.stderr
+
+
+# ----- check into a pipe that closes early -------------------------------------------------------
+
+
+def run_into_closed_pipe(store: Store, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run pseudorca in a child process whose stdout is a pipe nobody reads (like `| head -c 0`)."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        return subprocess.run(
+            [sys.executable, "-m", "pseudorca", "--store", str(store.root), *args],
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+
+
+def test_check_keeps_its_exit_code_when_stdout_is_closed_early(ledger: Store, tmp_path: Path):
+    for i in range(40):
+        ledger.append(
+            "idea.add", {"id": f"knob-{i}", "title": "t", "status": "adopted", "fingerprints": [f"k{i} = 1"]}
+        )
+    bad, good = tmp_path / "bad.py", tmp_path / "good.py"
+    bad.write_text("temperature=1.2\n", encoding="utf-8")
+    good.write_text(
+        "".join(f"k{i} = 1\n" for i in range(40)) + 'SYSTEM = "Be brief."\nmax_retries = 3\n',
+        encoding="utf-8",
+    )
+    for args, code in (
+        ([str(bad)], 1),
+        ([str(bad), "--json"], 1),
+        ([str(good)], 0),
+        ([str(good), "--json"], 0),
+    ):
+        result = run_into_closed_pipe(ledger, "check", *args, "--llm", "never", "--dry-run")
+        assert result.returncode == code, (args, result.returncode, result.stderr.decode()[-2000:])
+        assert b"Traceback" not in result.stderr
+
+
+def test_check_that_loses_its_output_before_the_outcome_is_known_could_not_run(
+    ledger: Store, monkeypatch: pytest.MonkeyPatch
+):
+    register_bytes(ledger, BAD, name="bad.ipynb")
+
+    def closed(store: Store) -> None:  # stderr piped into `head`, which has exited
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr("pseudorca.commands.audit.show_warnings", closed)
+    run(ledger, "check", "bad.ipynb", "--llm", "never", code=2)  # not 0: nothing was checked
+    assert verdicts(ledger) == []
 
 
 # ----- what the tables show ----------------------------------------------------------------------

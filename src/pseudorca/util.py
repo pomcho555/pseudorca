@@ -24,13 +24,19 @@ def new_ulid(min_ms: int = 0) -> str:
     store passes one more than the newest id it has seen, so a new event always sorts after them, even
     when this machine's clock is behind).
     """
-    ms = max(time.time_ns() // 1_000_000, min_ms)
-    if ms <= _last_ulid[0]:
-        ms = _last_ulid[0]
-        rnd = (_last_ulid[1] + 1) & _RAND_MASK
+    now = time.time_ns() // 1_000_000
+    if min_ms > now:
+        # a store whose newest event is ahead of this clock: order after it, but keep that future time out of
+        # the process-wide counter, so other stores this process writes to get ordinary ids
+        ms, rnd = min_ms, int.from_bytes(os.urandom(10), "big")
     else:
-        rnd = int.from_bytes(os.urandom(10), "big")
-    _last_ulid[0], _last_ulid[1] = ms, rnd
+        ms = now
+        if ms <= _last_ulid[0]:
+            ms = _last_ulid[0]
+            rnd = (_last_ulid[1] + 1) & _RAND_MASK
+        else:
+            rnd = int.from_bytes(os.urandom(10), "big")
+        _last_ulid[0], _last_ulid[1] = ms, rnd
     value = (ms << 80) | rnd
     chars = []
     for _ in range(26):

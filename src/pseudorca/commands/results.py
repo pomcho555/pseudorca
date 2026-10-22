@@ -479,7 +479,7 @@ def lb_cmd(
     store = ctx.store()
     with user_errors():
         st = store.state()
-        subs = sorted(st.subs.values(), key=lambda s: (str(s.date or s.updated or ""), s.id.zfill(20)))
+        subs = sorted(st.subs.values(), key=lambda s: (util.instant(s.date or s.updated), s.id.zfill(20)))
         noise = lb_noise(subs)
         if diff_refs:
             sub_a, sub_b = (_resolve_sub(st, ref) for ref in diff_refs)

@@ -9,6 +9,7 @@ string constants (base64/base85/hex, zlib/gzip/xz/lzma/bz2, tar/zip) become file
 from __future__ import annotations
 
 import contextlib
+import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from pseudorca.model import Notebook
     from pseudorca.store import Store
 
-EXTRACTOR_VERSION = 2  # bump when extraction output changes, so cached trees are rebuilt
+EXTRACTOR_VERSION = 3  # bump when extraction output changes, so cached trees are rebuilt
 FORMAT_SUFFIXES = {".ipynb": "ipynb", ".py": "script"}  # the only suffixes that pick the format
 
 
@@ -76,10 +77,17 @@ def extract_file(path: Path, limits: Limits | None = None) -> Tree:
 
 
 def tree_for(store: Store, nb: Notebook) -> Tree:
-    """The tree of a registered notebook: from cache/trees/<id>/ when fresh, else extracted and cached."""
+    """The tree of a registered notebook: from cache/trees/<id>/ when fresh, else extracted and cached.
+
+    The cache can arrive with a repository, so it is untrusted: a linked folder on the way to files/ is
+    refused (StoreError, from `Store.cache_dir`), and links inside the entry are removed before anything is
+    read or written there (only the links, never what they lead to).
+    """
     if not util.HEX_RE.match(nb.id or ""):
         raise StoreError(f"notebook id {str(nb.id)[:80]!r} is not a sha256")
-    cache = store.cache_dir("trees", nb.id)
+    files = store.cache_dir("trees", nb.id, "files")
+    cache = files.parent
+    _remove_links(cache, files)
     tree = Tree.load(cache)
     if (
         tree is not None
@@ -90,7 +98,7 @@ def tree_for(store: Store, nb: Notebook) -> Tree:
     data = _notebook_bytes(store, nb)
     tree = extract_bytes(data, _format_name(nb))
     tree.save(cache)
-    _prune(cache, tree)
+    _prune(files, tree)
     return tree
 
 
@@ -125,10 +133,25 @@ def _format_name(nb: Notebook) -> str:
     return next((n for n in names if suffix_format(n)), names[0] if names else "")
 
 
-def _prune(directory: Path, tree: Tree) -> None:
-    """Remove cached contents a previous extraction left behind and this tree no longer uses."""
+def _remove_links(cache: Path, files: Path) -> None:
+    """Remove the symlinks in a cache entry (the manifest, its temporary file, files/*): Tree.load would read
+    through them and Tree.save write through them, wherever they lead. Unlinking removes only the link."""
+    with os.scandir(files) as entries:
+        links = [Path(e.path) for e in entries if e.is_symlink()]
+    for p in (*links, cache / "manifest.json", cache / "manifest.json.tmp"):
+        if p.is_symlink():
+            p.unlink()
+
+
+def _prune(files: Path, tree: Tree) -> None:
+    """Remove cached contents a previous extraction left behind and this tree no longer uses: only regular
+    files directly inside files/ (never a link, a folder or what they lead to)."""
     keep = {f.sha256 for f in tree.files.values() if not f.binary}
-    with contextlib.suppress(OSError):
-        for p in (directory / "files").iterdir():
-            if p.name not in keep:
-                p.unlink()
+    if files.is_symlink() or not files.is_dir():
+        return
+    stale: list[str] = []
+    with contextlib.suppress(OSError), os.scandir(files) as entries:
+        stale = [e.path for e in entries if e.name not in keep and e.is_file(follow_symlinks=False)]
+    for path in stale:
+        with contextlib.suppress(OSError):
+            os.unlink(path)

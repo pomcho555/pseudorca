@@ -251,6 +251,16 @@ def test_openai_network_errors_become_llm_errors(monkeypatch: pytest.MonkeyPatch
     assert "localhost" in str(e.value) and "Connection refused" in str(e.value)
 
 
+def test_an_error_body_nested_too_deeply_is_still_an_llm_error(monkeypatch: pytest.MonkeyPatch):
+    body: Any = {}
+    for _ in range(100_000):
+        body = {"error": body}
+    install_openai(monkeypatch, [APIError("internal server error", 500, body)])
+    with pytest.raises(LLMError) as e:
+        judge_idea(IDEA, None, tree(), [], LOCAL)
+    assert "HTTP 500" in str(e.value) and "internal server error" in str(e.value)
+
+
 def test_openai_keys(monkeypatch: pytest.MonkeyPatch):
     install_openai(monkeypatch, [])
     with pytest.raises(LLMError) as e:

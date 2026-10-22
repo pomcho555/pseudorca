@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import random
+import re
 import string
 import subprocess
 import sys
@@ -11,6 +13,7 @@ import time
 
 import pytest
 
+from pseudorca.extract import extract_bytes
 from pseudorca.llm import LLMError, LLMSettings, ensure_allowed, load_settings
 from pseudorca.llm.backends import parse_json_reply
 from pseudorca.llm.redact import REDACTED, redact, redact_tree, redact_value
@@ -19,13 +22,15 @@ from pseudorca.llm.tools import (
     MAX_LIST,
     TOOL_SPECS,
     TRUNCATED,
+    ToolError,
     ToolHandler,
     anthropic_tools,
     openai_tools,
+    parse_arguments,
     parse_verdict,
 )
 from pseudorca.store import Store
-from pseudorca.tree import Tree
+from pseudorca.tree import Tree, split_lines
 
 ALNUM = string.ascii_letters + string.digits
 
@@ -231,6 +236,13 @@ def test_redact_kaggle_json_and_credentials_in_urls():
         "%set_env MY_SERVICE_KEY {v}",
         "export MY_SECRET={v}",
         "MY_TOKEN={v} python run.py",
+        # a notebook's shell escape (commented out by extraction), and shell commands inside strings
+        "# !MY_TOKEN={v} python train.py",
+        "!MY_TOKEN={v} python train.py",
+        "os.system('MY_TOKEN={v} python train.py')",
+        'subprocess.run("MY_TOKEN={v} python train.py", shell=True)',
+        "out = `MY_TOKEN={v} ./run.sh`",
+        'cmd = "cd /kaggle/working && MY_TOKEN={v} python train.py"',
     ],
 )
 def test_redact_generic_assignments_keep_the_name(template: str):
@@ -278,6 +290,27 @@ def test_redact_generic_assignments_keep_the_name(template: str):
         'train = pd.read_csv(join(pwd, "./data/train-set-2024.csv"))',
         'cache_key = f"{model_name}_{seed}_{temperature}"',
         'api_key: "${OPENAI_API_KEY}"',
+        # shell commands without secrets
+        "# !MAX_TOKENS=4096 python run.py",
+        "!pip install -q vllm==0.6.3",
+        'os.system("SECRET_NAME=my_hf_token_secret python run.py")',
+        'subprocess.run("PYTHONPATH=/kaggle/working/src python run.py", shell=True)',
+        "DB_PASSWORD=$DB_PASSWORD python app.py",
+        "!PASSWORD_AUTH=enabled python app.py",
+        # words on password lines that are code or settings, not passwords
+        "self.password = password",
+        "        self._password = password",
+        "password = user_password",
+        "password = dbPassword",
+        "self.passwd = password_mgr",
+        "password = args.password",
+        "password = DB_PASSWORD",
+        "password: Password",
+        "password: null",
+        "password_auth: enabled",
+        "password_hashing: bcrypt",
+        "passphrase_iterations: 100000",
+        "api_key: required",
     ],
 )
 def test_redact_leaves_ordinary_code_alone(text: str):
@@ -343,6 +376,8 @@ HOSTILE = {
     "an END header that never closes": lambda n: PEM_HEADER + "\n-----END " + "PRIVATE KEY " * (n // 12),
     "a run of -eyJ": lambda n: "-eyJ" * (n // 4),
     "a dotted name that never ends": lambda n: "a." * (n // 2),
+    "password lines with long names as values": lambda n: ("password: " + "a_" * 2000 + "a\n") * (n // 4012),
+    "password lines with long CamelCase values": lambda n: ("PASSWORD=" + "Aa" * 2000 + "\n") * (n // 4010),
 }
 
 
@@ -358,12 +393,119 @@ def test_redaction_takes_linear_time_on_hostile_text(kind: str):
         assert "PRIVATE KEY" not in out
 
 
+# runs in which an assignment can start after every separator; a value that ran on past the next separator
+# was scanned again from each of them
+SHELL_HOSTILE = ["a=&", "a=b&", "k1=v2&", "!a=&", "'a=", "a=b'", "://:a"]
+
+
+@pytest.mark.parametrize("unit", SHELL_HOSTILE)
+def test_shell_assignments_take_linear_time(unit: str):
+    text = unit * (1_000_000 // len(unit))
+    start = time.perf_counter()
+    out = redact(text)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"{elapsed:.2f} s for {len(text) // 1000} kB"  # linear: well under 0.2 s
+    assert out == text
+
+
+def _cells(*sources: str) -> bytes:
+    cells = [
+        {"cell_type": "code", "metadata": {}, "source": s, "outputs": [], "execution_count": 1}
+        for s in sources
+    ]
+    return json.dumps({"cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 5}).encode()
+
+
+def test_shell_escapes_and_shell_strings_in_a_notebook_are_redacted():
+    key = fake_secret("", 40, "0123456789abcdef")
+    data = _cells(
+        f"!WANDB_API_KEY={key} python train.py",
+        f"import os, subprocess\nos.system('WANDB_API_KEY={key} python train.py')\n"
+        f'subprocess.run("WANDB_API_KEY={key} python train.py", shell=True)\n',
+        f"%%bash\nWANDB_API_KEY={key} python train.py\n",
+    )
+    tree = extract_bytes(data, "train.ipynb")
+    assert any(key in tree.text(p) for p in tree.paths())
+    view = redact_tree(tree)
+    for path in view.paths():
+        assert key not in view.text(path), path
+    assert f"WANDB_API_KEY={REDACTED} python train.py" in view.text("cells/cell_000.py")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "redis.from_url('redis://{v}@cache:6379/0')",
+        "REDIS_URL=redis://{v}@cache:6379/0",
+        "redis_url: rediss://{v}@cache:6380",
+        'engine = create_engine("postgresql://{v}@db:5432/app")',
+    ],
+)
+@pytest.mark.parametrize("user", ["", "someone"])
+def test_redact_passwords_in_urls_with_or_without_a_user_name(template: str, user: str):
+    password = fake_secret("", 14)
+    out = redact(template.format(v=f"{user}:{password}"))
+    assert password not in out
+    assert out == template.format(v=REDACTED)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "DB_PASSWORD={v}",
+        "POSTGRES_PASSWORD: {v}",
+        "password = {v}",
+        "  - password: {v}  # the default",
+        "db.password={v}",
+        "PASSWORD={v} python app.py",
+        "# !DB_PASSWORD={v} python app.py",
+        "os.system('DB_PASSWORD={v} python app.py')",
+        "export DB_PASSWORD={v}",
+        "%env DB_PASSWORD={v}",
+    ],
+)
+@pytest.mark.parametrize(
+    "value", ["changeme", "supersecret", "letmein", "Changeme", "123456", "password1", "mypassword"]
+)
+def test_unquoted_passwords_are_redacted_like_quoted_ones(template: str, value: str):
+    assert redact(f'password = "{value}"') == f'password = "{REDACTED}"'
+    assert redact(template.format(v=value)) == template.format(v=REDACTED)
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r"])
+def test_redaction_keeps_every_kind_of_line_break(eol: str):
+    pem = _private_key().replace("\n", eol)
+    password = fake_secret("", 6, string.ascii_letters) + eol + fake_secret("", 7)
+    text = eol.join([f"KEY = '''{pem}'''", "x = 1", f'password = """{password}"""', "temperature = 0.2", ""])
+    out = redact(text)
+    assert "PRIVATE KEY" not in out
+    assert re.findall(r"\r\n|\r|\n", out) == re.findall(r"\r\n|\r|\n", text)
+    lines = split_lines(out)
+    assert len(lines) == len(split_lines(text)) and lines[-1] == "temperature = 0.2"
+    if eol == "\r":  # a triple-quoted value cannot hold \n, but it can hold a lone \r
+        assert password not in out and f'password = """{REDACTED}' in out
+
+
 def test_redact_value_handles_nested_data():
     secret = fake_secret("sk-", 48)
     data = {"messages": [{"content": f"key {secret}"}], "n": 3, "ok": True, "other": {secret}}
     out = redact_value(data)
     assert secret not in repr(out) and out["n"] == 3 and out["ok"] is True
     assert out["messages"][0]["content"] == f"key {REDACTED}"
+
+
+def _nested(depth: int, inner: object = None) -> object:
+    value = inner
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def test_redact_value_handles_deep_nesting():
+    secret = fake_secret("sk-", 48)
+    out = redact_value({"arguments": _nested(100_000, f"key {secret}"), "shallow": _nested(20, secret)})
+    text = json.dumps(out)  # deep nesting is cut off, so the result can be written as JSON
+    assert secret not in text and json.loads(text)["shallow"] == _nested(20, REDACTED)
 
 
 def test_redacted_view_has_the_same_paths_and_lines():
@@ -569,6 +711,56 @@ def test_verdict_arguments_and_json_replies():
         None,
         "the reply was not a valid JSON object with a status",
     )
+
+
+DEEP = "[" * 100_000 + "]" * 100_000
+
+
+def test_deeply_nested_json_is_a_parse_error_not_a_crash():
+    with pytest.raises(ToolError):
+        parse_arguments('{"text": ' + DEEP + "}")
+    assert parse_verdict('{"status": "present", "evidence": ' + DEEP + "}")[0] is None
+    assert parse_verdict({"status": "present", "evidence": DEEP})[0] is None  # evidence sent as a JSON string
+    assert parse_json_reply('{"status": "present", "evidence": ' + DEEP + "}")[0] is None
+    assert parse_json_reply('```json\n{"status": "present", "evidence": ' + DEEP + "}\n```")[0] is None
+    out = handler().run("grep", '{"text": ' + DEEP + "}")
+    assert out.startswith("error: the arguments") and "Recursion" not in out
+    # values an SDK has already parsed can be nested deeper than JSON can be written back
+    verdict, problem = parse_verdict({"status": "absent", "evidence": [], "reasoning": _nested(100_000)})
+    assert problem is None and verdict is not None and isinstance(verdict["reasoning"], str)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "<think>" * 20_000,  # think blocks that never close
+        "```" + "a" * 40_000,  # a code fence that never closes, after a long language tag
+        "<THINK>x</Think>" * 10_000 + "<think>" * 10_000,
+    ],
+)
+def test_json_replies_are_read_in_linear_time(reply: str):
+    start = time.perf_counter()
+    assert parse_json_reply(reply)[0] is None
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"{elapsed:.2f} s for {len(reply) // 1000} kB"  # linear: well under 0.1 s
+
+
+@pytest.mark.parametrize(
+    ("reply", "status"),
+    [
+        ('<THINK>{"status": "absent"}</Think>{"status": "partial"}', "partial"),  # a closed block is skipped
+        # a block runs to the first end after its start
+        ('<think>a <think>{"status": "absent"}</think>{"status": "partial"}', "partial"),
+        ('</think>{"status": "absent"}', "absent"),  # an end without a start is text
+        ('{"x": 1} <think>{"status": "present"}', "present"),  # a block that never closes is kept
+        ('```json\n{"status": "present"}\n```', "present"),
+        ('```\n{"status": "absent"}```', "absent"),
+        ('```json{"status": "absent"}```', "absent"),
+    ],
+)
+def test_think_blocks_and_fences_in_json_replies(reply: str, status: str):
+    v, _ = parse_json_reply(reply)
+    assert v is not None and v["status"] == status
 
 
 def test_importing_the_judge_loads_no_llm_sdk():

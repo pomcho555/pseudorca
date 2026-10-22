@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 import click
 
 from pseudorca import __version__
-from pseudorca.commands._common import Ctx
+from pseudorca.commands._common import Ctx, show_warnings
 from pseudorca.store import StoreError
 
 # name -> "module:attribute", in the order `pseudorca --help` lists them
@@ -37,18 +38,30 @@ class LazyGroup(click.Group):
         return list(COMMANDS)
 
     def invoke(self, ctx: click.Context) -> object:
-        """Run the command; expected failures become one-line errors (set PSEUDORCA_DEBUG=1 for tracebacks)."""
+        """Run the command, then print ledger warnings it has not shown. Expected failures become one-line
+        errors (set PSEUDORCA_DEBUG=1 for tracebacks)."""
         if os.environ.get("PSEUDORCA_DEBUG"):
-            return super().invoke(ctx)
+            return self._run(ctx)
         try:
-            return super().invoke(ctx)
-        except BrokenPipeError:  # output piped into `head` and closed early
-            sys.stderr.close()
+            return self._run(ctx)
+        except BrokenPipeError:  # output piped into `head` and closed early: exit quietly, no flush error
+            with contextlib.suppress(OSError, ValueError):
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
             raise SystemExit(0) from None
         except KeyError:
             raise
         except (StoreError, LookupError, ValueError, OSError) as e:
             raise click.ClickException(str(e) or type(e).__name__) from e
+
+    def _run(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        finally:
+            if sys.exc_info()[0] in (None, click.exceptions.Exit, SystemExit):
+                obj = ctx.find_object(Ctx)
+                if obj is not None and obj._store is not None:
+                    with contextlib.suppress(Exception):  # never let a warning hide the command's result
+                        show_warnings(obj._store)
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         target = COMMANDS.get(cmd_name)

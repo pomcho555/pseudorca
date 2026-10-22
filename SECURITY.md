@@ -14,8 +14,9 @@ that reading them is safe and that a team's code and results stay private.
   stores contents under their sha256.
 - **Code leaves your machine only when you allow it.** The LLM audit is off until you configure a model.
   Any endpoint that is not on localhost needs `allow_remote = true`, including the Anthropic API.
-  - A localhost endpoint is always contacted directly. It is never reached through a proxy configured in
-    your environment, and never by a redirect, so its requests cannot be carried to another host.
+  - A localhost endpoint of the OpenAI-compatible provider is always contacted directly. It is never reached
+    through a proxy configured in your environment, and never by a redirect, so its requests cannot be
+    carried to another host.
   - Before any text goes to an LLM, common secret formats are replaced with `[REDACTED]`:
     - API keys and tokens for OpenAI, Anthropic, GitHub, Hugging Face, Google, Slack and Kaggle;
     - AWS access keys and secret keys, including credentials files;

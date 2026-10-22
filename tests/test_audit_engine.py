@@ -6,7 +6,7 @@ import pytest
 
 import pseudorca.extract
 import pseudorca.llm
-from pseudorca.audit import engine
+from pseudorca.audit import engine, fingerprint, patch
 from pseudorca.audit.engine import audit_notebook, conclusive
 from pseudorca.audit.types import Evidence, Finding
 from pseudorca.llm import LLMError, LLMSettings
@@ -229,6 +229,73 @@ def test_an_older_pseudorca_never_redoes_a_newer_ones_verdicts(
     monkeypatch.setattr(pseudorca.llm, "PROMPT_VERSION", "10")  # same version, other model: asked
     rows = audit_notebook(store, nb, vague, settings=other, tree=present, judge=judge)
     assert judge.calls == ["vague", "vague"] and rows[0].effective.records[0].model == "fake:other"
+
+
+def test_deterministic_verdicts_record_their_matcher_version_and_a_matcher_upgrade_redoes_them(
+    store: Store, nb: Notebook, ideas: list[Idea], monkeypatch: pytest.MonkeyPatch
+):
+    assert fingerprint.MATCHER_VERSION == patch.MATCHER_VERSION == 2
+    low = ideas[:1]
+    present = make_tree(TREE_CODE)
+    reverted = make_tree("def answer(q):\n    return client.generate(q, temperature=0.7)\n")
+    audit_notebook(store, nb, low, llm_mode="never", tree=present)
+    extractor = pseudorca.extract.EXTRACTOR_VERSION
+    versions = [
+        (e["method"], e["detail"]["extractor_version"], e["detail"]["matcher_version"])
+        for e in verdict_events(store)
+    ]
+    assert versions == [("fingerprint", extractor, 2), ("patch", extractor, 2)]
+
+    # a fix to the patch matcher redoes the patch verdicts, and only those
+    monkeypatch.setattr(patch, "MATCHER_VERSION", 3)
+    rows = audit_notebook(store, nb, low, llm_mode="never", tree=reverted)
+    assert rows[0].skipped == ["fingerprint"] and [f.method for f in rows[0].findings] == ["patch"]
+    assert rows[0].findings[0].status == "absent" and rows[0].findings[0].detail["matcher_version"] == 3
+    # an older matcher never redoes a newer one's verdict, even with the same extractor
+    monkeypatch.setattr(patch, "MATCHER_VERSION", 2)
+    rows = audit_notebook(store, nb, low, llm_mode="never", tree=present)
+    assert rows[0].skipped == ["fingerprint", "patch"] and rows[0].findings == []
+    assert rows[0].effective.status == "conflict"  # fingerprint (matcher 2) present, patch (matcher 3) absent
+    # a newer extractor still counts first: (extractor, matcher) compare in that order
+    monkeypatch.setattr(pseudorca.extract, "EXTRACTOR_VERSION", extractor + 1)
+    monkeypatch.setattr(patch, "MATCHER_VERSION", 1)
+    rows = audit_notebook(store, nb, low, llm_mode="never", tree=present)
+    assert rows[0].skipped == [] and rows[0].effective.status == "present"
+
+
+def test_verdicts_recorded_before_matcher_versions_existed_are_redone(store: Store, nb: Notebook):
+    idea = add_idea(store, "old-run", fingerprints=("temperature=0.2",))
+    store.append(
+        "audit.verdict",
+        {
+            "nb": nb.id,
+            "idea": idea.id,
+            "idea_rev": idea.rev,
+            "status": "absent",
+            "method": "fingerprint",
+            "detail": {"extractor_version": pseudorca.extract.EXTRACTOR_VERSION},  # no matcher_version
+        },
+    )
+    rows = audit_notebook(store, nb, [idea], llm_mode="never", tree=make_tree(TREE_CODE))
+    assert rows[0].skipped == [] and rows[0].effective.status == "present"
+    rows = audit_notebook(store, nb, [idea], llm_mode="never", tree=make_tree(TREE_CODE))
+    assert rows[0].skipped == ["fingerprint"]
+
+
+def test_each_model_is_asked_once_per_prompt_version(store: Store, nb: Notebook, ideas: list[Idea]):
+    """Two teammates with different models at the same prompt version: each model is asked once, and the
+    verdict that counts no longer flips with every audit."""
+    judge = FakeJudge()
+    tree = make_tree(TREE_CODE)
+    a, b = LLMSettings(provider="fake", model="a"), LLMSettings(provider="fake", model="b")
+    effective = []
+    for settings in (a, b, a, b, a):
+        st = Store.at(store.root)
+        rows = audit_notebook(st, nb, [st.state().ideas["vague"]], settings=settings, tree=tree, judge=judge)
+        effective.append(rows[0].effective.records[0].model)
+    assert judge.calls == ["vague", "vague"]
+    assert effective == ["fake:a", "fake:b", "fake:b", "fake:b", "fake:b"]
+    assert rows[0].skipped == ["llm"]
 
 
 def test_an_audit_replays_the_ledger_at_most_once(

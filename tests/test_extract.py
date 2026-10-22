@@ -89,6 +89,66 @@ def payload_files(tree: Tree, cell: int = 0) -> list[str]:
     return tree.paths(f"payloads/cell_{cell:03d}/*")
 
 
+def with_alone_dict(stream: bytes, size: int) -> bytes:
+    """An lzma-alone stream whose header declares another dictionary size (the data needs no more than its
+    own length, so it still decodes)."""
+    return stream[:1] + size.to_bytes(4, "little") + stream[5:]
+
+
+def with_xz_dict(stream: bytes, code: int) -> bytes:
+    """A one-block xz stream, as lzma.compress makes it, whose LZMA2 filter declares dictionary `code`
+    (32 = 256 MiB, 36 = 1 GiB, 40 = 4 GiB - 1); the block header's CRC32 is recomputed."""
+    out = bytearray(stream)
+    end = 12 + (out[12] + 1) * 4
+    at = out.index(b"\x21\x01", 14, end - 4) + 2
+    out[at] = code
+    out[end - 4 : end] = zlib.crc32(out[12 : end - 4]).to_bytes(4, "little")
+    return bytes(out)
+
+
+def _vli(n: int) -> bytes:
+    out = bytearray()
+    while n >= 0x80:
+        out.append(n & 0x7F | 0x80)
+        n >>= 7
+    return bytes([*out, n])
+
+
+def xz_blocks(chunks: list[bytes], code: int, *, sizes: bool) -> bytes:
+    """An xz stream built by hand with one LZMA2 block per chunk, each header declaring dictionary `code`
+    and, with `sizes`, the block's compressed and uncompressed size (as multi-threaded xz writes them)."""
+    flags = b"\x00\x01"  # CRC32 checks
+    out = bytearray(b"\xfd7zXZ\x00" + flags + zlib.crc32(flags).to_bytes(4, "little"))
+    records = []
+    for chunk in chunks:
+        packed = lzma.compress(
+            chunk, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 16}]
+        )
+        body = bytes([0xC0 if sizes else 0x00])
+        body += (_vli(len(packed)) + _vli(len(chunk)) if sizes else b"") + bytes([0x21, 0x01, code])
+        size = -(-(len(body) + 5) // 4) * 4
+        header = bytes([size // 4 - 1]) + body
+        header += bytes(size - 4 - len(header))
+        header += zlib.crc32(header).to_bytes(4, "little")
+        out += header + packed + bytes(-len(packed) % 4) + zlib.crc32(chunk).to_bytes(4, "little")
+        records.append((len(header) + len(packed) + 4, len(chunk)))
+    index = bytearray(b"\x00" + _vli(len(records)))
+    for unpadded, unpacked in records:
+        index += _vli(unpadded) + _vli(unpacked)
+    index += bytes(-len(index) % 4)
+    index += zlib.crc32(index).to_bytes(4, "little")
+    backward = (len(index) // 4 - 1).to_bytes(4, "little")
+    out += index + zlib.crc32(backward + flags).to_bytes(4, "little") + backward + flags + b"YZ"
+    return bytes(out)
+
+
+def symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links cannot be made here")
+
+
 # ----- cells and magics ------------------------------------------------------------------------------
 
 
@@ -360,6 +420,41 @@ def test_written_python_is_scanned_for_payloads():
     assert t.files[path].origin == "cell 0 > write_text gen.py > line 2 str > base64 > zlib"
 
 
+def test_written_files_that_are_not_python_are_searched_for_payloads():
+    # %%writefile searched a written run.sh or config for payloads; write_text and open().write did not,
+    # and nothing written as bytes was searched at all, not even Python
+    src = py_source("written")
+    blob = b64(src.encode())
+    sh = f"#!/bin/bash\\necho {blob} | base64 -d > helper.py\\n"
+    t = extract(
+        f'from pathlib import Path\nPath("run.sh").write_text("{sh}")\n',
+        f'with open("cfg.yaml", "w") as f:\n    f.write("name: x\\nblob: {blob}\\n")\n',
+        f'open("log.sh", "w").write("#!/bin/bash\\n")\nopen("log.sh", "a").write("echo {blob}\\n")\n',
+        f'open("run.sh", "wb").write(b"{sh}")\n',
+        f'from pathlib import Path\nPath("gen.py").write_bytes(b"import base64\\nBLOB = \'{blob}\'\\n")\n',
+        f"%%writefile run.sh\n#!/bin/bash\necho {blob} | base64 -d > helper.py\n",
+    )
+    origins = [
+        "cell 0 > write_text run.sh > line 2 str > base64",
+        "cell 1 > open().write cfg.yaml > line 2 str > base64",
+        "cell 2 > open().write log.sh > line 2 str > base64",  # the append continues the file's lines
+        "cell 3 > open().write run.sh > line 2 str > base64",
+        "cell 4 > write_bytes gen.py > line 2 str > base64",
+        "cell 5 > %%writefile run.sh > line 2 str > base64",  # as before: the same content, the same payload
+    ]
+    for cell, origin in enumerate(origins):
+        (path,) = payload_files(t, cell)
+        assert t.text(path) == src and t.files[path].origin == origin, cell
+    assert t.warnings == []
+
+    # max_nesting bounds written files that are not Python too
+    t = extract(
+        f'from pathlib import Path\nPath("run.sh").write_text("{sh}")\n', limits=Limits(max_nesting=0)
+    )
+    assert payload_files(t) == []
+    assert t.warnings == ["cell 0 > write_text run.sh: not searched for nested payloads (max_nesting 0)"]
+
+
 # ----- payloads --------------------------------------------------------------------------------------
 
 
@@ -582,6 +677,76 @@ def test_hostile_payloads_never_raise():
     assert not any("extraction failed" in w or "not decoded (" in w for w in t.warnings)
 
 
+def test_big_lzma_dictionaries_are_decoded_within_the_memory_limit():
+    # a header may declare any dictionary size, and lzma.decompress has no memory limit: a stream that
+    # declared 128 MiB or more once vanished from the tree, without a warning
+    src = py_source("big_dict").encode()
+    small = [{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 16}]
+    alone = lzma.compress(
+        src, format=lzma.FORMAT_ALONE, filters=[{"id": lzma.FILTER_LZMA1, "dict_size": 1 << 16}]
+    )
+    bcj = lzma.compress(src, filters=[{"id": lzma.FILTER_X86}, *small])  # two filters in the block header
+    cases = [
+        with_alone_dict(alone, 256 << 20),
+        with_alone_dict(alone, 3 << 30),
+        with_xz_dict(lzma.compress(src, filters=small), 36),  # 1 GiB
+        with_xz_dict(bcj, 40),  # 4 GiB - 1
+        xz_blocks([src[:3000], src[3000:]], 32, sizes=True),  # 256 MiB in every block header
+    ]
+    assert lzma.decompress(xz_blocks([src[:3000], src[3000:]], 4, sizes=True)) == src  # the builder is sound
+    t = extract(*(f"X = '{b64(c)}'\n" for c in cases))
+    for cell in range(len(cases)):
+        assert t.text(f"payloads/cell_{cell:03d}/0.py") == src.decode(), cell
+        assert t.files[f"payloads/cell_{cell:03d}/0.py"].origin == f"cell {cell} > line 1 str > base64 > lzma"
+    assert t.warnings == []
+
+    # past max_depth such a stream is still recognised and kept as a binary file
+    t = extract(f"X = '{b64(cases[2])}'\n", limits=Limits(max_depth=1))
+    assert payload_files(t) == ["payloads/cell_000/0.xz"] and t.files["payloads/cell_000/0.xz"].binary
+    assert t.warnings == ["cell 0 > line 1 str > base64 > lzma: not decompressed (max_depth 1 reached)"]
+
+
+def test_lzma_dictionaries_too_big_even_when_lowered_are_kept_with_a_warning():
+    # with max_payload_bytes this high, a dictionary big enough for the output would pass LZMA_MEMLIMIT
+    src = py_source("too_big").encode()
+    alone = lzma.compress(
+        src, format=lzma.FORMAT_ALONE, filters=[{"id": lzma.FILTER_LZMA1, "dict_size": 1 << 16}]
+    )
+    single = with_xz_dict(lzma.compress(src, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 16}]), 36)
+    cases = [
+        with_alone_dict(alone, 256 << 20),
+        single,
+        f"X = {single!r}\n",
+        with_alone_dict(alone, 0xFFFF0000),  # not a size an lzma header can have: not lzma at all
+    ]
+    limits = Limits(max_payload_bytes=200 << 20)
+    t = extract(*(c if isinstance(c, str) else f"X = '{b64(c)}'\n" for c in cases), limits=limits)
+    limit = payloads.LZMA_MEMLIMIT
+    assert t.paths("payloads/*") == [
+        "payloads/cell_000/0.lzma",
+        "payloads/cell_001/0.xz",
+        "payloads/cell_002/0.xz",
+    ]
+    assert all(t.files[p].binary for p in t.paths("payloads/*"))
+    assert t.warnings == [
+        f"cell 0 > line 1 str > base64 > lzma: not decompressed (its dictionary needs more than "
+        f"LZMA_MEMLIMIT, {limit} bytes)",
+        f"cell 1 > line 1 str > base64 > lzma: not decompressed (its dictionary needs more than "
+        f"LZMA_MEMLIMIT, {limit} bytes)",
+        f"cell 2 > line 1 bytes > lzma: not decompressed (its dictionary needs more than "
+        f"LZMA_MEMLIMIT, {limit} bytes)",
+    ]
+
+    # the blocks after the first are found only through the sizes their headers record: without them the
+    # second block's dictionary stays as declared, and the stream is kept with a warning
+    t = extract(f"X = '{b64(xz_blocks([src[:3000], src[3000:]], 32, sizes=False))}'\n")
+    assert payload_files(t) == ["payloads/cell_000/0.xz"]
+    assert t.warnings == [
+        f"cell 0 > line 1 str > base64 > lzma: not decompressed (its dictionary needs more than "
+        f"LZMA_MEMLIMIT, {limit} bytes)"
+    ]
+
+
 def test_quoted_string_scan_takes_linear_time():
     # an opening quote followed by many escaped ones once made every escaped quote rescan the line: O(n²)
     n = 6000
@@ -774,6 +939,86 @@ def test_tree_for_caches_and_rebuilds_on_version_bump(store: Store, monkeypatch:
     assert calls == ["main.ipynb"] and rebuilt.meta["extractor_version"] == EXTRACTOR_VERSION + 1
     tree_for(store, nb)
     assert len(calls) == 1
+
+
+def test_tree_for_refuses_linked_cache_folders(store: Store, tmp_path: Path):
+    # a cache entry can arrive with the repository: a linked files/ under a stale manifest once made
+    # tree_for write into, and then empty, a folder of the link's choosing
+    nb, _ = register_bytes(store, notebook("x = 1\n"), name="main.ipynb")
+    docs = tmp_path / "home" / "Documents"
+    docs.mkdir(parents=True)
+    for name in ("notes.txt", "thesis.docx"):
+        (docs / name).write_text("keep me\n")
+    entry = store.root / "cache" / "trees" / nb.id
+    entry.mkdir(parents=True)
+    stale = {
+        "format": 1,
+        "source_sha256": nb.id,
+        "meta": {"extractor_version": 1},
+        "warnings": [],
+        "files": [],
+    }
+    (entry / "manifest.json").write_text(json.dumps(stale))
+    for link in (entry / "files", entry, entry.parent, store.root / "cache"):  # files/, <id>/, trees/, cache/
+        shutil.rmtree(link, ignore_errors=True)
+        symlink(link, docs)
+        with pytest.raises(StoreError) as e:
+            tree_for(store, nb)
+        assert link.name in str(e.value)
+        assert sorted(p.name for p in docs.iterdir()) == ["notes.txt", "thesis.docx"], link
+        link.unlink()
+    assert tree_for(store, nb).text("cells/cell_000.py") == "x = 1\n"
+
+
+def test_tree_for_never_follows_links_inside_its_cache_entry(store: Store, tmp_path: Path):
+    nb, _ = register_bytes(store, notebook("x = 1\n"), name="main.ipynb")
+    fresh = tree_for(store, nb)
+    entry = store.root / "cache" / "trees" / nb.id
+    content = entry / "files" / fresh.files["cells/cell_000.py"].sha256
+
+    # a content file linked to a file elsewhere is neither read nor kept
+    secret = tmp_path / "credentials"
+    secret.write_text("aws_secret_access_key = outside\n")
+    content.unlink()
+    symlink(content, secret)
+    assert tree_for(store, nb).text("cells/cell_000.py") == "x = 1\n"
+    assert not content.is_symlink() and secret.read_text() == "aws_secret_access_key = outside\n"
+
+    # dangling links where the next save writes (a content file, the temporary manifest): nothing is created
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    content.unlink()
+    symlink(content, planted / "content")
+    symlink(entry / "manifest.json.tmp", planted / "manifest")
+    assert tree_for(store, nb).text("cells/cell_000.py") == "x = 1\n"
+    assert list(planted.iterdir()) == []
+    assert not content.is_symlink() and not (entry / "manifest.json").is_symlink()
+
+    # a linked manifest is not read either, even one that looks fresh
+    crafted = tmp_path / "crafted.json"
+    planted_manifest = {
+        "format": 1,
+        "source_sha256": nb.id,
+        "meta": {"extractor_version": EXTRACTOR_VERSION},
+        "warnings": ["planted"],
+        "files": [],
+    }
+    crafted.write_text(json.dumps(planted_manifest))
+    (entry / "manifest.json").unlink()
+    symlink(entry / "manifest.json", crafted)
+    t = tree_for(store, nb)
+    assert t.paths() == ["cells/cell_000.py"] and t.warnings == []
+    assert not (entry / "manifest.json").is_symlink() and json.loads(crafted.read_text()) == planted_manifest
+
+    # a rebuild removes stale contents, but only regular files directly inside files/
+    stale = entry / "files" / ("0" * 64)
+    stale.write_text("stale\n")
+    (entry / "files" / "sub").mkdir()
+    (entry / "files" / "sub" / "inner.txt").write_text("not a cached content\n")
+    (entry / "manifest.json").unlink()
+    tree_for(store, nb)
+    assert not stale.exists()
+    assert (entry / "files" / "sub" / "inner.txt").read_text() == "not a cached content\n"
 
 
 def test_tree_for_reads_no_store_notebooks_from_their_path(store: Store):

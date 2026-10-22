@@ -30,7 +30,10 @@ if TYPE_CHECKING:
     from pseudorca.extract import Limits
 
 MIN_DECODED = 32  # bytes a text decoding (base64, ...) must yield to count
-LZMA_MEMLIMIT = 128 << 20  # xz/lzma decoder memory; enough for `xz -9`, refuses absurd dictionary sizes
+# xz/lzma decoder memory: enough for `xz -9`. A dictionary declared bigger is first lowered to what the output
+# cap can use (_fit_dictionary), so only an output cap of 96 MiB or more can still run into this limit.
+LZMA_MEMLIMIT = 128 << 20
+OVER_MEMLIMIT = "a dictionary over LZMA_MEMLIMIT"  # decompress()'s problem when a stream needs more
 MAX_STREAMS = 64  # concatenated compressed streams followed in one payload (`cat a.gz b.gz`, pbzip2)
 DECOMPRESS_WINDOW = 64 << 10  # compressed input given to a decompressor at a time
 
@@ -370,6 +373,10 @@ class _NotDecodable(Exception):
     """The bytes only look like the format their magic bytes announce."""
 
 
+class _OverMemlimit(Exception):
+    """A real xz or lzma stream (liblzma read its headers) that needs more memory than LZMA_MEMLIMIT."""
+
+
 def _decompressor(kind: str) -> Any:
     if kind == "zlib":
         return zlib.decompressobj()
@@ -380,27 +387,171 @@ def _decompressor(kind: str) -> Any:
     return lzma.LZMADecompressor(format=lzma.FORMAT_AUTO, memlimit=LZMA_MEMLIMIT)
 
 
+# ----- lzma dictionaries -----------------------------------------------------------------------------
+
+_XZ_CHECK_SIZE = (0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64)  # by the stream's check type
+_LZMA2_FILTER = 0x21
+_ALONE_UNKNOWN_SIZE = (1 << 64) - 1
+# xz block headers looked at per stream. Multi-threaded xz writes a block per 3 dictionaries of input, so a
+# stream with a dictionary over LZMA_MEMLIMIT has one block unless it was split on purpose; the cap keeps a
+# chain of tiny blocks from costing a Python loop per block.
+MAX_FITTED_BLOCKS = 256
+
+
+def _dict_size(code: int) -> int:
+    """The dictionary size an LZMA2 property byte (0-40) declares: 2^n or 3 * 2^(n-1) bytes, 40 = 4 GiB - 1."""
+    return 0xFFFFFFFF if code == 40 else (2 | (code & 1)) << (code // 2 + 11)
+
+
+def _dict_code(size: int) -> int:
+    """The smallest LZMA2 property byte that declares at least `size` bytes."""
+    return next((code for code in range(40) if _dict_size(code) >= size), 40)
+
+
+def _fit_dictionary(kind: str, data: memoryview, pos: int, need: int) -> list[tuple[int, bytes]]:
+    """Header patches for the xz or lzma stream at `pos` that lower each dictionary of LZMA_MEMLIMIT or more
+    to the smallest size that holds `need` bytes; [] when there is nothing to lower or lowering would not help.
+
+    A decoder never refers further back than what it has decoded, and decompress() stops after `need` bytes,
+    so the output is the same: the header's size only decides how much memory liblzma reserves. Only headers
+    liblzma would accept are changed (it checks everything again): an lzma-alone header that passes its
+    plausibility checks, and xz block headers whose CRC32 holds (then recomputed). Blocks are found without
+    decoding: the first one, and each next one while the one before records its compressed size.
+    """
+    code = _dict_code(need)
+    if _dict_size(code) >= LZMA_MEMLIMIT:
+        return []
+    if kind == "lzma":
+        return _fit_alone(data, pos, _dict_size(code))
+    return _fit_xz(data, pos, code)
+
+
+def _is_dict_size(n: int) -> bool:
+    """2^n or 3 * 2^(n-1): the sizes liblzma accepts in an lzma-alone header, besides 4 GiB - 1."""
+    third = n // 3 if n % 3 == 0 else 0
+    return n > 0 and (n & (n - 1) == 0 or (third > 0 and third & (third - 1) == 0))
+
+
+def _fit_alone(data: memoryview, pos: int, size: int) -> list[tuple[int, bytes]]:
+    head = bytes(data[pos : pos + 13])  # properties, dictionary size, uncompressed size (little-endian)
+    if len(head) < 13 or head[0] >= 9 * 5 * 5:
+        return []
+    declared = int.from_bytes(head[1:5], "little")
+    unpacked = int.from_bytes(head[5:13], "little")
+    # liblzma's checks for a format without magic bytes: a dictionary size the format can declare, and an
+    # uncompressed size that is unknown or under 256 GiB
+    if not (declared == 0xFFFFFFFF or _is_dict_size(declared)):
+        return []
+    if unpacked != _ALONE_UNKNOWN_SIZE and unpacked >= 1 << 38:
+        return []
+    return [(pos + 1, size.to_bytes(4, "little"))] if declared >= LZMA_MEMLIMIT else []
+
+
+def _fit_xz(data: memoryview, pos: int, code: int) -> list[tuple[int, bytes]]:
+    head = bytes(data[pos : pos + 12])  # magic, flags, CRC32 of the flags
+    if len(head) < 12 or head[6] or head[7] > 0x0F:
+        return []
+    if zlib.crc32(head[6:8]) != int.from_bytes(head[8:], "little"):
+        return []
+    check = _XZ_CHECK_SIZE[head[7]]
+    patches: list[tuple[int, bytes]] = []
+    p = pos + 12
+    for _ in range(MAX_FITTED_BLOCKS):
+        if p >= len(data) or not data[p]:  # a 0 here starts the index: no more blocks
+            break
+        n = (data[p] + 1) * 4
+        header = bytearray(data[p : p + n])
+        if len(header) < n or zlib.crc32(header[:-4]) != int.from_bytes(header[-4:], "little"):
+            break
+        parsed = _block_header(header)
+        if parsed is None:
+            break
+        packed, props = parsed
+        big = [i for i in props if header[i] <= 40 and _dict_size(header[i]) >= LZMA_MEMLIMIT]
+        if big:
+            for i in big:
+                header[i] = code
+            header[-4:] = zlib.crc32(header[:-4]).to_bytes(4, "little")
+            patches.append((p, bytes(header)))
+        if packed is None:
+            break
+        p += len(header) + packed
+        p += -(p - pos) % 4 + check  # block padding, then the block's check
+    return patches
+
+
+def _block_header(header: bytearray) -> tuple[int | None, list[int]] | None:
+    """(compressed size if recorded, offsets of the LZMA2 property bytes) of an xz block header, or None."""
+    flags, end = header[1], len(header) - 4
+    if flags & 0x3C:  # reserved bits
+        return None
+    try:
+        i, packed = 2, None
+        if flags & 0x40:
+            packed, i = _vli(header, i, end)
+        if flags & 0x80:
+            _, i = _vli(header, i, end)
+        props = []
+        for _ in range((flags & 3) + 1):
+            filter_id, i = _vli(header, i, end)
+            n, i = _vli(header, i, end)
+            if i + n > end:
+                return None
+            if filter_id == _LZMA2_FILTER and n == 1:
+                props.append(i)
+            i += n
+    except ValueError:
+        return None
+    return packed, props
+
+
+def _vli(buf: bytearray, i: int, end: int) -> tuple[int, int]:
+    """An xz variable-length integer at buf[i:end]: (value, the index after it). Raises ValueError."""
+    value = 0
+    for k in range(9):
+        if i + k >= end:
+            break
+        b = buf[i + k]
+        value |= (b & 0x7F) << (7 * k)
+        if b < 0x80:
+            return value, i + k + 1
+    raise ValueError("not a variable-length integer")
+
+
 def decompress(kind: str, data: bytes, cap: int) -> tuple[bytes, str]:
     """At most `cap` bytes of decompressed output (never more than cap + 1 are produced), plus what went
     wrong: "", "truncated", "damaged stream", "stream ended early", "empty stream" (a stream that decodes
-    to nothing ends the decoding) or "more than MAX_STREAMS streams". Concatenated streams are followed, up
-    to MAX_STREAMS of them. Raises _NotDecodable when nothing decodes at all.
+    to nothing ends the decoding), OVER_MEMLIMIT or "more than MAX_STREAMS streams". Concatenated streams
+    are followed, up to MAX_STREAMS of them. Raises _OverMemlimit when the first xz or lzma stream needs
+    more than LZMA_MEMLIMIT before any output, and _NotDecodable when nothing decodes at all.
 
     The input is fed a window at a time, so the end of a stream copies at most a window of what follows,
-    and the time stays linear in the input however many streams it holds.
+    and the time stays linear in the input however many streams it holds. A dictionary too big for
+    LZMA_MEMLIMIT is first lowered to what the output can use (`_fit_dictionary`), in a copy of the input.
     """
-    view = memoryview(data)
+    buf: bytes | bytearray = data
+    view = memoryview(buf)
     chunks: list[bytes] = []
     size = pos = 0
     problem = ""
     for _ in range(MAX_STREAMS):
+        if kind in ("xz", "lzma"):
+            patches = _fit_dictionary(kind, view, pos, cap + 1 - size)
+            if patches and not isinstance(buf, bytearray):
+                buf = bytearray(data)
+                view = memoryview(buf)
+            for at, new in patches:
+                buf[at : at + len(new)] = new
         d = _decompressor(kind)
         before = size
         while not problem:
             window = view[pos : pos + DECOMPRESS_WINDOW]
             try:
                 chunk = d.decompress(window, cap + 1 - size)  # max_length >= 1 (0 means "no limit" to zlib)
-            except (zlib.error, lzma.LZMAError, OSError, EOFError, ValueError):
+            except lzma.LZMAError as e:
+                problem = OVER_MEMLIMIT if "memory usage limit" in str(e).lower() else "damaged stream"
+                break
+            except (zlib.error, OSError, EOFError, ValueError):
                 problem = "damaged stream"
                 break
             chunks.append(chunk)
@@ -417,7 +568,7 @@ def decompress(kind: str, data: bytes, cap: int) -> tuple[bytes, str]:
                     problem = "stream ended early"
         if problem:
             break
-        follows = pos < len(data) and sniff(data[pos : pos + 512]) == kind
+        follows = pos < len(buf) and sniff(buf[pos : pos + 512]) == kind
         if size == before:  # an empty stream: hostile input repeats them, and they cost no output
             if follows:
                 problem = "empty stream"
@@ -427,7 +578,7 @@ def decompress(kind: str, data: bytes, cap: int) -> tuple[bytes, str]:
     else:
         problem = f"more than {MAX_STREAMS} streams"
     if not size:
-        raise _NotDecodable(kind)
+        raise _OverMemlimit(kind) if problem == OVER_MEMLIMIT else _NotDecodable(kind)
     return b"".join(chunks), problem
 
 
@@ -514,18 +665,23 @@ class Decoder:
     def _inflate(self, kind: str, data: bytes, origin: str, depth: int) -> Result | None:
         step = f"{origin} > {STEP_NAMES.get(kind, kind)}"
         cap = min(self.limits.max_payload_bytes, self.budget.total_left)
+        item = Item(origin, data=data, ext=COMPRESSED_EXT[kind])  # kept as it is when not decompressed
         if depth >= self.limits.max_depth or cap <= 0:
             try:
                 decompress(kind, data, 64)  # only keep it if it really is that format
+            except _OverMemlimit:
+                pass  # liblzma read its headers: it is
             except _NotDecodable:
                 return None
             why = (
                 f"max_depth {self.limits.max_depth}" if depth >= self.limits.max_depth else "max_total_bytes"
             )
-            item = Item(origin, data=data, ext=COMPRESSED_EXT[kind])
             return Result([item], [f"{step}: not decompressed ({why} reached)"])
         try:
             out, problem = decompress(kind, data, cap)
+        except _OverMemlimit:
+            why = f"its dictionary needs more than LZMA_MEMLIMIT, {LZMA_MEMLIMIT} bytes"
+            return Result([item], [f"{step}: not decompressed ({why})"])
         except _NotDecodable:
             return None
         self.budget.total_left -= len(out)

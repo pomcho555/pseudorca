@@ -49,8 +49,13 @@ Every event file has this shape:
   - The `time` field keeps the writer's wall clock (with its offset) for display. Displays convert it to
     the viewer's time zone.
 - **Conflicts:** concurrent edits resolve last-writer-wins per field, and lists are replaced whole.
-  - Exception: a second `nb.add` of the same notebook (registered on two clones before a pull) merges.
-    Tags and applies are unioned, and empty fields are filled; nothing already recorded is wiped.
+  - Exception: a second `nb.add` of the same notebook merges. This covers both registering it on two clones
+    before a pull and re-adding it later with more metadata.
+    - Tags and applies are unioned, and empty fields are filled.
+    - Another name becomes an alias that still resolves, and a different note is appended.
+    - Nothing already recorded is wiped.
+    - Re-registering therefore writes an `nb.add` that carries only what it adds. `nb update` is for
+      deliberate changes.
 - **Forward compatibility:** unknown event types, unknown fields and a newer `schema` are ignored with
   one warning each, so older versions can read newer stores.
 - **Validation:**
@@ -58,6 +63,10 @@ Every event file has this shape:
     a non-sha256 `patch` or `results`, or a score that is not a finite number.
   - Blob ids must be sha256 before they become paths, and blob bytes are checked against their name on
     read. A Git LFS pointer or a line-ending conversion is an error, not a wrong verdict.
+  - Adding the original file again rewrites a missing or damaged blob.
+  - The local cache is untrusted too:
+    - cache folders must not be symlinks or lead outside `.pseudorca/cache`;
+    - a cached tree is used only when its content names are sha256 hashes of regular files.
 - Because every event is a new file, git merges never conflict.
 
 | type | data |
@@ -380,11 +389,17 @@ the sections and `passed`.
 Heavy imports (`numpy`, `openai`, `anthropic`, `kaggle`) happen inside the functions that need them.
 
 `pseudorca init` creates a store or completes a partial one (for example a clone without `events/`).
-It never overwrites existing files such as a committed `config.toml`.
+- It never overwrites existing files such as a committed `config.toml`.
+- Without `--name`, the name is left out of `config.toml`; it defaults to the repository folder's name.
+  Two clones that run `init` with the same options therefore write identical files.
 
 Expected failures become one-line errors in every command: store errors, `LookupError`, `ValueError`
 and `OSError`.
 - `cli.LazyGroup.invoke` does this around each command, and `commands._common.user_errors()` does it inside
   a command, for any extra exception types passed to it.
 - Set `PSEUDORCA_DEBUG=1` to see tracebacks.
+- After a command finishes, any ledger warning it has not shown yet is printed once to stderr. This covers
+  replay warnings and the clock-skew note.
+- When output is piped into a reader that closes early, such as `head`, the command ends quietly with code
+  0. `check` keeps its own exit code in that case.
 - Raise `LookupError` or `ValueError` for user mistakes, never `KeyError`, which is treated as a bug.

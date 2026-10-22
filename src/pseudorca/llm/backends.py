@@ -158,7 +158,12 @@ def _api_key(settings: LLMSettings, default_env: str) -> str | None:
 
 def _error_text(e: BaseException) -> str:
     body = getattr(e, "body", None)
-    return f"{e} {json.dumps(body, default=str)}" if body is not None else str(e)
+    if body is None:
+        return str(e)
+    try:
+        return f"{e} {json.dumps(body, default=str)}"
+    except (TypeError, ValueError, RecursionError):  # a body nested deeper than the recursion limit
+        return str(e)
 
 
 def _rejects(e: BaseException, word: str) -> bool:
@@ -519,16 +524,39 @@ def make_backend(settings: LLMSettings) -> Backend:
 
 # ----- replies written as text ---------------------------------------------------------------------
 
-_THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
-_FENCE = re.compile(r"```[A-Za-z]*[ \t]*\n?(.*?)```", re.S)
+_THINK_TAG = re.compile(r"<(/?)think>", re.I)
+# the language tag and the spaces after it are possessive: giving them back cannot make a fence close, and
+# retrying would scan the rest of the reply once for every character of an unclosed fence's tag
+_FENCE = re.compile(r"```[A-Za-z]*+[ \t]*+\n?(.*?)```", re.S)
+
+
+def _without_think(text: str) -> str:
+    """`text` without its <think>...</think> blocks, each from a <think> to the next </think>.
+
+    A block that never closes stays, and so does a </think> without a start. One pass over the tags, so a
+    reply full of unclosed tags takes linear time (a lazy <think>.*?</think> scans to the end from each).
+    """
+    parts: list[str] = []
+    pos = 0
+    start: int | None = None
+    for tag in _THINK_TAG.finditer(text):
+        if not tag.group(1):
+            if start is None:
+                start = tag.start()
+        elif start is not None:
+            parts.append(text[pos:start])
+            pos, start = tag.end(), None
+    parts.append(text[pos:])
+    return "".join(parts)
 
 
 def parse_json_reply(text: str) -> tuple[dict[str, Any] | None, str | None]:
     """A {status, evidence, reasoning} verdict from a text reply: code fences first, then the whole reply.
 
-    <think> blocks are skipped. Returns (None, what is wrong) when no valid verdict object is found.
+    <think> blocks are skipped. Returns (None, what is wrong) when no valid verdict object is found, also
+    when the reply's JSON is nested deeper than Python's recursion limit.
     """
-    body = _THINK.sub("", text or "")
+    body = _without_think(text or "")
     problem = "the reply was not a valid JSON object with a status"
     decoder = json.JSONDecoder()
     for part in [*_FENCE.findall(body), body]:
@@ -537,7 +565,7 @@ def parse_json_reply(text: str) -> tuple[dict[str, Any] | None, str | None]:
                 break
             try:
                 value, _ = decoder.raw_decode(part, m.start())
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(value, dict) and "status" in value:
                 verdict, why = parse_verdict(value)

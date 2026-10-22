@@ -64,8 +64,11 @@ def user_errors(*extra: type[Exception]) -> Iterator[None]:
 
 
 def show_warnings(store: Store) -> None:
+    """Print the ledger's warnings that this run has not printed yet."""
     for w in store.state().warnings:
-        warn(w)
+        if w not in store.shown_warnings:
+            store.shown_warnings.add(w)
+            warn(w)
 
 
 def verdict_symbol(eff: Effective | None, claimed: bool = False) -> str:

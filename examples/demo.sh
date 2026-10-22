@@ -2,7 +2,7 @@
 # The README tour on synthetic files, in a fresh directory:  bash examples/demo.sh [DIR]
 set -euo pipefail
 
-DEMO="${1:-pseudorca-demo}"
+DEMO="${1:-${TMPDIR:-/tmp}/pseudorca-demo}"   # outside the source tree by default
 "${PYTHON:-python3}" "$(dirname "$0")/make_demo_files.py" "$DEMO"
 cd "$DEMO"
 git init -q

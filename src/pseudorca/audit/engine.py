@@ -4,11 +4,13 @@ For each idea:
 1. fingerprint (when the idea has fingerprints) and patch (when it has a patch);
 2. the LLM: never, always, or (auto) only when the deterministic verdicts are not conclusive;
 3. each new finding is written as one audit.verdict event (nothing is written in a dry run).
-A method is skipped, unless `force` is given, when the recorded verdict that counts for it (see
-`State.current_records`) is at least as new as what this run would record: for fingerprint and patch, a
-`detail.extractor_version` >= EXTRACTOR_VERSION; for the LLM, the same model with `detail.prompt_version`
->= PROMPT_VERSION, or any model with a newer prompt version (versions compare as integers). So an older
-Pseudorca never redoes a newer one's verdicts, and an upgrade redoes older ones.
+A method is skipped, unless `force` is given, when what is recorded for it is at least as new as what this
+run would record. For fingerprint and patch: the verdict that counts (see `State.current_records`) has a
+(`detail.extractor_version`, `detail.matcher_version`) >= (EXTRACTOR_VERSION, the method's MATCHER_VERSION),
+compared in that order. For the LLM: a verdict for this rev from the same model has `detail.prompt_version`
+>= PROMPT_VERSION, or one from any model has a newer prompt version. Versions compare as integers, and a
+missing one counts as 0. So an older Pseudorca never redoes a newer one's verdicts, an upgrade of the
+extractor or of a matcher redoes older ones, and each model is asked once per prompt version.
 
 The ledger is read once per audit: the effective verdicts are computed at the end from that snapshot plus
 this run's own findings, never by replaying the events after each one is written.
@@ -18,11 +20,21 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from pseudorca.audit import fingerprint, patch
 from pseudorca.audit.types import Evidence, Finding
-from pseudorca.model import DETERMINISTIC, VERDICT_STATUSES, Effective, Idea, Notebook, State, VerdictRecord
+from pseudorca.model import (
+    DETERMINISTIC,
+    VERDICT_STATUSES,
+    Effective,
+    Idea,
+    Notebook,
+    State,
+    VerdictRecord,
+    record_version,
+)
 from pseudorca.store import Event, Store, StoreError
 from pseudorca.tree import Tree
 
@@ -30,6 +42,7 @@ if TYPE_CHECKING:
     from pseudorca.llm import LLMSettings
 
 LLM_MODES = ("auto", "always", "never")
+MATCHERS: dict[str, ModuleType] = {"fingerprint": fingerprint, "patch": patch}  # each has a MATCHER_VERSION
 
 # judge(idea, patch_text, tree, findings, settings, *, cache_dir) -> Finding, like pseudorca.llm.judge_idea
 Judge = Callable[..., Finding]
@@ -140,18 +153,19 @@ class _Run:
             self._tree = extract.tree_for(self.store, self.nb)
         return self._tree
 
+    def records(self, idea: Idea) -> list[VerdictRecord]:
+        """The verdicts on `idea` in this notebook: recorded before this run, then this run's."""
+        return [*self.state.verdicts.get((self.nb.id, idea.id), []), *self.new.get(idea.id, [])]
+
     def view(self, idea: Idea) -> State:
         """The verdicts on `idea` (recorded before this run, then this run's), judged for `idea` as given."""
         st = State()
         st.ideas[idea.id] = idea
-        st.verdicts[(self.nb.id, idea.id)] = [
-            *self.state.verdicts.get((self.nb.id, idea.id), []),
-            *self.new.get(idea.id, []),
-        ]
+        st.verdicts[(self.nb.id, idea.id)] = self.records(idea)
         return st
 
     def audit(self, idea: Idea) -> AuditRow:
-        from pseudorca.extract import EXTRACTOR_VERSION
+        from pseudorca import extract
 
         row = AuditRow(idea)
         current = self.view(idea).current_records(self.nb.id, idea.id)
@@ -162,12 +176,13 @@ class _Run:
         if idea.patch:
             methods.append("patch")
         for method in methods:
+            # in the order model.record_version compares them
+            versions = {
+                "extractor_version": int(extract.EXTRACTOR_VERSION),
+                "matcher_version": int(MATCHERS[method].MATCHER_VERSION),
+            }
             rec = current.get(method)
-            if (
-                rec is not None
-                and not self.force
-                and _int(rec.detail.get("extractor_version")) >= EXTRACTOR_VERSION
-            ):
+            if rec is not None and not self.force and record_version(rec) >= tuple(versions.values()):
                 row.skipped.append(method)
                 continue
             if method == "fingerprint":
@@ -176,7 +191,7 @@ class _Run:
                 text = self.patch_text(idea, row)
                 found = None if text is None else patch.check(text, self.tree())
             if found is not None:
-                found.detail = {**found.detail, "extractor_version": EXTRACTOR_VERSION}
+                found.detail = {**found.detail, **versions}
                 self.record(row, idea, found)
                 det[method] = found
         if not methods:
@@ -216,11 +231,10 @@ class _Run:
             return
         from pseudorca import llm
 
-        if (
-            not self.force
-            and current is not None
-            and _llm_is_current(current, settings.label, llm.PROMPT_VERSION)
-        ):
+        # every LLM verdict for this rev, not only the one that counts: with two models at the same prompt
+        # version the latest one counts, and asking the other model again would only flip it back
+        asked = [r for r in self.records(idea) if r.method == "llm" and r.idea_rev == idea.rev]
+        if not self.force and any(_llm_is_current(r, settings.label, llm.PROMPT_VERSION) for r in asked):
             row.skipped.append("llm")
             return
         if self.allowed is None:
@@ -254,10 +268,10 @@ class _Run:
 
 
 def _llm_is_current(r: VerdictRecord, label: str, prompt_version: str) -> bool:
-    """Whether the LLM verdict that counts makes asking `label` now pointless: it came from the same model
+    """Whether an LLM verdict for this rev makes asking `label` now pointless: it came from the same model
     with this prompt version or a newer one, or from any model with a newer one (an older prompt's answer
     would never count over it)."""
-    recorded, ours = _int(r.detail.get("prompt_version")), _int(prompt_version)
+    recorded, ours = record_version(r)[0], _int(prompt_version)
     return recorded > ours or (recorded == ours and r.model == label)
 
 
