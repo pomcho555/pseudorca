@@ -90,6 +90,7 @@ def run_add(
                 "protocol": protocol,
                 "note": note,
                 "n_rows": len(table),
+                "file": file.name,
             },
         )
     tags = [f"label {label}" if label else "", f"notebook {nb.label}" if nb else "", _protocol_tag(protocol)]

@@ -91,9 +91,22 @@ def clip(text: str, width: int) -> str:
     return "".join(out) + "…"
 
 
-def format_table(headers: list[str], rows: list[list[object]], max_width: int = 60) -> str:
-    """A plain-text table. Cells are flattened to one line and clipped to `max_width` columns."""
-    cells = [[clip(" ".join(("" if v is None else str(v)).split()), max_width) for v in row] for row in rows]
+def format_table(
+    headers: list[str],
+    rows: list[list[object]],
+    max_width: int = 60,
+    col_widths: dict[int, int] | None = None,
+) -> str:
+    """A plain-text table. Cells are flattened to one line and clipped to `max_width` display columns,
+    or to `col_widths[i]` for column i."""
+    limits = col_widths or {}
+    cells = [
+        [
+            clip(" ".join(("" if v is None else str(v)).split()), limits.get(i, max_width))
+            for i, v in enumerate(row)
+        ]
+        for row in rows
+    ]
     heads = [str(h) for h in headers]
     widths = [display_width(h) for h in heads]
     for row in cells:

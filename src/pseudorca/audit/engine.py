@@ -4,8 +4,8 @@ For each idea:
 1. fingerprint (when the idea has fingerprints) and patch (when it has a patch);
 2. the LLM: never, always, or (auto) only when the deterministic verdicts are not conclusive;
 3. each new finding is written as one audit.verdict event (nothing is written in a dry run).
-A method is skipped when an equal verdict is already recorded (same notebook, idea, rev and method; for the
-LLM also the same model and PROMPT_VERSION), unless `force` is given.
+A method is skipped when an equal verdict is already recorded (same notebook, idea, rev, method and
+extractor version; for the LLM also the same model and PROMPT_VERSION), unless `force` is given.
 """
 
 from __future__ import annotations
@@ -127,8 +127,14 @@ class _Run:
         records = self.store.state().verdicts.get((self.nb.id, idea.id), [])
         rev = idea.rev
         # latest still-valid recorded verdict per deterministic method, replaced below by new findings
+        from pseudorca.extract import EXTRACTOR_VERSION
+
         current = {
-            r.method: _as_finding(r) for r in records if r.idea_rev == rev and r.method in DETERMINISTIC
+            r.method: _as_finding(r)
+            for r in records
+            if r.idea_rev == rev
+            and r.method in DETERMINISTIC
+            and r.detail.get("extractor_version") == EXTRACTOR_VERSION
         }
         methods = []
         if any(f.strip() for f in idea.fingerprints):
@@ -145,6 +151,7 @@ class _Run:
                 text = self.patch_text(idea, row)
                 found = None if text is None else patch.check(text, self.tree())
             if found is not None:
+                found.detail = {**found.detail, "extractor_version": EXTRACTOR_VERSION}
                 self.record(row, idea, found)
                 current[method] = found
         if not methods:

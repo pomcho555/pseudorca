@@ -194,3 +194,35 @@ def test_register_notebook_merges_metadata(store: Store, tmp_path: Path):
     assert nb3.path == "elsewhere.ipynb" and not nb3.stored and nb3.parent == nb.id
     with pytest.raises(LookupError):
         register_file(store, outside, applies=["missing"])
+
+
+def test_split_lines_counts_like_python():
+    from pseudorca.tree import split_lines
+
+    assert split_lines("a\fb\nc\r\nd\re\n") == ["a\fb", "c", "d", "e"]
+    t = Tree()
+    t.add_text("x.py", "x = 1\f\ny = 2\n", "cell 0")
+    assert [h.line for h in t.grep("y = 2")] == [2]
+
+
+def test_null_note_and_model_are_empty_strings(store: Store):
+    store.append("idea.add", {"id": "i", "title": "t"})
+    store.append(
+        "audit.verdict",
+        {
+            "nb": "a" * 64,
+            "idea": "i",
+            "idea_rev": "r",
+            "status": "present",
+            "method": "llm",
+            "note": None,
+            "model": None,
+        },
+    )
+    rec = store.state().verdicts[("a" * 64, "i")][0]
+    assert rec.note == "" and rec.model == ""
+
+
+def test_format_table_column_widths():
+    out = util.format_table(["a", "b"], [["x" * 30, "y" * 30]], col_widths={0: 10})
+    assert "x" * 9 + "…" in out and "y" * 30 in out

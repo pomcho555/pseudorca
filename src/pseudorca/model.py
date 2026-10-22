@@ -120,11 +120,12 @@ class Run:
     protocol: str = ""
     note: str = ""
     n_rows: int = 0
+    file: str = ""  # name of the file it was imported from
     added: str = ""
     added_by: str = ""
 
 
-RUN_FIELDS = ("results", "format", "nb", "label", "protocol", "note", "n_rows")
+RUN_FIELDS = ("results", "format", "nb", "label", "protocol", "note", "n_rows", "file")
 
 
 @dataclass
@@ -260,8 +261,8 @@ class State:
             status=status,
             method=method,
             evidence=list(d.get("evidence") or []),
-            note=str(d.get("note", "")),
-            model=str(d.get("model", "")),
+            note=str(d.get("note") or ""),
+            model=str(d.get("model") or ""),
             detail=dict(d.get("detail") or {}),
             time=ev.time,
             actor=ev.actor,

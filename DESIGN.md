@@ -51,7 +51,7 @@ Every event file has this shape:
 | `nb.add` | `id` (sha256 of the bytes), `name`, `path`, `kernel`, `version`, `parent`, `applies[]`, `tags[]`, `note`, `stored`, `size` |
 | `nb.update` | `id` plus any of `name`, `path`, `kernel`, `version`, `parent`, `applies`, `tags`, `note` |
 | `sub.upsert` | `id` plus any of `competition`, `nb`, `description`, `date`, `status`, `public_score`, `private_score`, `submitted_by`, `source`, `extra{}` |
-| `run.add` | `id` (ULID), `results` (blob sha), `format` (`csv`/`jsonl`), `nb`, `label`, `protocol`, `note`, `n_rows` |
+| `run.add` | `id` (ULID), `results` (blob sha), `format` (`csv`/`jsonl`), `nb`, `label`, `protocol`, `note`, `n_rows`, `file` (source file name) |
 | `audit.verdict` | `nb`, `idea`, `idea_rev`, `status`, `method`, `evidence[{path,line,quote}]`, `note`, `model`, `detail{}` |
 
 **Actor.** The author of new events comes from `--as`, then `$PSEUDORCA_ACTOR`, then git `user.name`, then
@@ -102,7 +102,9 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
   - `%%writefile [-a] PATH` becomes `files/PATH`. `-a` appends.
   - `%%bash`, `%%sh` and `%%script bash` become `.sh` files.
   - Other cell magics become `.txt` files.
-  - Line magics and `!cmd` are commented out, so the cell still parses.
+  - The bodies of shell and other cell magics are scanned for payloads by pattern, not parsed.
+  - Line magics and `!cmd` are commented out, so the cell still parses. Inside an indented block the line
+    becomes `pass  # <line>`, so the block is not left empty. Line numbers are kept.
   - Literal environment settings are collected in `tree.meta["env"]` as `[{cell, key, value}]`. These
     come from `%env K=V`, `%set_env K V` and `os.environ["K"] = "V"`.
 - **File writes:** a literal path written with literal text becomes `files/<path>`. This covers
@@ -114,8 +116,14 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
   - Text results become files.
   - Binary results are recorded without content.
   - A pickle is recorded as binary and never loaded.
-  - Limits are enforced while decompressing.
+  - Limits are enforced while decompressing. `Limits` caps bytes per payload (`max_payload_bytes`),
+    bytes per notebook (`max_total_bytes`), decode steps (`max_depth`) and archive members
+    (`max_members`).
+  - Decoded or written Python is searched again for payloads and writes, up to `max_nesting` times.
+    Python longer than `max_parse_chars` is searched by pattern instead of parsed.
+  - Origins name the xz container step `lzma`.
 - **Never:** `exec`, `eval`, importing notebook code, `pickle.loads`, or writing tree paths to disk.
+- **Line numbers** count only `\n`, `\r\n` and `\r` (`tree.split_lines`), as Python's tokenizer does.
 - **`tree_for(store, nb)`:** caches in `cache/trees/<nb.id>/`. The cache is valid while
   `meta["extractor_version"] == EXTRACTOR_VERSION`.
   - The bytes come from the blob.
@@ -167,7 +175,9 @@ Every file records its origin, for example `cell 4 > line 12 str > base64 > lzma
 2. Call the LLM when `llm = "always"`, or when `llm = "auto"` and the deterministic result is not
    conclusive (no single agreed `present`/`absent`). Never call it when `llm = "never"`.
 3. A method is skipped when an equal verdict already exists, unless `--force` is given. "Equal" means the
-   same notebook, idea, rev and method, and for the LLM also the same model and `PROMPT_VERSION`.
+   same notebook, idea, rev and method. For deterministic methods it also means the same
+   `detail.extractor_version`, so an extractor upgrade re-runs them. For the LLM it also means the same
+   model and `detail.prompt_version`.
 4. Every finding is written as one `audit.verdict` event.
 
 ### LLM judge (`pseudorca.llm`)
@@ -253,3 +263,7 @@ It also lists ideas the notebook claims (`applies`) that the audit found absent.
 | `report.py`, `commands/report.py` | `report` (single-file HTML, no external resources) |
 
 Heavy imports (`numpy`, `openai`, `anthropic`, `kaggle`) happen inside the functions that need them.
+
+Commands turn user mistakes into one-line errors with `commands._common.user_errors()`. That covers
+store errors, `LookupError`, `ValueError`, `OSError`, and any exception types passed to it. Raise
+`LookupError` or `ValueError` for user mistakes, never `KeyError`, which is treated as a bug.

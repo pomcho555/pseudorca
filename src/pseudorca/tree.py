@@ -62,6 +62,18 @@ def safe_path(path: str) -> str:
     return "/".join(parts) or "_"
 
 
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def split_lines(text: str) -> list[str]:
+    """Lines split only at \\r\\n, \\r and \\n, as Python's tokenizer counts them (str.splitlines also splits
+    at form feeds and other separators, which would shift line numbers)."""
+    lines = _LINE_BREAK.split(text)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def normalize_line(line: str) -> str:
     """Collapse all whitespace runs to one space and strip the ends."""
     return " ".join(line.split())
@@ -152,7 +164,7 @@ class Tree:
         return self.files[path].text
 
     def lines(self, path: str) -> list[str]:
-        return self.files[path].text.splitlines()
+        return split_lines(self.files[path].text)
 
     def read(self, path: str, start: int = 1, end: int | None = None) -> str:
         """Lines `start`..`end` (1-based, inclusive) with line numbers, like `cat -n`."""
@@ -183,7 +195,7 @@ class Tree:
             f = self.files.get(p)
             if f is None or f.binary:
                 continue
-            for i, line in enumerate(f.text.splitlines(), 1):
+            for i, line in enumerate(split_lines(f.text), 1):
                 if rx.search(line):
                     hits.append(Hit(p, i, line))
                     if len(hits) >= max_hits:
@@ -194,7 +206,7 @@ class Tree:
         if path not in self._norm:
             self._norm[path] = [
                 (i, normalize_line(line))
-                for i, line in enumerate(self.files[path].text.splitlines(), 1)
+                for i, line in enumerate(split_lines(self.files[path].text), 1)
                 if line.strip()
             ]
         return self._norm[path]
@@ -208,7 +220,7 @@ class Tree:
         of one (a quote cut mid-line); otherwise every line must match a whole line. A one-line snippet with
         `partial_ends` matches anywhere inside a line. Returns (path, line of the snippet's first line).
         """
-        want = [normalize_line(line) for line in snippet.splitlines() if line.strip()]
+        want = [normalize_line(line) for line in split_lines(snippet) if line.strip()]
         if not want:
             return []
         n = len(want)
@@ -255,7 +267,7 @@ class Tree:
             "files": self.manifest(),
         }
         tmp = directory / "manifest.json.tmp"
-        tmp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
         os.replace(tmp, directory / "manifest.json")
 
     @classmethod

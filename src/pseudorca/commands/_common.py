@@ -49,14 +49,18 @@ def warn(message: str) -> None:
 
 
 @contextmanager
-def user_errors() -> Iterator[None]:
-    """Show expected errors (bad references, store problems, bad input) as one line instead of a traceback."""
+def user_errors(*extra: type[Exception]) -> Iterator[None]:
+    """Show expected errors (bad references, store problems, bad input, file problems, and any `extra`
+    types) as one line instead of a traceback.
+
+    KeyError is re-raised because it usually means a bug; raise LookupError or ValueError for user mistakes.
+    """
     try:
         yield
     except KeyError:
         raise
-    except (StoreError, LookupError, ValueError) as e:
-        raise click.ClickException(str(e)) from e
+    except (StoreError, LookupError, ValueError, OSError, *extra) as e:
+        raise click.ClickException(str(e) or type(e).__name__) from e
 
 
 def show_warnings(store: Store) -> None:
