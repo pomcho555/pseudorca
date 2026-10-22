@@ -35,6 +35,9 @@ that reading them is safe and that a team's code and results stay private.
   has read-only tools (list, substring search, read) over the extracted text and cannot act on anything.
 - **Kaggle access is read-only.** Pseudorca only lists submissions and pulls kernel sources. It never
   submits, pushes or creates anything, and it never prints credentials.
+- **Shared ledger text is shown safely.** Idea, notebook and submission names come through git from
+  teammates, or from hand-edited events. The terminal output replaces control characters and
+  bidirectional overrides with `?`, and the HTML report escapes every such string and has no scripts.
 - **No telemetry and no server.** The ledger is plain files in your repository.
 
 ## Keeping your data private

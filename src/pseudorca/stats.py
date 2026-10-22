@@ -185,8 +185,14 @@ def lb_noise(subs: Iterable[Submission]) -> LbNoise | None:
     if not groups:
         return None
     dof = sum(len(v) - 1 for v in groups.values())
-    pooled = sum((len(v) - 1) * statistics.variance(v) for v in groups.values()) / dof
-    return LbNoise(math.sqrt(pooled), len(groups), sum(len(v) for v in groups.values()), groups)
+    try:
+        pooled = sum((len(v) - 1) * statistics.variance(v) for v in groups.values()) / dof
+        sd = math.sqrt(pooled)
+    except (OverflowError, ValueError):  # scores so large that their squares overflow
+        return None
+    if not math.isfinite(sd):
+        return None
+    return LbNoise(sd, len(groups), sum(len(v) for v in groups.values()), groups)
 
 
 def lb_diff(x: float, y: float, sd: float) -> tuple[float, float]:
@@ -195,6 +201,120 @@ def lb_diff(x: float, y: float, sd: float) -> tuple[float, float]:
     if sd > 0:
         return diff, diff / (sd * math.sqrt(2))
     return diff, (math.copysign(math.inf, diff) if diff else 0.0)
+
+
+T_EXPANSION_DF = 3000  # from this many degrees of freedom on, t_quantile uses the Cornish-Fisher expansion
+
+
+def t_quantile(p: float, df: float) -> float:
+    """The p-quantile of Student's t distribution with `df` degrees of freedom (the normal when df is inf).
+
+    Exact for 1 and 2 degrees of freedom. Below T_EXPANSION_DF the tail probability (a regularized
+    incomplete beta function) is inverted by bisection, to about 1e-12. From there on the Cornish-Fisher
+    expansion (Abramowitz and Stegun 26.7.5) is used: as close at ordinary levels, but less so far in the
+    tails (a relative error near 1e-6 at p = 1e-12 just above T_EXPANSION_DF). The tail beyond the quantile
+    is used directly, so quantiles far out keep their precision and t_quantile(1 − p) = −t_quantile(p). A
+    quantile whose square overflows (beyond about 1e154, with df well below 1) is ±inf."""
+    if not 0 < p < 1:
+        raise ValueError("p must be between 0 and 1")
+    if not df > 0:
+        raise ValueError("degrees of freedom must be positive")
+    if math.isinf(df):
+        return statistics.NormalDist().inv_cdf(p)
+    if p == 0.5:
+        return 0.0
+    if df >= T_EXPANSION_DF:
+        return _t_expansion(p, df)
+    tail, sign = (1 - p, 1.0) if p > 0.5 else (p, -1.0)  # 1 − p is exact for p > 0.5
+    if df == 1:
+        return sign / math.tan(math.pi * tail)
+    if df == 2:
+        return sign * (1 - 2 * tail) / math.sqrt(2 * tail * (1 - tail))
+    lo, hi = 0.0, 1.0
+    while _t_tail(hi, df) > tail:
+        lo, hi = hi, hi * 2
+    if math.isinf(hi * hi):  # the tail cannot be computed this far out
+        return sign * math.inf
+    for _ in range(2000):
+        mid = (lo + hi) / 2
+        if _t_tail(mid, df) > tail:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo <= 1e-12 * hi:
+            break
+    return sign * (lo + hi) / 2
+
+
+def f_sf(f: float, d1: float, d2: float) -> float:
+    """P(F > f) for Snedecor's F distribution with d1 and d2 degrees of freedom."""
+    if not (d1 > 0 and d2 > 0):
+        raise ValueError("degrees of freedom must be positive")
+    if math.isnan(f):
+        raise ValueError("f must be a number")
+    if f <= 0:
+        return 1.0
+    if math.isinf(f):
+        return 0.0
+    x = d2 / (d2 + d1 * f)
+    return _betainc(d2 / 2, d1 / 2, x, d1 * f / (d2 + d1 * f))
+
+
+def _t_tail(x: float, df: float) -> float:
+    """P(T > x) for x >= 0."""
+    s = x * x
+    if math.isinf(s):
+        return 0.0
+    return 0.5 * _betainc(df / 2, 0.5, df / (df + s), s / (df + s))
+
+
+def _t_expansion(p: float, df: float) -> float:
+    """The Cornish-Fisher expansion of the t quantile in powers of 1/df, to the fourth."""
+    z = statistics.NormalDist().inv_cdf(p)
+    z2 = z * z
+    g1 = (z2 + 1) * z / 4
+    g2 = ((5 * z2 + 16) * z2 + 3) * z / 96
+    g3 = (((3 * z2 + 19) * z2 + 17) * z2 - 15) * z / 384
+    g4 = ((((79 * z2 + 776) * z2 + 1482) * z2 - 1920) * z2 - 945) * z / 92160
+    return z + (g1 + (g2 + (g3 + g4 / df) / df) / df) / df
+
+
+def _betainc(a: float, b: float, x: float, y: float) -> float:
+    """The regularized incomplete beta function I_x(a, b), by its continued fraction (modified Lentz).
+
+    y is 1 − x, computed by the caller without cancellation: x is often close to 1."""
+    if x <= 0:
+        return 0.0
+    if y <= 0:
+        return 1.0
+    log_x = math.log1p(-y) if y < 0.5 else math.log(x)
+    log_y = math.log1p(-x) if x < 0.5 else math.log(y)
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * log_x + b * log_y)
+    if x < (a + 1) / (a + b + 2):
+        return front * _betacf(a, b, x) / a
+    return 1 - front * _betacf(b, a, y) / b
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1, a - 1
+    c, d = 1.0, 1 - qab * x / qap
+    d = 1 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 1000):
+        m2 = 2 * m
+        for aa in (
+            m * (b - m) * x / ((qam + m2) * (a + m2)),
+            -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2)),
+        ):
+            d = 1 + aa * d
+            d = 1 / (d if abs(d) > tiny else tiny)
+            c = 1 + aa / c
+            c = c if abs(c) > tiny else tiny
+            h *= d * c
+        if abs(d * c - 1) < 1e-15:  # a few ulps: 1e-16 would wait for an exact 1.0
+            break
+    return h
 
 
 # ----- internals -----------------------------------------------------------------------------------

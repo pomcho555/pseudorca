@@ -38,5 +38,15 @@ pseudorca sub add 1002 --nb base.ipynb --score 0.398 --date 2026-01-06
 pseudorca sub add 1003 --nb next.ipynb --score 0.437 --date 2026-01-07
 pseudorca lb --diff 1001 1003
 
+pseudorca nb add hot.ipynb  --parent next.ipynb --tag candidate
+pseudorca nb add lean.ipynb --parent next.ipynb --tag candidate
+pseudorca run add runs/hot.csv  --nb hot.ipynb  --label hot  --protocol p60x3
+pseudorca run add runs/lean.csv --nb lean.ipynb --label lean --protocol p60x3
+pseudorca sub add 1004 --nb hot.ipynb  --score 0.411 --date 2026-01-08
+pseudorca sub add 1005 --nb lean.ipynb --score 0.428 --date 2026-01-09
+pseudorca sub add 1006 --nb next.ipynb --score 0.441 --date 2026-01-10
+pseudorca audit --submitted
+pseudorca effects
+
 pseudorca report
 pseudorca log -n 5

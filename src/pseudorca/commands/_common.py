@@ -44,8 +44,19 @@ def fail(message: str) -> NoReturn:
     raise click.ClickException(message)
 
 
+def echo(message: object = "", *, err: bool = False) -> None:
+    """click.echo for text that may quote the ledger or a notebook: each line goes through util.clean, so
+    control characters and bidirectional overrides reach the terminal as "?" (JSON goes out as it is)."""
+    from pseudorca.util import clean
+
+    text = "" if message is None else str(message)
+    click.echo("\n".join(clean(line) for line in text.split("\n")), err=err)
+
+
 def warn(message: str) -> None:
-    click.secho(f"warning: {message}", fg="yellow", err=True)
+    from pseudorca.util import clean
+
+    click.secho(f"warning: {clean(message)}", fg="yellow", err=True)
 
 
 @contextmanager

@@ -198,6 +198,8 @@ def _read_jsonl(data: bytes) -> tuple[list[str], list[Row]]:
             obj = json.loads(line)
         except json.JSONDecodeError as e:
             raise ValueError(f"line {no}: not valid JSON ({e.msg})") from None
+        except RecursionError:  # nested deeper than the interpreter's limit: a RuntimeError, not bad JSON
+            raise ValueError(f"line {no}: nested too deeply") from None
         if not isinstance(obj, dict):
             raise ValueError(f"line {no}: expected a JSON object, got {type(obj).__name__}")
         for key in obj:

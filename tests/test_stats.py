@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 from typing import Any
 
 import numpy as np
@@ -262,3 +263,97 @@ def test_lb_diff():
 def test_spread():
     assert stats.spread([3, 1, 2, 4]) == (1, 2.5, 4)
     assert stats.spread([]) == (0, 0.0, 0)
+
+
+# ----- Student's t quantiles -----------------------------------------------------------------------
+
+T_TABLE = {  # (p, df): the quantile, as tables print it (12 significant digits)
+    (0.975, 1): 12.7062047362,
+    (0.975, 2): 4.30265272975,
+    (0.975, 3): 3.18244630528,
+    (0.975, 4): 2.77644510520,
+    (0.975, 5): 2.57058183564,
+    (0.975, 10): 2.22813885199,
+    (0.975, 30): 2.04227245630,
+    (0.975, 100): 1.98397151852,
+    (0.95, 1): 6.31375151468,
+    (0.95, 5): 2.01504837333,
+    (0.95, 10): 1.81246112281,
+    (0.9, 3): 1.63774435370,
+    (0.99, 20): 2.52797700274,
+    (0.995, 5): 4.03214298356,
+    (0.995, 10): 3.16927267262,
+    (0.75, 7): 0.711141778082,
+}
+
+
+@pytest.mark.parametrize(("p", "df"), list(T_TABLE))
+def test_t_quantile_table_values(p: float, df: int):
+    assert stats.t_quantile(p, df) == pytest.approx(T_TABLE[p, df], rel=1e-11)
+    assert stats.t_quantile(1 - p, df) == pytest.approx(-T_TABLE[p, df], rel=1e-11)
+    assert stats.t_quantile(p, float(df)) == stats.t_quantile(p, df)
+
+
+def test_t_quantile_closed_forms():
+    for p in (0.51, 0.6, 0.9, 0.975, 0.999):
+        assert stats.t_quantile(p, 1) == pytest.approx(math.tan(math.pi * (p - 0.5)), rel=1e-12)
+        assert stats.t_quantile(p, 2) == pytest.approx((2 * p - 1) / math.sqrt(2 * p * (1 - p)), rel=1e-12)
+        # 4 degrees of freedom: t = 2·sqrt(cos(acos(√a)/3)/√a − 1) with a = 4p(1 − p)
+        a = 4 * p * (1 - p)
+        closed = 2 * math.sqrt(math.cos(math.acos(math.sqrt(a)) / 3) / math.sqrt(a) - 1)
+        assert stats.t_quantile(p, 4) == pytest.approx(closed, rel=1e-11)
+        # 3 degrees of freedom: the CDF is 1/2 + (θ + sin θ cos θ)/π with θ = atan(t/√3)
+        theta = math.atan(stats.t_quantile(p, 3) / math.sqrt(3))
+        assert 0.5 + (theta + math.sin(theta) * math.cos(theta)) / math.pi == pytest.approx(p, rel=1e-12)
+        # 5: 1/2 + (θ + sin θ cos θ (1 + 2/3 cos² θ))/π with θ = atan(t/√5)
+        theta = math.atan(stats.t_quantile(p, 5) / math.sqrt(5))
+        cdf = 0.5 + (theta + math.sin(theta) * math.cos(theta) * (1 + 2 / 3 * math.cos(theta) ** 2)) / math.pi
+        assert cdf == pytest.approx(p, rel=1e-12)
+
+
+def test_t_quantile_is_symmetric_and_keeps_its_tails():
+    for df in (1, 2, 3, 4.5, 7, 50, 2999, 3000, 1e6, math.inf):
+        for p in (0.25, 0.125, 0.0625, 1 / 1024):  # 1 − p is exact for these
+            assert stats.t_quantile(1 - p, df) == -stats.t_quantile(p, df) > 0
+        assert stats.t_quantile(0.5, df) == 0.0
+    # far out in the tails, where 1 − p would round to 1 (this used to raise ValueError)
+    for p in (1e-10, 1e-17, 1e-20, 1e-300):
+        assert stats.t_quantile(p, 1) == pytest.approx(-1 / math.tan(math.pi * p), rel=1e-12)
+        assert stats.t_quantile(p, 2) == pytest.approx(-(1 - 2 * p) / math.sqrt(2 * p * (1 - p)), rel=1e-12)
+        a = 4 * p * (1 - p)
+        closed = 2 * math.sqrt(math.cos(math.acos(math.sqrt(a)) / 3) / math.sqrt(a) - 1)
+        assert stats.t_quantile(p, 4) == pytest.approx(-closed, rel=1e-10)
+        assert stats.t_quantile(p, 3) < stats.t_quantile(p, 30) < stats.t_quantile(p, math.inf) < 0
+    # just above 1/2 the quantile is tiny but not 0: P(T < t) ≈ 1/2 + t·f(0)
+    density = math.gamma(4) / (math.sqrt(7 * math.pi) * math.gamma(3.5))
+    assert stats.t_quantile(0.5 + 1e-6, 7) == pytest.approx(1e-6 / density, rel=1e-6)
+
+
+def test_t_quantile_approaches_the_normal(monkeypatch: pytest.MonkeyPatch):
+    for p in (0.6, 0.975, 0.9999):
+        z = statistics.NormalDist().inv_cdf(p)
+        assert stats.t_quantile(p, math.inf) == z
+        values = [stats.t_quantile(p, df) for df in (3, 10, 100, 1000, 2999, 3000, 1e5, 1e9, 1e300)]
+        assert values == sorted(values, reverse=True) and values[-1] >= z  # down towards the normal
+        assert stats.t_quantile(p, 1e9) - z == pytest.approx((z**3 + z) / 4e9, rel=1e-6)  # the 1/df term
+    # from T_EXPANSION_DF on, the expansion: where the two methods meet, they agree
+    assert stats.T_EXPANSION_DF == 3000
+    expanded = [stats.t_quantile(p, df) for p in (0.6, 0.975, 1 - 1e-9) for df in (3000, 5000)]
+    monkeypatch.setattr(stats, "T_EXPANSION_DF", math.inf)
+    bisected = [stats.t_quantile(p, df) for p in (0.6, 0.975, 1 - 1e-9) for df in (3000, 5000)]
+    assert expanded == pytest.approx(bisected, rel=1e-11)
+
+
+def test_t_quantile_rejects_bad_input():
+    for p in (0, 1, -0.5, 1.5, math.nan):
+        with pytest.raises(ValueError, match="p must be between 0 and 1"):
+            stats.t_quantile(p, 5)
+    for df in (0, -1, math.nan, -math.inf):
+        with pytest.raises(ValueError, match="degrees of freedom must be positive"):
+            stats.t_quantile(0.9, df)
+
+
+def test_t_quantile_below_one_degree_of_freedom():
+    # tails heavier than the Cauchy's: larger quantiles, and beyond the float range ±inf
+    assert stats.t_quantile(0.975, 1) < stats.t_quantile(0.975, 0.5) < math.inf
+    assert stats.t_quantile(0.975, 1e-3) == math.inf and stats.t_quantile(0.025, 1e-3) == -math.inf

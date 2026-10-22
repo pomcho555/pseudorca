@@ -10,7 +10,7 @@ import sys
 import traceback
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -43,6 +43,8 @@ COUNT_ORDER = ("present", "partial", "absent", "unknown", "conflict", "none")
 SECTIONS = ("MISSING", "UNKNOWN", "FORBIDDEN PRESENT", "CLAIMED BUT NOT FOUND", "OK")
 SECTION_KEYS = {title: title.lower().replace(" ", "_") for title in SECTIONS}  # in --json
 EVIDENCE_WIDTH = 60  # display columns of the EVIDENCE/NOTE cell (util.format_table's default)
+LABEL_WIDTH = 40  # display columns of a notebook's label in the lines of `audit --submitted`
+MAX_LLM_ERRORS = 5  # distinct LLM error texts `audit --submitted` shows; the others are counted
 CHECK_FAILED, CHECK_ERROR = 1, 2  # check's exit codes besides 0
 _EVIDENCE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d*):(?P<quote>.*)$", re.DOTALL)
 
@@ -104,14 +106,14 @@ def _llm(
 
 
 def _progress(message: str) -> None:
-    click.secho(message, err=True, dim=True)
+    click.secho(util.clean(message), err=True, dim=True)  # idea ids and labels come from the ledger
 
 
-def _report_messages(rows: AuditRows) -> None:
+def _report_messages(rows: AuditRows, prefix: str = "") -> None:
     for message in rows.messages:
         if "not configured" in message:
             message += " (set [llm] model in config.toml or pass --model)"
-        warn(message)
+        warn(prefix + message)
 
 
 def _echo_json(obj: Any) -> None:
@@ -180,9 +182,14 @@ def _counts(rows: AuditRows) -> Counter[str]:
     return Counter(r.effective.status if r.effective else "none" for r in rows)
 
 
-def _summary(rows: AuditRows, dry_run: bool) -> str:
+def _verdict_counts(rows: AuditRows) -> str:
+    """How many ideas have each verdict, as "2 present, 1 absent, 1 none"."""
     counts = _counts(rows)
-    verdicts = ", ".join(f"{counts[k]} {k}" for k in COUNT_ORDER if counts[k])
+    return ", ".join(f"{counts[k]} {k}" for k in COUNT_ORDER if counts[k])
+
+
+def _summary(rows: AuditRows, dry_run: bool) -> str:
+    verdicts = _verdict_counts(rows)
     new = sum(len(r.findings) for r in rows)
     skipped = sum(len(r.skipped) for r in rows)
     done = f"{new} new verdict{'' if new == 1 else 's'}" + (
@@ -216,6 +223,27 @@ def _idea_json(idea: Idea, eff: Effective | None, row: AuditRow | None, claimed:
         "notes": list(row.notes) if row else [],
         "llm_note": row.llm_note if row else "",
         "llm_error": row.llm_error if row else "",
+    }
+
+
+def _tallies(rows: AuditRows) -> dict[str, Any]:
+    """In --json: how many ideas have each verdict, how many verdicts are new, how many methods were skipped."""
+    counts = _counts(rows)
+    return {
+        "counts": {k: counts[k] for k in COUNT_ORDER if counts[k]},
+        "new_verdicts": sum(len(r.findings) for r in rows),
+        "skipped": sum(len(r.skipped) for r in rows),
+    }
+
+
+def _audit_json(nb: Notebook, rows: AuditRows, dry_run: bool) -> dict[str, Any]:
+    """One notebook's audit in --json."""
+    return {
+        "notebook": asdict(nb),
+        "dry_run": dry_run,
+        "ideas": [_idea_json(r.idea, r.effective, r, r.idea.id in nb.applies) for r in rows],
+        **_tallies(rows),
+        "messages": list(rows.messages),
     }
 
 
@@ -257,6 +285,11 @@ def _audit_target(st: State, nb_ref: str | None) -> Notebook:
 
 @click.command("audit")
 @click.argument("nb_ref", required=False)
+@click.option(
+    "--submitted",
+    is_flag=True,
+    help="Audit every notebook a submission links to, oldest submission first, instead of NB_REF.",
+)
 @click.option("--idea", "idea_refs", multiple=True, metavar="ID", help="Audit only this idea (repeatable).")
 @click.option(
     "--status",
@@ -273,6 +306,7 @@ def _audit_target(st: State, nb_ref: str | None) -> Notebook:
 def audit_cmd(
     c: Ctx,
     nb_ref: str | None,
+    submitted: bool,
     idea_refs: tuple[str, ...],
     statuses: tuple[str, ...],
     llm_mode: str | None,
@@ -290,7 +324,18 @@ def audit_cmd(
     always read as a file). Fingerprints and patches are checked first, without running anything; the LLM is
     asked only when they are inconclusive (see --llm). Each new verdict is recorded as an event, and methods
     already recorded for the same idea revision are skipped.
+
+    --submitted audits every registered notebook that a submission links to instead, each once, oldest
+    submission first, so that `effects` has verdicts for all of them. A submission without a registered
+    notebook, and a notebook that cannot be read (its bytes are not in this store, its blob does not match
+    its sha256, or it is not a notebook), are skipped with a warning.
     """
+    if submitted:
+        if nb_ref is not None:
+            fail("use NB_REF or --submitted, not both")
+        llm_args = (llm_mode, model, base_url, provider, allow_remote)
+        _audit_submitted(c, idea_refs, statuses, llm_args, force=force, dry_run=dry_run, as_json=as_json)
+        return
     store = c.store()
     show_warnings(store)
     with user_errors():
@@ -313,24 +358,14 @@ def audit_cmd(
             )
         _report_messages(rows)
     if as_json:
-        counts = _counts(rows)
-        _echo_json(
-            {
-                "notebook": asdict(nb),
-                "dry_run": dry_run,
-                "ideas": [_idea_json(r.idea, r.effective, r, r.idea.id in nb.applies) for r in rows],
-                "counts": {k: counts[k] for k in COUNT_ORDER if counts[k]},
-                "new_verdicts": sum(len(r.findings) for r in rows),
-                "skipped": sum(len(r.skipped) for r in rows),
-                "messages": list(rows.messages),
-            }
-        )
+        _echo_json(_audit_json(nb, rows, dry_run))
         return
     if not ideas:
         click.echo("no ideas to audit")
         return
     click.echo(
-        f"audit of {nb.label} ({util.short(nb.id)})" + (", dry run: nothing recorded" if dry_run else "")
+        f"audit of {util.clean(nb.label)} ({util.short(nb.id)})"
+        + (", dry run: nothing recorded" if dry_run else "")
     )
     click.echo()
     click.echo(
@@ -339,6 +374,266 @@ def audit_cmd(
     click.echo()
     click.echo(_summary(rows, dry_run))
     click.echo(LEGEND)
+
+
+# ----- audit --submitted ---------------------------------------------------------------------------
+
+
+@dataclass
+class SubmittedNotebook:
+    """A notebook that submissions link to, with their ids (oldest first) and, once audited, its rows."""
+
+    nb: Notebook
+    subs: list[str]
+    rows: AuditRows = field(default_factory=AuditRows)
+
+
+def _audit_submitted(
+    c: Ctx,
+    idea_refs: tuple[str, ...],
+    statuses: tuple[str, ...],
+    llm_args: tuple[str | None, str | None, str | None, str | None, bool],
+    *,
+    force: bool,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """`audit --submitted`: each submitted notebook as `audit` would, one line each instead of a table. The
+    LLM endpoint and its remote guard are set up once, for all of them."""
+    store = c.store()
+    show_warnings(store)
+    with user_errors():
+        st = store.state()
+        ideas = _select(st, idea_refs, statuses)
+        targets, skipped = _submitted(store, st)
+    for entry in skipped:
+        warn(entry["message"])
+    mode, settings = "never", None
+    if ideas and targets:
+        mode, settings = _llm(store, *llm_args)
+    if not as_json:
+        if not targets:
+            n = sum(len(entry["submissions"]) for entry in skipped)
+            why = f"{n} submission{'' if n == 1 else 's'} skipped" if n else "no submissions yet"
+            hint = "" if n else " (`pseudorca sub add` or `pseudorca kaggle sync`)"
+            click.echo(f"no submitted notebooks to audit: {why}{hint}")
+            return
+        if not ideas:
+            click.echo("no ideas to audit")
+            return
+        click.echo(
+            f"{len(targets)} submitted notebook{'' if len(targets) == 1 else 's'} to audit, oldest submission "
+            "first" + (", dry run: nothing recorded" if dry_run else "")
+        )
+        click.echo()
+    width = max((util.display_width(_label(t.nb)) for t in targets), default=0)
+    audited: list[SubmittedNotebook] = []
+    for t in targets:
+        if ideas:
+            try:
+                with user_errors():
+                    t.rows = audit_notebook(
+                        store,
+                        t.nb,
+                        ideas,
+                        llm_mode=mode,
+                        settings=settings,
+                        force=force,
+                        dry_run=dry_run,
+                        on_progress=_progress_of(t.nb),
+                    )
+            except click.ClickException as e:
+                # The audit reads the notebook when a method first needs it, before it records anything for
+                # it. If the extractor, asked again, cannot read it either, the notebook is skipped like those
+                # found before the run; any other error (an event that cannot be written, say) stops the run.
+                reason, why = "", ""
+                if isinstance(e.__cause__, (StoreError, ValueError)):
+                    reason, why = _unreadable(store, t.nb)
+                if not reason:  # say which notebook (the verdicts before it are recorded)
+                    e.message = util.clean(f"{t.nb.label} ({util.short(t.nb.id)}): {e.message}")
+                    raise
+                skipped.append(_skipped_notebook(t.nb, t.subs, reason, why))
+                warn(skipped[-1]["message"])
+                continue
+        audited.append(t)
+        if not as_json:
+            click.echo(_notebook_line(t.nb, t.rows, width))
+    _report_each_once(audited)
+    every = AuditRows(r for t in audited for r in t.rows)
+    if as_json:
+        totals = {"notebooks": len(audited), "submissions": sum(len(t.subs) for t in audited)}
+        _echo_json(
+            {
+                "dry_run": dry_run,
+                "notebooks": [_audit_json(t.nb, t.rows, dry_run) for t in audited],
+                "skipped": skipped,
+                "totals": {**totals, **_tallies(every)},
+            }
+        )
+        return
+    click.echo()
+    if not audited:  # each one was skipped, with a warning
+        click.echo("no submitted notebook could be read")
+        return
+    n = len(audited)
+    click.echo(f"{n} notebook{'' if n == 1 else 's'}: {_summary(every, dry_run)}{_llm_errors(every)}")
+    click.echo(LEGEND)
+
+
+def _submitted(store: Store, st: State) -> tuple[list[SubmittedNotebook], list[dict[str, Any]]]:
+    """The registered notebooks that submissions link to, each once, in the order of its oldest submission
+    (as `effects` lists them); and what cannot be audited, each with the warning that says how to fix it:
+    a submission without a registered notebook, and a notebook the extractor cannot read (`_unreadable`)."""
+    from pseudorca.effects import sub_order
+
+    targets: dict[str, SubmittedNotebook] = {}
+    unreadable: dict[str, list[str]] = {}  # notebook id -> its submissions (shared with its skipped entry)
+    skipped: list[dict[str, Any]] = []
+    for sub in sorted(st.subs.values(), key=sub_order):
+        nb_id = sub.nb if isinstance(sub.nb, str) and sub.nb else None
+        nb = st.notebooks.get(nb_id) if nb_id else None
+        if nb is None:
+            skipped.append(_unlinked(sub.id, nb_id))
+        elif nb.id in targets:
+            targets[nb.id].subs.append(sub.id)
+        elif nb.id in unreadable:
+            unreadable[nb.id].append(sub.id)
+        else:
+            # a sound blob is read (and extracted) only when the audit needs it; without one, the extractor
+            # may still read the notebook, from a fresh cached tree or from its file
+            reason, why = ("", "") if store.blob_ok(nb.id) else _unreadable(store, nb)
+            if reason:
+                unreadable[nb.id] = [sub.id]
+                skipped.append(_skipped_notebook(nb, unreadable[nb.id], reason, why))
+            else:
+                targets[nb.id] = SubmittedNotebook(nb, [sub.id])
+    return list(targets.values()), skipped
+
+
+def _unlinked(sub_id: str, nb_id: str | None) -> dict[str, Any]:
+    """The skipped entry of a submission without a notebook (nb_id None) or with one that is not registered."""
+    link = f"`pseudorca sub link {shlex.quote(sub_id)} NB`"
+    if nb_id is None:
+        reason, why = "no_notebook", f"it has no notebook (link one with {link})"
+    else:
+        reason = "not_registered"
+        why = (
+            f"its notebook {util.short(nb_id)} is not registered (add it with `pseudorca nb add FILE` or "
+            f"`pseudorca kaggle pull OWNER/SLUG`, or link another with {link})"
+        )
+    message = f"skipped submission {sub_id}: {why}"
+    return {"reason": reason, "submissions": [sub_id], "nb": nb_id, "message": message}
+
+
+def _skipped_notebook(nb: Notebook, subs: list[str], reason: str, why: str) -> dict[str, Any]:
+    """The skipped entry of a notebook that cannot be read (reason not_stored or unreadable)."""
+    message = f"skipped {nb.label} ({util.short(nb.id)}): {why}"
+    return {"reason": reason, "submissions": subs, "nb": nb.id, "message": message}
+
+
+def _unreadable(store: Store, nb: Notebook) -> tuple[str, str]:
+    """(reason, why) when the extractor cannot read the notebook, else ("", ""). It is read as the audit
+    reads it (`extract.tree_for`): a fresh cached tree, else its blob, checked against its sha256, else the
+    file at its recorded path while that still has the same sha256 (a notebook added with --no-store). A
+    tree extracted here is cached, so the audit does not extract it again.
+
+    - not_stored: the bytes are not in this store, and no fresh cached tree or file stands in for them.
+    - unreadable: a blob that does not match its sha256 (a Git LFS pointer, say), bytes that are not a
+      notebook, or a file that cannot be read; `why` is the store's or the extractor's message.
+    """
+    from pseudorca import extract
+
+    try:
+        extract.tree_for(store, nb)
+    except StoreError as e:
+        if store.has_blob(nb.id):
+            return "unreadable", str(e) or type(e).__name__
+        return "not_stored", _not_stored(nb)
+    except (ValueError, OSError) as e:
+        return "unreadable", str(e) or type(e).__name__
+    return "", ""
+
+
+def _not_stored(nb: Notebook) -> str:
+    """Why a notebook whose bytes are not in this store cannot be read, with what to do about it."""
+    if nb.stored:
+        return (
+            "its bytes are not in this store (pull the latest store, or add the file again with "
+            "`pseudorca nb add FILE`)"
+        )
+    where = f"{nb.path} is gone or has changed" if nb.path else "no file path was recorded for it"
+    return (
+        f"it was added with --no-store and {where} (restore that version, or add it with "
+        "`pseudorca nb add FILE` so the store keeps its bytes)"
+    )
+
+
+def _label(nb: Notebook) -> str:
+    """A notebook's label on one line, cut to LABEL_WIDTH display columns (util.clip makes it safe to print:
+    labels come from the ledger)."""
+    return util.clip(" ".join(nb.label.split()), LABEL_WIDTH)
+
+
+def _llm_errors(rows: AuditRows) -> str:
+    """How many of these ideas the LLM failed on (each is in the table of `audit NB`), as "; N LLM errors"
+    to end a line; "" when it failed on none."""
+    n = sum(1 for r in rows if r.llm_error)
+    return f"; {n} LLM error{'' if n == 1 else 's'}" if n else ""
+
+
+def _notebook_line(nb: Notebook, rows: AuditRows, width: int) -> str:
+    """A notebook's line in `audit --submitted`: its label (padded to `width`), short sha, verdicts and LLM
+    errors."""
+    label = _label(nb)
+    pad = " " * (width - util.display_width(label))
+    new = sum(len(r.findings) for r in rows)
+    verdicts = f"{_verdict_counts(rows)}; {new} new verdict{'' if new == 1 else 's'}{_llm_errors(rows)}"
+    return f"{label}{pad}  {util.short(nb.id)}  {verdicts}"
+
+
+def _progress_of(nb: Notebook) -> Callable[[str], None]:
+    """Progress lines that name the notebook they are about."""
+    label = _label(nb)
+    return lambda message: _progress(f"{label}: {message}")
+
+
+def _where(nbs: list[Notebook]) -> str:
+    """The notebooks a warning is about: "each of N notebooks", or the one notebook's label and short sha."""
+    if len(nbs) > 1:
+        return f"each of {len(nbs)} notebooks"
+    return f"{nbs[0].label} ({util.short(nbs[0].id)})"
+
+
+def _report_each_once(targets: list[SubmittedNotebook]) -> None:
+    """The notebooks' messages and LLM errors, each text once, saying how many notebooks it came from: the
+    LLM setup is shared, so the same message (the LLM is not configured, not allowed or not reachable) would
+    otherwise repeat for each. Notebooks are counted, not named: versions pulled from one kernel often share
+    a name. Error texts can differ on every call (a rate limit's wait), so the MAX_LLM_ERRORS most frequent
+    are shown, and the others counted; --json has each one."""
+    sources: dict[str, list[Notebook]] = {}
+    for t in targets:
+        for message in t.rows.messages:
+            sources.setdefault(message, []).append(t.nb)
+    for message, nbs in sources.items():
+        _report_messages(AuditRows(messages=[message]), prefix=f"in {_where(nbs)}: ")
+    failed: dict[str, list[Notebook]] = {}  # error text -> its notebook, once per idea the LLM failed on
+    for t in targets:
+        for r in t.rows:
+            if r.llm_error:
+                failed.setdefault(r.llm_error, []).append(t.nb)
+    ranked = sorted(failed.items(), key=lambda item: -len(item[1]))  # stable: the first seen first
+    for error, nbs in ranked[:MAX_LLM_ERRORS]:
+        distinct = list({nb.id: nb for nb in nbs}.values())
+        per_nb = set(Counter(nb.id for nb in nbs).values())
+        if len(per_nb) == 1:  # as many ideas in each notebook
+            k = per_nb.pop()
+            warn(f"in {_where(distinct)}: the LLM failed on {k} idea{'' if k == 1 else 's'}: {error}")
+        else:
+            warn(f"in {len(distinct)} notebooks: the LLM failed on {len(nbs)} ideas in all: {error}")
+    if rest := ranked[MAX_LLM_ERRORS:]:
+        n = sum(len(nbs) for _, nbs in rest)
+        texts = f"{len(rest)} other text{'' if len(rest) == 1 else 's'}"
+        warn(f"{n} more LLM error{'' if n == 1 else 's'}, with {texts} (--json shows each one)")
 
 
 # ----- check ---------------------------------------------------------------------------------------
@@ -535,7 +830,7 @@ def _check(
             table = util.format_table(
                 HEADERS, [_cells(st.ideas[i], eff(i), by_id.get(i), i in nb.applies) for i in listed]
             ).splitlines()[2:]
-            click.echo(f"check of {nb.label} ({util.short(nb.id)})" + (f", {how}" if how else ""))
+            click.echo(f"check of {util.clean(nb.label)} ({util.short(nb.id)})" + (f", {how}" if how else ""))
             _show_sections(sections, table)
             click.echo(_check_outcome(problems, expected, expect_status, sections))
     except BrokenPipeError:  # stdout closed early (`| head`): the outcome stands
@@ -625,4 +920,4 @@ def verdict_cmd(c: Ctx, nb_ref: str, idea_id: str, status: str, note: str, evide
         idea = st.resolve_idea(idea_id)
         items = [_parse_evidence(e) for e in evidence]
     store.append("audit.verdict", Finding(status, "human", items, note=note).event_data(nb.id, idea))
-    click.echo(f"recorded: {idea.id} in {nb.label} is {SYMBOLS[status]} {status} (human verdict)")
+    click.echo(util.clean(f"recorded: {idea.id} in {nb.label} is {SYMBOLS[status]} {status} (human verdict)"))

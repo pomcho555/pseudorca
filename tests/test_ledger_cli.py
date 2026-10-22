@@ -1141,3 +1141,17 @@ def test_options_follow_one_convention(store: Store, command: list[str], wanted:
     for text in wanted:
         assert text in flat(raw), text
     assert not re.search(r"--[\w-]+ [A-Z]\b(?!/)", raw)  # no one-letter metavar such as `--tag T`
+
+
+def test_ledger_strings_reach_the_terminal_cleaned_in_every_text_output(store: Store):
+    hostile = "T\x1b]0;owned\x07\x1b[2J‮x"
+    store.append("idea.add", {"id": "i1", "title": hostile})
+    sha = store.put_blob(b"nb")
+    store.append("nb.add", {"id": sha, "name": hostile, "applies": ["i1"]})
+    store.append("sub.upsert", {"id": "7", "nb": sha, "public_score": 0.5, "description": hostile})
+    runner = CliRunner()
+    for args in (["idea", "show", "i1"], ["nb", "show", sha], ["sub", "list"], ["lb", "-n", "0"], ["log"]):
+        out = runner.invoke(main, ["--store", str(store.root), *args])
+        assert out.exit_code == 0, (args, out.output)
+        assert not any(c in out.output for c in "\x1b\x07‮"), args
+        assert "T?]0;owned??[2J?x" in out.output or "T?]0;owned" in out.output, args

@@ -10,7 +10,7 @@ from typing import Any
 import click
 
 from pseudorca import util
-from pseudorca.commands._common import Ctx, fail, pass_ctx, user_errors, warn
+from pseudorca.commands._common import Ctx, echo, fail, pass_ctx, user_errors, warn
 from pseudorca.kaggle_api import KaggleError, SyncReport, pull_kernel, sync_submissions
 from pseudorca.model import Notebook
 
@@ -93,9 +93,9 @@ def sync_cmd(ctx: Ctx, competition: str | None, dry_run: bool) -> None:
     )
     if report.linked:
         head += f"; {len(report.linked)} linked to notebooks"
-    click.echo(head + (" (dry run: nothing written)" if dry_run else ""))
+    echo(head + (" (dry run: nothing written)" if dry_run else ""))
     if report.rows:
-        click.echo(util.format_table(SUB_HEADERS, _rows(report, store.state().notebooks)))
+        echo(util.format_table(SUB_HEADERS, _rows(report, store.state().notebooks)))
     if report.ambiguous:
         ids = ", ".join(report.ambiguous[:10]) + (" ..." if len(report.ambiguous) > 10 else "")
         warn(
@@ -129,6 +129,6 @@ def pull_cmd(
     with _errors():
         nb, created = pull_kernel(store, kernel, name=name, tags=tags, parent=parent, applies=applies)
     if created:
-        click.echo(f"registered {nb.label} {util.short(nb.id)} from {nb.kernel}")
+        echo(f"registered {nb.label} {util.short(nb.id)} from {nb.kernel}")
     else:
-        click.echo(f"already registered as {nb.label} {util.short(nb.id)}")
+        echo(f"already registered as {nb.label} {util.short(nb.id)}")

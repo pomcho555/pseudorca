@@ -1,4 +1,4 @@
-"""Write synthetic demo inputs for Pseudorca: two notebook versions, a patch and two results tables.
+"""Write synthetic demo inputs for Pseudorca: four notebook versions, a patch and four results tables.
 
     python examples/make_demo_files.py DEMO_DIR
 
@@ -52,6 +52,8 @@ def solve(llm, problem, sampling, retries=2):
             return answer
     return None
 """
+
+SOLVER_LEAN = SOLVER_V1.replace("Think step by step.", "Think step by step, briefly.")  # no retries
 
 RETRY_PATCH = """\
 --- a/solver.py
@@ -143,9 +145,14 @@ def main(out: Path) -> None:
             _notebook(SOLVER_V2, ", enable_prefix_caching=True, gpu_memory_utilization=0.92", "0.7"), indent=1
         )
     )
+    cache = ", enable_prefix_caching=True, gpu_memory_utilization=0.92"
+    (out / "hot.ipynb").write_text(json.dumps(_notebook(SOLVER_V2, cache, "0.6"), indent=1))  # next, hotter
+    (out / "lean.ipynb").write_text(json.dumps(_notebook(SOLVER_LEAN, cache, "0.7"), indent=1))  # next, no retries
     (out / "retry-parse.diff").write_text(RETRY_PATCH)
     _results(out / "runs" / "base.csv", 0.0, seed=1)
     _results(out / "runs" / "next.csv", 0.08, seed=2)
+    _results(out / "runs" / "hot.csv", -0.04, seed=3)
+    _results(out / "runs" / "lean.csv", 0.06, seed=4)
     print(f"wrote demo files to {out}")
 
 

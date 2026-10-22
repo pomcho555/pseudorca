@@ -10,7 +10,7 @@ from pathlib import Path
 
 import click
 
-from pseudorca import __version__
+from pseudorca import __version__, util
 from pseudorca.commands._common import Ctx, show_warnings
 from pseudorca.store import StoreError
 
@@ -28,6 +28,7 @@ COMMANDS: dict[str, str] = {
     "run": "pseudorca.commands.results:run_group",
     "compare": "pseudorca.commands.results:compare_cmd",
     "lb": "pseudorca.commands.results:lb_cmd",
+    "effects": "pseudorca.commands.effects:effects_cmd",
     "report": "pseudorca.commands.report:report_cmd",
     "log": "pseudorca.commands.ledger:log_cmd",
 }
@@ -55,8 +56,11 @@ class LazyGroup(click.Group):
             raise SystemExit(0) from None
         except KeyError:
             raise
+        except click.ClickException as e:  # its message may quote the ledger: print it safely
+            e.message = util.clean(e.message)
+            raise
         except (StoreError, LookupError, ValueError, OSError) as e:
-            raise click.ClickException(str(e) or type(e).__name__) from e
+            raise click.ClickException(util.clean(str(e) or type(e).__name__)) from e
 
     def _run(self, ctx: click.Context) -> object:
         try:

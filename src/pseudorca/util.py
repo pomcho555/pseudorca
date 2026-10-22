@@ -1,15 +1,19 @@
-"""Small shared helpers: ids, hashes, time stamps and plain-text tables."""
+"""Small shared helpers: ids, hashes, time stamps, plain-text tables and numbers for display."""
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
+import itertools
+import math
 import os
 import re
 import time
 import unicodedata
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _RAND_MASK = (1 << 80) - 1
@@ -138,6 +142,17 @@ def short(sha: str | None, n: int = 10) -> str:
     return (sha or "")[:n]
 
 
+# control characters (all but tab) and bidirectional overrides: printed as they are, they could move the
+# cursor, recolour, retitle or rewrite the terminal, or make text read in another order than it is
+_UNSAFE_RE = re.compile("[\x00-\x08\x0a-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean(text: str) -> str:
+    """`text` safe to print on one terminal line: each unsafe character becomes "?". Ledger strings come
+    through git from teammates, or from hand-edited events."""
+    return _UNSAFE_RE.sub("?", text)
+
+
 def _char_width(c: str) -> int:
     return 2 if unicodedata.east_asian_width(c) in "WF" else 1
 
@@ -148,7 +163,8 @@ def display_width(text: str) -> int:
 
 
 def clip(text: str, width: int) -> str:
-    """Cut text to a display width, marking the cut with an ellipsis."""
+    """Cut text to a display width, marking the cut with an ellipsis (unsafe characters become "?")."""
+    text = clean(text)
     if display_width(text) <= width:
         return text
     out, used = [], 0
@@ -192,12 +208,12 @@ def format_table(
     limits = col_widths or {}
     cells = [
         [
-            clip(" ".join(("" if v is None else str(v)).split()), limits.get(i, max_width))
+            clip(" ".join(("" if v is None else str(v)).split()), limits.get(i, max_width))  # clip cleans
             for i, v in enumerate(row)
         ]
         for row in rows
     ]
-    heads = [str(h) for h in headers]
+    heads = [clean(str(h)) for h in headers]
     widths = [display_width(h) for h in heads]
     for row in cells:
         for i, v in enumerate(row):
@@ -209,3 +225,109 @@ def format_table(
     out = [line(heads), line(["-" * w for w in widths])]
     out.extend(line(r) for r in cells)
     return "\n".join(out)
+
+
+# ----- numbers for display -------------------------------------------------------------------------
+
+MINUS = "−"
+COMPACT = 1e6  # from this magnitude on, a number is shown with 4 to 6 significant digits, not decimals
+MAX_DECIMALS = 10
+
+
+def _finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def number(x: float | None, dec: int | None = None) -> str:
+    """A score: `dec` decimals, or 6 significant digits (always for 1e6 and more); empty when missing."""
+    if not _finite(x):
+        return ""
+    assert x is not None
+    return f"{x:.6g}" if dec is None or abs(x) >= COMPACT else f"{x:.{dec}f}"
+
+
+def _magnitude(x: float, dec: int) -> str:
+    return f"{x:.4g}" if x >= COMPACT else f"{x:.{dec}f}"
+
+
+def plain_number(x: float | None, dec: int) -> str:
+    """A value with a Unicode minus ("n/a" when missing)."""
+    if not _finite(x):
+        return "n/a"
+    assert x is not None
+    text = _magnitude(abs(x), dec)
+    return MINUS + text if x < 0 and float(text) else text
+
+
+def signed_number(x: float | None, dec: int) -> str:
+    """A difference: always signed, except a zero ("n/a" when missing)."""
+    if not _finite(x):
+        return "n/a"
+    assert x is not None
+    text = _magnitude(abs(x), dec)
+    if not float(text):
+        return text
+    return ("+" if x > 0 else MINUS) + text
+
+
+def interval_decimals(items: Iterable[Any], fallback: Iterable[float | None] = ()) -> int:
+    """Decimals that show intervals (of anything with ci_low and ci_high: terms, steps) to about two
+    significant digits; more when a bound that excludes 0 would otherwise print as 0."""
+    items = list(items)
+    widths = [
+        t.ci_high - t.ci_low
+        for t in items
+        if _finite(getattr(t, "ci_low", None)) and _finite(getattr(t, "ci_high", None))
+    ]
+    bases = [w for w in widths if w > 0 and math.isfinite(w)]  # two huge finite bounds can be inf apart
+    if not bases:
+        values = [abs(getattr(t, "estimate", getattr(t, "delta", 0.0)) or 0.0) for t in items]
+        values += [abs(v) for v in fallback if _finite(v)]  # type: ignore[arg-type]
+        bases = [v for v in values if math.isfinite(v) and v > 0]
+    dec = min(MAX_DECIMALS, max(0, 1 - math.floor(math.log10(min(bases))))) if bases else 3
+    for t in items:
+        lo, hi = getattr(t, "ci_low", None), getattr(t, "ci_high", None)
+        for bound, excludes in ((lo, _finite(lo) and lo > 0), (hi, _finite(hi) and hi < 0)):
+            while excludes and dec < MAX_DECIMALS and not float(f"{abs(bound):.{dec}f}"):
+                dec += 1
+    return dec
+
+
+def score_columns(
+    scores: Iterable[float | None], fitted: Iterable[float | None], digits: int = 6
+) -> tuple[int, int]:
+    """Decimals for scores (to `digits` significant digits: 6 for scores as recorded, fewer for means
+    computed from a table) and for fitted values: up to 2 more than the scores' (a fitted value is a mean,
+    but hardly more precise than the scores it comes from)."""
+    dec = score_decimals(scores, digits=digits)
+    return dec, min(dec + 2, max(dec, score_decimals(fitted, digits=digits)))
+
+
+def running_column(start: float, deltas: list[float], end: float, dec: int) -> tuple[str, list[str], str]:
+    """A start, the steps added to it and the end, at `dec` decimals. Each step is shown as the difference
+    of the rounded running totals, so the column adds up as printed (a step is then at most one unit in
+    the last place from its own rounding). Compact numbers (1e6 and more) are rounded one by one."""
+    totals = [start]
+    for d in deltas[:-1]:
+        totals.append(totals[-1] + d)
+    totals.append(end)
+    if not all(_finite(v) and abs(v) < COMPACT for v in totals):
+        return plain_number(start, dec), [signed_number(d, dec) for d in deltas], plain_number(end, dec)
+    shown = [round(v, dec) for v in totals]
+    steps = [signed_number(b - a, dec) for a, b in itertools.pairwise(shown)]
+    return plain_number(shown[0], dec), steps[: len(deltas)], plain_number(shown[-1], dec)
+
+
+def score_decimals(values: Iterable[float | None], cap: int = 8, digits: int = 6) -> int:
+    """Decimals that show every value to `digits` significant digits, without trailing zeros (at most
+    `cap`)."""
+    dec = 0
+    for v in values:
+        if not _finite(v) or v == 0 or abs(v) >= COMPACT:  # type: ignore[arg-type]
+            continue
+        assert v is not None
+        places = min(cap, max(0, digits - 1 - math.floor(math.log10(abs(v)))))
+        text = f"{abs(v):.{places}f}".rstrip("0")
+        if "." in text:
+            dec = max(dec, len(text.split(".")[1]))
+    return dec

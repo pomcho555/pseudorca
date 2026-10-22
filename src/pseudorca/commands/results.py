@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from pseudorca import util
-from pseudorca.commands._common import Ctx, fail, pass_ctx, show_warnings, user_errors, warn
+from pseudorca.commands._common import Ctx, echo, fail, pass_ctx, show_warnings, user_errors, warn
 from pseudorca.store import StoreError
 
 if TYPE_CHECKING:
@@ -98,9 +98,9 @@ def run_add(
         )
     tags = [f"label {label}" if label else "", f"notebook {nb.label}" if nb else "", _protocol_tag(protocol)]
     head = f"added run {run_id[:10]}"
-    click.echo(head + (f" ({', '.join(t for t in tags if t)})" if any(tags) else ""))
+    echo(head + (f" ({', '.join(t for t in tags if t)})" if any(tags) else ""))
     for line in _table_overview(table):
-        click.echo("  " + line)
+        echo("  " + line)
     if DEFAULT_METRIC not in table.metrics:
         warn(f"no {DEFAULT_METRIC!r} column: compare this run with --metric NAME")
 
@@ -133,7 +133,7 @@ def run_list(ctx: Ctx, nb_ref: str | None, count: int, as_json: bool) -> None:
         _echo_json([dataclasses.asdict(r) for r in shown])
         return
     if not shown:
-        click.echo(
+        echo(
             "no runs" + (" for that notebook" if nb_ref else "") + " (add one with `pseudorca run add FILE`)"
         )
     else:
@@ -149,9 +149,9 @@ def run_list(ctx: Ctx, nb_ref: str | None, count: int, as_json: bool) -> None:
             ]
             for r in shown
         ]
-        click.echo(util.format_table(["ID", "LABEL", "NOTEBOOK", "PROTOCOL", "ROWS", "ADDED", "BY"], rows))
+        echo(util.format_table(["ID", "LABEL", "NOTEBOOK", "PROTOCOL", "ROWS", "ADDED", "BY"], rows))
         if len(runs) > len(shown):
-            click.echo(f"({_plural(len(runs) - len(shown), 'older run')} not shown)")
+            echo(f"({_plural(len(runs) - len(shown), 'older run')} not shown)")
     repeats = distinct_runs(runs)[1]
     if repeats:
         warn(f"{_repeats_text(repeats)}; compare pools each table once")
@@ -185,12 +185,12 @@ def run_show(ctx: Ctx, run_ref: str) -> None:
         ("added", f"{util.local_time(run.added)} by {run.added_by}"),
         ("table", f"{run.format}, {len(table)} rows, blob {util.short(run.results, 12)}{also}"),
     ]
-    click.echo(f"run {run.id}")
+    echo(f"run {run.id}")
     for key, value in fields:
         if value:
-            click.echo(f"{key:<9} {value}")
+            echo(f"{key:<9} {value}")
     lo, med, hi = _count_spread(table.draw_counts().values())
-    click.echo(f"{'items':<9} {len(table.draw_counts())}, draws per item: min {lo}, median {med:g}, max {hi}")
+    echo(f"{'items':<9} {len(table.draw_counts())}, draws per item: min {lo}, median {med:g}, max {hi}")
     rows = []
     for name, column in table.metrics.items():
         values = column[~np.isnan(column)]
@@ -207,11 +207,11 @@ def run_show(ctx: Ctx, run_ref: str) -> None:
                 _num(float(values.max())) if values.size else "n/a",
             ]
         )
-    click.echo("")
-    click.echo(util.format_table(["METRIC", "ITEMS", "VALUES", "MISSING", "MEAN", "SD", "MIN", "MAX"], rows))
-    click.echo("MEAN is over items (each item's draws averaged first); SD is the SD of those item means.")
+    echo("")
+    echo(util.format_table(["METRIC", "ITEMS", "VALUES", "MISSING", "MEAN", "SD", "MIN", "MAX"], rows))
+    echo("MEAN is over items (each item's draws averaged first); SD is the SD of those item means.")
     if table.ignored:
-        click.echo(f"ignored columns: {', '.join(table.ignored)}")
+        echo(f"ignored columns: {', '.join(table.ignored)}")
     show_warnings(store)
 
 
@@ -314,7 +314,7 @@ def compare_cmd(
         _echo_json(payload)
         return
     for line in _render_compare(result, metric, (arm_a, values_a), (arm_b, values_b)):
-        click.echo(line)
+        echo(line)
     if result.small_n:
         warn(f"only {result.n_items} item(s) compared: the interval and p-value are rough")
     show_warnings(store)
@@ -496,7 +496,7 @@ def lb_cmd(
             _echo_json({"a": a, "b": b, "diff": diff, "z": z, "verdict": verdict, "noise": noise_json})
             return
         for line in _render_diff(st, (sub_a, sub_b), diff, z, verdict, noise):
-            click.echo(line)
+            echo(line)
         show_warnings(store)
         return
     total = len(shown)
@@ -508,7 +508,7 @@ def lb_cmd(
         )
         return
     if not shown:
-        click.echo(
+        echo(
             "no submissions of that notebook"
             if nb_ref
             else "no submissions yet (record them with `pseudorca sub` or `pseudorca kaggle sync`)"
@@ -525,21 +525,21 @@ def lb_cmd(
             ]
             for s in shown
         ]
-        click.echo(util.format_table(["ID", "DATE", "NOTEBOOK", "PUBLIC", "PRIVATE", "STATUS"], rows))
+        echo(util.format_table(["ID", "DATE", "NOTEBOOK", "PUBLIC", "PRIVATE", "STATUS"], rows))
         if len(shown) < total:
-            click.echo(f"(the newest {len(shown)} of {total}; -n 0 shows all)")
-    click.echo("")
+            echo(f"(the newest {len(shown)} of {total}; -n 0 shows all)")
+    echo("")
     if noise is None:
-        click.echo(
+        echo(
             "LB noise: unknown. It needs a notebook submitted at least twice; "
             "resubmitting an unchanged notebook shows how much the public score moves by chance."
         )
     else:
-        click.echo(
+        echo(
             f"LB noise: pooled SD {noise.sd:.3g} of the public score, from {_plural(noise.n_groups, 'notebook')} "
             f"and {_plural(noise.n_subs, 'submission')}."
         )
-        click.echo(
+        echo(
             f"Two single submissions differ by chance with SD {noise.sd * math.sqrt(2):.3g}; "
             f"a gap under {Z_BEYOND * noise.sd * math.sqrt(2):.3g} is within noise (|z| < {Z_BEYOND:g})."
         )

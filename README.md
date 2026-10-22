@@ -41,8 +41,8 @@ pip install "pseudorca[all] @ git+https://github.com/pomcho555/pseudorca"
 
 ## A five-minute tour
 
-The tour uses synthetic files from `examples/make_demo_files.py`: an offline word-problem solver in two
-notebook versions, a patch, and two results tables.
+The tour uses synthetic files from `examples/make_demo_files.py`: an offline word-problem solver in four
+notebook versions, a patch, and four results tables.
 
 ```bash
 git clone https://github.com/pomcho555/pseudorca
@@ -216,7 +216,88 @@ z = +1.79 against the LB noise (pooled SD 0.0099 from 1 notebook and 2 submissio
 verdict: within LB noise
 ```
 
-### 8. Share
+### 8. What did each idea add?
+
+Two more versions get submitted: `hot.ipynb` samples at temperature 0.6 (the rejected idea), and
+`lean.ipynb` drops the retries. `audit --submitted` audits every notebook that has a submission, and
+`effects` lines the submissions up against the ideas:
+
+```bash
+pseudorca nb add hot.ipynb  --parent next.ipynb --tag candidate
+pseudorca nb add lean.ipynb --parent next.ipynb --tag candidate
+pseudorca run add runs/hot.csv  --nb hot.ipynb  --label hot  --protocol p60x3
+pseudorca run add runs/lean.csv --nb lean.ipynb --label lean --protocol p60x3
+pseudorca sub add 1004 --nb hot.ipynb  --score 0.411 --date 2026-01-08
+pseudorca sub add 1005 --nb lean.ipynb --score 0.428 --date 2026-01-09
+pseudorca sub add 1006 --nb next.ipynb --score 0.441 --date 2026-01-10
+pseudorca audit --submitted
+pseudorca effects
+```
+
+```text
+Submissions, oldest first (public score)
+SUB   DATE        NOTEBOOK    PUBLIC  FITTED  1  2  3  4  CHANGES
+----  ----------  ----------  ------  ------  -  -  -  -  -------------------------------------
+1001  2026-01-05  base.ipynb  0.412   0.405   ✗  ✗  ✗  ✗
+1002  2026-01-06  base.ipynb  0.398   0.405   ✗  ✗  ✗  ✗  resubmits 1001
+1003  2026-01-07  next.ipynb  0.437   0.439   ✓  ✓  ✓  ✗  +prefix-cache +retry-parse +short-cot
+1004  2026-01-08  hot.ipynb   0.411   0.411   ✓  ✓  ✓  ✓  +temp-06
+1005  2026-01-09  lean.ipynb  0.428   0.428   ✓  ✗  ✓  ✗  −retry-parse −temp-06
+1006  2026-01-10  next.ipynb  0.441   0.439   ✓  ✓  ✓  ✗  resubmits 1003; +retry-parse
+ideas: 1 prefix-cache  2 retry-parse  3 short-cot  4 temp-06
+✓ present  ◐ partial  ✗ absent  ? unknown  ! methods disagree  · no verdict  * stale (re-audit)
+
+What each idea adds to the public score (additive model over 6 submissions)
+IDEA                      EFFECT  95% CI            SUBS  VERDICT       −0.066    0    +0.066  NOTE
+------------------------  ------  ----------------  ----  ------------  ---------------------  --------------------------------------------
+prefix-cache + short-cot  +0.023  [−0.015, +0.061]  4/2   within noise          [-|--*-----]   always in or out together: measured together
+retry-parse               +0.011  [−0.027, +0.049]  3/3   within noise        [---|-*----]
+temp-06                   −0.028  [−0.066, +0.010]  1/5   within noise  [-----*---|-]
+SUBS = submissions with/without it. VERDICT is helps or hurts when the 95% CI excludes 0.
+noise: residual SD 0.00728 with 2 degrees of freedom; t intervals (few degrees of freedom: wide intervals)
+resubmitting a notebook moved the score with SD 0.00728 (2 notebook(s), 4 submissions)
+
+Local runs (protocol p60x3), score: 4 of 4 runs used, 60 items in every one
+RUN                NOTEBOOK    MEAN    FITTED  1  2  3  4  NOTE
+-----------------  ----------  ------  ------  -  -  -  -  ----
+01M5J3ZEDT (base)  base.ipynb  0.5111  0.5111  ✗  ✗  ✗  ✗
+01M5J3ZEG7 (next)  next.ipynb  0.5833  0.5833  ✓  ✓  ✓  ✗
+01M5J3ZF0H (hot)   hot.ipynb   0.4556  0.4556  ✓  ✓  ✓  ✓
+01M5J3ZF2R (lean)  lean.ipynb  0.5333  0.5333  ✓  ✗  ✓  ✗
+ideas: 1 prefix-cache  2 retry-parse  3 short-cot  4 temp-06
+
+What each idea adds to the score (additive model over 4 runs)
+IDEA                      EFFECT  95% CI          RUNS  VERDICT       −0.24     0     +0.24  NOTE
+------------------------  ------  --------------  ----  ------------  ---------------------  --------------------------------------------
+retry-parse               +0.05   [−0.07, +0.17]  2/2   within noise         [--|-*----]
+prefix-cache + short-cot  +0.02   [−0.10, +0.15]  3/1   within noise        [---|*----]      always in or out together: measured together
+temp-06                   −0.13   [−0.24, −0.01]  1/3   hurts         [----*---]|
+RUNS = runs with/without it. VERDICT is helps or hurts when the 95% CI excludes 0 and the sign-flip p < 0.05, as in `compare`.
+intervals: two-stage bootstrap over items and draws (10000 resamples, seed 0), the runs paired by item
+run-to-run SD: not measurable, as no two runs have the same ideas; the intervals assume none (run a notebook twice to measure it)
+
+Breakdown of 1006 (best in the model) from 1001 (first), by the model
+  1001 fitted                    0.405  observed 0.412
+  + (prefix-cache + short-cot)  +0.023  [−0.015, +0.061]
+  + retry-parse                 +0.011  [−0.027, +0.049]
+  = 1006 fitted                  0.439  observed 0.441
+```
+
+- **The table** shows which ideas each submission has, and what changed since the one before.
+- **The effects** come from an additive model, `score = baseline + the effects of its ideas + noise`. It
+  is fitted to all scored submissions, and separately to the local runs of each protocol, paired by item.
+- **What cannot be separated is said so.** `prefix-cache` and `short-cot` were always added together, so
+  only their sum is measured. An idea that is in every submission, or in none, gets no number at all.
+  Two ideas that replaced each other are measured as "A instead of B".
+- **On the leaderboard nothing is beyond the noise yet.** Two resubmissions give the noise estimate only
+  2 degrees of freedom, so the intervals are wide. The local runs measure the same ideas on another
+  metric, and there temperature 0.6 clearly hurts.
+- **The breakdown** walks from the first submission to the best one, idea by idea. `--sub` and `--base`
+  choose others.
+
+`pseudorca report` draws the same as charts.
+
+### 9. Share
 
 ```bash
 pseudorca report                # writes .pseudorca/cache/report.html (local, ignored by git)
@@ -330,6 +411,22 @@ allow_remote = true                      # notebook code will be sent to this pr
 **`lb`** estimates leaderboard noise from notebooks submitted more than once, and `lb --diff` tells you
 whether a gap is bigger than that noise.
 
+**`effects`** puts the ideas side by side instead of two notebooks:
+- Each scored submission (or local run) is a row, and the verdicts on its notebook say which ideas it has.
+- An additive least-squares model gives each idea's effect with an interval: Student's t from the residuals
+  on the leaderboard (or a known `--noise`), and the paired two-stage bootstrap on local runs.
+- Ideas that always change together are measured together, and swapped ideas as "A instead of B". What the
+  rows cannot separate gets no number.
+- The breakdown (`--sub`, `--base`) shows how one submission's score is built from another's, idea by idea.
+- On local runs, runs with the same ideas also measure run-to-run noise, and the intervals include it.
+- Set the score's direction and a known LB noise once for the team, in `.pseudorca/config.toml`:
+
+  ```toml
+  [effects]
+  lower_is_better = true   # for an error metric
+  noise = 0.012            # the LB noise SD, if you know it
+  ```
+
 ## Commands
 
 | command | what it does |
@@ -337,17 +434,19 @@ whether a gap is bigger than that noise.
 | `init` | create `.pseudorca/` in the current repository, or complete a partial one |
 | `idea add / update / list / show` | the ideas |
 | `nb add / update / list / show / tree` | notebooks, and what the audit sees in them |
-| `audit [NB]` | decide which ideas are in a notebook |
+| `audit [NB]`, `audit --submitted` | decide which ideas are in a notebook, or in every submitted one |
 | `check FILE_OR_NB` | audit, then fail if an expected idea is missing or a rejected one is present |
 | `verdict NB IDEA STATUS` | record a human verdict |
 | `status` | the ideas × notebooks board |
 | `sub add / list / link`, `kaggle sync`, `kaggle pull` | submissions and Kaggle kernels (read-only) |
 | `run add / list / show`, `compare`, `lb` | results and noise |
+| `effects` | which ideas each submission has, and what each idea adds to the score |
 | `report` | a single-file HTML report |
 | `log` | recent changes and who made them |
 
-`audit`, `check`, `status`, `log`, `lb` and the `list` commands take `--json` for scripts. In `status`,
-`log`, `nb list`, `sub list`, `run list`, `lb` and `report`, `-n N` shows the latest N and `-n 0` shows all.
+`audit`, `check`, `status`, `log`, `lb`, `effects` and the `list` commands take `--json` for scripts. In
+`status`, `log`, `nb list`, `sub list`, `run list`, `lb`, `effects` and `report`, `-n N` shows the latest N
+and `-n 0` shows all.
 Times are shown in your time zone.
 
 Every command has `--help`. The design and the exact rules are in [DESIGN.md](DESIGN.md), and the safety

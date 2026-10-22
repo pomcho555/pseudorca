@@ -115,6 +115,14 @@ def test_jsonl_values():
         load_table(b'{"item": "q1", "score": 1}\n{"score": 0}\n', "jsonl")
 
 
+def test_jsonl_nested_deeper_than_the_recursion_limit_is_a_value_error():
+    """json raises RecursionError for such a line: a RuntimeError, which no caller of load_table expects."""
+    deep = "[" * 100_000 + "]" * 100_000
+    data = f'{{"item": "q1", "score": 1}}\n{{"item": "q2", "score": {deep}}}\n'.encode()
+    with pytest.raises(ValueError, match=r"^line 2: nested too deeply$"):
+        load_table(data, "jsonl")
+
+
 def test_format_for():
     assert format_for("runs/a.csv") == "csv"
     assert format_for(Path("a.JSONL")) == "jsonl" and format_for("b.ndjson") == "jsonl"
@@ -246,6 +254,21 @@ def test_run_add_rejects_bad_tables(store: Store, tmp_path: Path):
 
     again = _cli(store, "run", "add", str(odd), "--format", "jsonl")
     assert again.exit_code == 0 and "already added as run" in again.output
+
+
+def test_a_table_nested_too_deeply_is_a_one_line_error(store: Store, tmp_path: Path):
+    deep = tmp_path / "deep.jsonl"
+    deep.write_text('{"item": "q1", "score": ' + "[" * 100_000 + "]" * 100_000 + "}\n", encoding="utf-8")
+    result = _cli(store, "run", "add", str(deep))
+    assert result.exit_code == 1 and result.output == "Error: line 1: nested too deeply\n"
+    assert Store.at(store.root).state().runs == {}
+    # a hand-made run that arrived through git: listed as not used, instead of stopping `effects`
+    nb = register_bytes(store, b'{"cells": []}', name="a.ipynb")[0]
+    blob = store.put_blob(deep.read_bytes())
+    store.append("run.add", {"id": util.new_ulid(), "results": blob, "format": "jsonl", "nb": nb.id})
+    result = _cli(store, "effects")
+    assert result.exit_code == 0, result.output
+    assert "line 1: nested too deeply" in result.output
 
 
 def test_compare_by_run_id_label_and_notebook(two_notebooks: Store, tmp_path: Path):

@@ -39,7 +39,7 @@ pip install "pseudorca[all] @ git+https://github.com/pomcho555/pseudorca"
 
 ## 5 分で一周
 
-`examples/make_demo_files.py` が作る合成データで一周します。中身は、オフラインで文章題を解くソルバーのノートブック 2 版、パッチ 1 つ、結果表 2 つです。
+`examples/make_demo_files.py` が作る合成データで一周します。中身は、オフラインで文章題を解くソルバーのノートブック 4 版、パッチ 1 つ、結果表 4 つです。
 
 ```bash
 git clone https://github.com/pomcho555/pseudorca
@@ -211,7 +211,80 @@ z = +1.79 against the LB noise (pooled SD 0.0099 from 1 notebook and 2 submissio
 verdict: within LB noise
 ```
 
-### 8. 共有する
+### 8. 各改善はどれだけ効いたか
+
+さらに 2 つの版を提出します。`hot.ipynb` は温度 0.6 でサンプリングする版（rejected の改善）、`lean.ipynb` は再試行を外した版です。`audit --submitted` で提出のあるノートブックをすべて判定し、`effects` で提出と改善を突き合わせます。
+
+```bash
+pseudorca nb add hot.ipynb  --parent next.ipynb --tag candidate
+pseudorca nb add lean.ipynb --parent next.ipynb --tag candidate
+pseudorca run add runs/hot.csv  --nb hot.ipynb  --label hot  --protocol p60x3
+pseudorca run add runs/lean.csv --nb lean.ipynb --label lean --protocol p60x3
+pseudorca sub add 1004 --nb hot.ipynb  --score 0.411 --date 2026-01-08
+pseudorca sub add 1005 --nb lean.ipynb --score 0.428 --date 2026-01-09
+pseudorca sub add 1006 --nb next.ipynb --score 0.441 --date 2026-01-10
+pseudorca audit --submitted
+pseudorca effects
+```
+
+```text
+Submissions, oldest first (public score)
+SUB   DATE        NOTEBOOK    PUBLIC  FITTED  1  2  3  4  CHANGES
+----  ----------  ----------  ------  ------  -  -  -  -  -------------------------------------
+1001  2026-01-05  base.ipynb  0.412   0.405   ✗  ✗  ✗  ✗
+1002  2026-01-06  base.ipynb  0.398   0.405   ✗  ✗  ✗  ✗  resubmits 1001
+1003  2026-01-07  next.ipynb  0.437   0.439   ✓  ✓  ✓  ✗  +prefix-cache +retry-parse +short-cot
+1004  2026-01-08  hot.ipynb   0.411   0.411   ✓  ✓  ✓  ✓  +temp-06
+1005  2026-01-09  lean.ipynb  0.428   0.428   ✓  ✗  ✓  ✗  −retry-parse −temp-06
+1006  2026-01-10  next.ipynb  0.441   0.439   ✓  ✓  ✓  ✗  resubmits 1003; +retry-parse
+ideas: 1 prefix-cache  2 retry-parse  3 short-cot  4 temp-06
+✓ present  ◐ partial  ✗ absent  ? unknown  ! methods disagree  · no verdict  * stale (re-audit)
+
+What each idea adds to the public score (additive model over 6 submissions)
+IDEA                      EFFECT  95% CI            SUBS  VERDICT       −0.066    0    +0.066  NOTE
+------------------------  ------  ----------------  ----  ------------  ---------------------  --------------------------------------------
+prefix-cache + short-cot  +0.023  [−0.015, +0.061]  4/2   within noise          [-|--*-----]   always in or out together: measured together
+retry-parse               +0.011  [−0.027, +0.049]  3/3   within noise        [---|-*----]
+temp-06                   −0.028  [−0.066, +0.010]  1/5   within noise  [-----*---|-]
+SUBS = submissions with/without it. VERDICT is helps or hurts when the 95% CI excludes 0.
+noise: residual SD 0.00728 with 2 degrees of freedom; t intervals (few degrees of freedom: wide intervals)
+resubmitting a notebook moved the score with SD 0.00728 (2 notebook(s), 4 submissions)
+
+Local runs (protocol p60x3), score: 4 of 4 runs used, 60 items in every one
+RUN                NOTEBOOK    MEAN    FITTED  1  2  3  4  NOTE
+-----------------  ----------  ------  ------  -  -  -  -  ----
+01M5J3ZEDT (base)  base.ipynb  0.5111  0.5111  ✗  ✗  ✗  ✗
+01M5J3ZEG7 (next)  next.ipynb  0.5833  0.5833  ✓  ✓  ✓  ✗
+01M5J3ZF0H (hot)   hot.ipynb   0.4556  0.4556  ✓  ✓  ✓  ✓
+01M5J3ZF2R (lean)  lean.ipynb  0.5333  0.5333  ✓  ✗  ✓  ✗
+ideas: 1 prefix-cache  2 retry-parse  3 short-cot  4 temp-06
+
+What each idea adds to the score (additive model over 4 runs)
+IDEA                      EFFECT  95% CI          RUNS  VERDICT       −0.24     0     +0.24  NOTE
+------------------------  ------  --------------  ----  ------------  ---------------------  --------------------------------------------
+retry-parse               +0.05   [−0.07, +0.17]  2/2   within noise         [--|-*----]
+prefix-cache + short-cot  +0.02   [−0.10, +0.15]  3/1   within noise        [---|*----]      always in or out together: measured together
+temp-06                   −0.13   [−0.24, −0.01]  1/3   hurts         [----*---]|
+RUNS = runs with/without it. VERDICT is helps or hurts when the 95% CI excludes 0 and the sign-flip p < 0.05, as in `compare`.
+intervals: two-stage bootstrap over items and draws (10000 resamples, seed 0), the runs paired by item
+run-to-run SD: not measurable, as no two runs have the same ideas; the intervals assume none (run a notebook twice to measure it)
+
+Breakdown of 1006 (best in the model) from 1001 (first), by the model
+  1001 fitted                    0.405  observed 0.412
+  + (prefix-cache + short-cot)  +0.023  [−0.015, +0.061]
+  + retry-parse                 +0.011  [−0.027, +0.049]
+  = 1006 fitted                  0.439  observed 0.441
+```
+
+- **表**は、各提出にどの改善が入っているかと、1 つ前の提出から何が変わったかを示します。
+- **効果**は加法モデル（スコア = 基準 + 入っている改善の効果の和 + ノイズ）で推定します。スコアのある提出すべてに当てはめ、別にプロトコルごとのローカル実行にも当てはめます（問題ごとに対応づけ）。
+- **分けられないものは、分けられないと表示します。** `prefix-cache` と `short-cot` は常に一緒に入ったので、測れるのは 2 つの合計だけです。すべての提出に入っている改善や、どの提出にも入っていない改善には数値を出しません。入れ替えた 2 つの改善は「A instead of B」（B の代わりに A）として差を測ります。
+- **LB ではまだノイズを超えた改善はありません。** 再提出が 2 組だけなので、ノイズの推定の自由度は 2 しかなく、区間が広くなります。ローカル実行では同じ改善を別の指標で測っていて、そちらでは温度 0.6 ではっきり悪化しています。
+- **内訳**は、最初の提出から最良の提出まで、改善 1 つずつスコアを積み上げます。`--sub` と `--base` で別の提出を選べます。
+
+`pseudorca report` は同じ内容をグラフで描きます。
+
+### 9. 共有する
 
 ```bash
 pseudorca report                # .pseudorca/cache/report.html を作る（ローカル、git の対象外）
@@ -312,6 +385,20 @@ LLM に聞く範囲と費用については次のとおりです。
 - protocol の違う run どうしは、`--force` を付けない限り比べません。
 - `lb` は同じノートブックの再提出から LB のブレを推定し、`lb --diff` はある差がそのブレより大きいかを判定します。
 
+**`effects`** は、2 つのノートブックではなく改善どうしを並べて比べます。
+- スコアのある提出（またはローカル実行）1 つが 1 行で、そのノートブックの判定から、入っている改善が決まります。
+- 加法モデルを最小二乗で当てはめ、改善ごとの効果を区間つきで出します。区間は、LB では残差からの t 分布（ブレが分かっていれば `--noise`）、ローカル実行では問題ごとに対応づけた 2 段階ブートストラップです。
+- 常に一緒に変わった改善はまとめて測り、入れ替えた改善は「A instead of B」（B の代わりに A）として測ります。行から分けられないものには数値を出しません。
+- 内訳（`--sub`、`--base`）は、ある提出のスコアが別の提出から改善 1 つずつどう積み上がるかを示します。
+- ローカル実行では、同じ改善の実行が複数あれば実行ごとのばらつきも測り、区間に含めます。
+- スコアの向きと、分かっている LB のブレは、チームで一度 `.pseudorca/config.toml` に書いておけます。
+
+  ```toml
+  [effects]
+  lower_is_better = true   # 誤差のように低いほど良い指標のとき
+  noise = 0.012            # LB のブレの SD が分かっていれば
+  ```
+
 ## コマンド
 
 | コマンド | 内容 |
@@ -319,16 +406,17 @@ LLM に聞く範囲と費用については次のとおりです。
 | `init` | 今のリポジトリに `.pseudorca/` を作る（途中まであるなら補う） |
 | `idea add / update / list / show` | 改善の登録と表示 |
 | `nb add / update / list / show / tree` | ノートブックと、反映チェックが読む中身 |
-| `audit [NB]` | ノートブックに各改善が入っているかを判定する |
+| `audit [NB]`、`audit --submitted` | ノートブック（または提出のあるすべてのノートブック）に各改善が入っているかを判定する |
 | `check FILE_OR_NB` | 判定したうえで、期待の改善が抜けているか、rejected の改善が入っていれば失敗する |
 | `verdict NB IDEA STATUS` | 人の判定を記録する |
 | `status` | 改善 × ノートブックの表 |
 | `sub add / list / link`、`kaggle sync`、`kaggle pull` | 提出と Kaggle カーネル（読み取りのみ） |
 | `run add / list / show`、`compare`、`lb` | 結果とノイズ |
+| `effects` | 各提出にどの改善が入っているかと、各改善がスコアにどれだけ効いたか |
 | `report` | 1 ファイルの HTML レポート |
 | `log` | 最近の変更と、誰が変更したか |
 
-`audit`・`check`・`status`・`log`・`lb` と各 `list` コマンドは、スクリプト用に `--json` を受け付けます。`status`・`log`・`nb list`・`sub list`・`run list`・`lb`・`report` では、`-n N` で最新 N 件、`-n 0` で全件を表示します。時刻は自分のタイムゾーンで表示されます。
+`audit`・`check`・`status`・`log`・`lb`・`effects` と各 `list` コマンドは、スクリプト用に `--json` を受け付けます。`status`・`log`・`nb list`・`sub list`・`run list`・`lb`・`effects`・`report` では、`-n N` で最新 N 件、`-n 0` で全件を表示します。時刻は自分のタイムゾーンで表示されます。
 
 各コマンドで `--help` が使えます。設計と細かい規則は [DESIGN.md](DESIGN.md)、安全面の考え方は [SECURITY.md](SECURITY.md) にあります。
 

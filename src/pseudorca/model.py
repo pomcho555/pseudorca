@@ -170,6 +170,8 @@ def _score(value: Any) -> float | None:
     """A leaderboard score from event data: a finite number, or None for empty."""
     if value is None or value == "":
         return None
+    if isinstance(value, bool):  # float(True) is 1.0, but a hand-edited true is not a score
+        raise ValueError(f"score {value!r} is not a number")
     score = float(value)
     if score != score or score in (float("inf"), float("-inf")):
         raise ValueError(f"score {value!r} is not a finite number")

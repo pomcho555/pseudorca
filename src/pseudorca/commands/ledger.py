@@ -22,6 +22,7 @@ from pseudorca import util
 from pseudorca.commands._common import (
     LEGEND,
     Ctx,
+    echo,
     fail,
     pass_ctx,
     show_warnings,
@@ -461,14 +462,14 @@ def init_cmd(directory: Path | None, name: str, competition: str) -> None:
             f"{target} is not inside a git repository; create one (git init) so the team can share the ledger"
         )
     if existed:
-        click.echo(f"completed {store.root}, keeping its existing files; added:")
+        echo(f"completed {store.root}, keeping its existing files; added:")
     else:
-        click.echo(f"created {store.root}")
+        echo(f"created {store.root}")
     order = list(_STORE_PARTS)
     created = sorted(store.created, key=lambda p: order.index(p) if p in order else len(order))
     width = max((len(p) for p in created), default=0)
     for path in created:
-        click.echo(f"  {path:<{width}}  {_STORE_PARTS.get(path, '')}".rstrip())
+        echo(f"  {path:<{width}}  {_STORE_PARTS.get(path, '')}".rstrip())
     unused = [opt for opt, value in (("--name", name), ("--competition", competition)) if value]
     if unused and "config.toml" not in store.created:
         warn(
@@ -476,10 +477,10 @@ def init_cmd(directory: Path | None, name: str, competition: str) -> None:
             "config.toml was kept; edit it if needed"
         )
     cd = "" if target == Path.cwd().resolve() else f"cd {shlex.quote(str(target))} && "
-    click.echo("\nnext steps:")
-    click.echo(f'  {cd}git add .pseudorca && git commit -m "Add Pseudorca ledger"')
-    click.echo("  keep the repository private: the ledger will hold your notebooks and results")
-    click.echo('  pseudorca idea add ID --title "..."   then   pseudorca nb add NOTEBOOK.ipynb')
+    echo("\nnext steps:")
+    echo(f'  {cd}git add .pseudorca && git commit -m "Add Pseudorca ledger"')
+    echo("  keep the repository private: the ledger will hold your notebooks and results")
+    echo('  pseudorca idea add ID --title "..."   then   pseudorca nb add NOTEBOOK.ipynb')
 
 
 # ----- idea ----------------------------------------------------------------------------------------
@@ -556,7 +557,7 @@ def idea_add(
         data["patch"] = _save_patch(store, patch_file)
     store.append("idea.add", data)
     idea = store.state().ideas[idea_id]
-    click.echo(f"added idea {idea.id} ({idea.status}, owner {idea.owner or '-'}, checks {_checks(idea)})")
+    echo(f"added idea {idea.id} ({idea.status}, owner {idea.owner or '-'}, checks {_checks(idea)})")
 
 
 @idea_group.command("update")
@@ -653,10 +654,10 @@ def idea_update(
         given = no_patch or any(lists) or any(v is not None for v in scalars)
         _nothing_to_change(label, given, "idea update")
     store.append("idea.update", {"id": idea.id, **changes})
-    click.echo(f"updated {label}: {_fields_text(changes, st)}")
+    echo(f"updated {label}: {_fields_text(changes, st)}")
     audited = sum(1 for _, iid in st.verdicts if iid == idea.id)
     if audited and dataclasses.replace(idea, **changes).rev != idea.rev:
-        click.echo(
+        echo(
             f"note: its checks changed, so the verdicts on {_plural(audited, 'notebook')} are now stale; "
             "audit again to refresh them"
         )
@@ -686,13 +687,13 @@ def idea_list(
         return
     if ideas:
         rows = [[i.id, i.status, i.owner or "-", i.title, _checks(i), _day(i.updated)] for i in ideas]
-        click.echo(util.format_table(["ID", "STATUS", "OWNER", "TITLE", "CHECKS", "UPDATED"], rows))
+        echo(util.format_table(["ID", "STATUS", "OWNER", "TITLE", "CHECKS", "UPDATED"], rows))
     elif not st.ideas:
-        click.echo('no ideas yet: add one with `pseudorca idea add ID --title "..."`')
+        echo('no ideas yet: add one with `pseudorca idea add ID --title "..."`')
     else:
-        click.echo("no ideas match")
+        echo("no ideas match")
     if hidden:
-        click.echo(f"({_plural(hidden, 'parked idea')} hidden; use --all)")
+        echo(f"({_plural(hidden, 'parked idea')} hidden; use --all)")
 
 
 @idea_group.command("show")
@@ -724,7 +725,7 @@ def idea_show(ctx: Ctx, ref: str, as_json: bool) -> None:
             }
         )
         return
-    click.echo(
+    echo(
         _kv(
             [
                 ("idea", idea.id),
@@ -742,18 +743,18 @@ def idea_show(ctx: Ctx, ref: str, as_json: bool) -> None:
             ]
         )
     )
-    click.echo("")
+    echo("")
     shown = cells[-SHOW_LATEST:]
     if not shown:
-        click.echo("no verdicts yet, and no notebook claims it (run `pseudorca audit`)")
+        echo("no verdicts yet, and no notebook claims it (run `pseudorca audit`)")
         return
     if len(cells) > len(shown):
-        click.echo(f"latest {len(shown)} of {len(cells)} notebooks:")
+        echo(f"latest {len(shown)} of {len(cells)} notebooks:")
     rows = [
         [_nb_ref(nb), _verdict_text(eff, claimed), eff.method if eff else "-", _when(eff), _evidence(eff)]
         for nb, eff, claimed in shown
     ]
-    click.echo(util.format_table(["NOTEBOOK", "VERDICT", "METHOD", "WHEN", "EVIDENCE"], rows))
+    echo(util.format_table(["NOTEBOOK", "VERDICT", "METHOD", "WHEN", "EVIDENCE"], rows))
 
 
 # ----- nb ------------------------------------------------------------------------------------------
@@ -834,10 +835,10 @@ def nb_add(
         )
     ref = f"{nb.label} {util.short(nb.id)}"
     if created:
-        click.echo(f"registered {ref}")
+        echo(f"registered {ref}")
         if no_store:  # register_file refuses a file outside the repository: audits could not find it again
             where = f"{nb.path} in the repository"
-            click.echo(f"  bytes not stored: audits read {where} while it keeps this content")
+            echo(f"  bytes not stored: audits read {where} while it keeps this content")
         return
     if name and name.strip() != nb.name:
         warn(
@@ -849,7 +850,7 @@ def nb_add(
     if not no_store and not had_bytes and store.has_blob(nb.id):  # register_file stored or restored them
         missing = old is not None and old["stored"]
         done.append("stored its bytes, which were missing" if missing else "stored its bytes")
-    click.echo(f"already registered as {ref}" + (f"; {'; '.join(done)}" if done else " (no changes)"))
+    echo(f"already registered as {ref}" + (f"; {'; '.join(done)}" if done else " (no changes)"))
 
 
 @nb_group.command("list")
@@ -875,7 +876,7 @@ def nb_list(ctx: Ctx, tag: str | None, count: int, as_json: bool) -> None:
         _echo_json([asdict(nb) for nb in nbs])
         return
     if not nbs:
-        click.echo(
+        echo(
             "no notebooks match"
             if st.notebooks
             else "no notebooks yet: register one with `pseudorca nb add FILE`"
@@ -894,9 +895,9 @@ def nb_list(ctx: Ctx, tag: str | None, count: int, as_json: bool) -> None:
         ]
         for nb in nbs
     ]
-    click.echo(util.format_table(["#", "SHA", "NAME", "TAGS", "PARENT", "APPLIES", "ADDED", "BY"], rows))
+    echo(util.format_table(["#", "SHA", "NAME", "TAGS", "PARENT", "APPLIES", "ADDED", "BY"], rows))
     if total > len(nbs):
-        click.echo(f"({_plural(total - len(nbs), 'older notebook')} not shown)")
+        echo(f"({_plural(total - len(nbs), 'older notebook')} not shown)")
 
 
 @nb_group.command("show")
@@ -933,7 +934,7 @@ def nb_show(ctx: Ctx, ref: str, as_json: bool) -> None:
         )
         return
     parent = f"{_nb_label(st, nb.parent)} {util.short(nb.parent)}" if nb.parent else "-"
-    click.echo(
+    echo(
         _kv(
             [
                 ("notebook", f"{nb.label}  (#{nb.seq})"),
@@ -956,15 +957,15 @@ def nb_show(ctx: Ctx, ref: str, as_json: bool) -> None:
             ]
         )
     )
-    click.echo("")
+    echo("")
     if not rows:
-        click.echo("no verdicts yet, and it claims no ideas (run `pseudorca audit`)")
+        echo("no verdicts yet, and it claims no ideas (run `pseudorca audit`)")
         return
     table = [
         [iid, status, _verdict_text(eff, claimed), eff.method if eff else "-", _evidence(eff)]
         for iid, status, eff, claimed in rows
     ]
-    click.echo(util.format_table(["IDEA", "IDEA STATUS", "VERDICT", "METHOD", "EVIDENCE"], table))
+    echo(util.format_table(["IDEA", "IDEA STATUS", "VERDICT", "METHOD", "EVIDENCE"], table))
 
 
 def _parent_loop(st: State, nb_id: str, parent_id: str) -> bool:
@@ -1046,7 +1047,7 @@ def nb_update(
         given = no_parent or any(lists) or any(v is not None for v in (name, parent, kernel, version, note))
         _nothing_to_change(label, given, "nb update")
     store.append("nb.update", {"id": nb.id, **changes})
-    click.echo(f"updated {label}: {_fields_text(changes, store.state())}")
+    echo(f"updated {label}: {_fields_text(changes, store.state())}")
 
 
 def _excerpt(line: str, needle: str, ignore_case: bool, width: int = 200) -> str:
@@ -1089,11 +1090,11 @@ def nb_tree(ctx: Ctx, ref: str, needle: str | None, glob: str, ignore_case: bool
             fail("--grep needs some text")
         hits = tree.grep(needle, ignore_case=ignore_case, path_glob=glob, max_hits=MAX_GREP_HITS)
         for h in hits:
-            click.echo(f"{h.path}:{h.line}: {_excerpt(h.text, needle, ignore_case)}")
+            echo(f"{h.path}:{h.line}: {_excerpt(h.text, needle, ignore_case)}")
         if len(hits) >= MAX_GREP_HITS:
             warn(f"stopped after {MAX_GREP_HITS} matches; narrow the search with --path")
         if not hits:
-            click.echo(f"no line contains {needle!r}", err=True)
+            echo(f"no line contains {needle!r}", err=True)
         return
     paths = tree.paths(glob)
     if paths:
@@ -1101,9 +1102,9 @@ def nb_tree(ctx: Ctx, ref: str, needle: str | None, glob: str, ignore_case: bool
         for p in paths:
             f = tree.files[p]
             rows.append([p, _size(f.size) + (" (binary)" if f.binary else ""), f.origin])
-        click.echo(util.format_table(["PATH", "SIZE", "ORIGIN"], rows, max_width=80))
+        echo(util.format_table(["PATH", "SIZE", "ORIGIN"], rows, max_width=80))
     else:
-        click.echo(f"no files match {glob!r}" if glob != "*" else "no files")
+        echo(f"no files match {glob!r}" if glob != "*" else "no files")
     for w in tree.warnings:
         warn(w)
 
@@ -1174,29 +1175,29 @@ def status_cmd(
             rows.append({"idea": asdict(idea), "cells": row})
         _echo_json({"notebooks": [asdict(nb) for nb in cols], "rows": rows})
     elif not ideas:
-        click.echo(
+        echo(
             "no ideas match"
             if st.ideas
             else 'no ideas yet: add one with `pseudorca idea add ID --title "..."`'
         )
         if hidden:
-            click.echo(f"({_plural(hidden, 'parked idea')} hidden; use --all)")
+            echo(f"({_plural(hidden, 'parked idea')} hidden; use --all)")
     else:
         heads = ["IDEA", "STATUS", *(f"{i} {util.clip(nb.label, 12)}" for i, nb in enumerate(cols, 1))]
         table = [
             [idea.id, idea.status, *(verdict_symbol(eff, claimed) for eff, claimed in cells)]
             for idea, cells in zip(ideas, grid, strict=True)
         ]
-        click.echo(util.format_table(heads, table))
+        echo(util.format_table(heads, table))
         if hidden:
-            click.echo(f"({_plural(hidden, 'parked idea')} hidden; use --all)")
-        click.echo("")
+            echo(f"({_plural(hidden, 'parked idea')} hidden; use --all)")
+        echo("")
         if cols:
-            click.echo(LEGEND)
+            echo(LEGEND)
             key = [[i, nb.label, util.short(nb.id), _day(nb.added)] for i, nb in enumerate(cols, 1)]
-            click.echo(util.format_table(["#", "NOTEBOOK", "SHA", "ADDED"], key))
+            echo(util.format_table(["#", "NOTEBOOK", "SHA", "ADDED"], key))
         else:
-            click.echo("no notebooks yet: register one with `pseudorca nb add FILE`")
+            echo("no notebooks yet: register one with `pseudorca nb add FILE`")
     show_warnings(store)
 
 
@@ -1270,15 +1271,13 @@ def sub_add(
             "source": "manual",
         }
         store.append("sub.upsert", data)
-        click.echo(
-            f"added submission {sub_id}: {_fields_text(data, store.state(), _SUB_KEYS) or 'no score yet'}"
-        )
+        echo(f"added submission {sub_id}: {_fields_text(data, store.state(), _SUB_KEYS) or 'no score yet'}")
         return
     changes = {k: v for k, v in given.items() if getattr(existing, k) != v}
     if not changes:
         fail(f"nothing to change: submission {sub_id} already has these values")
     store.append("sub.upsert", {"id": sub_id, **changes})
-    click.echo(f"updated submission {sub_id}: {_fields_text(changes, store.state())}")
+    echo(f"updated submission {sub_id}: {_fields_text(changes, store.state())}")
 
 
 @sub_group.command("list")
@@ -1308,7 +1307,7 @@ def sub_list(ctx: Ctx, count: int, nb_ref: str | None, as_json: bool) -> None:
         _echo_json([asdict(s) for s in subs])
         return
     if not subs:
-        click.echo(
+        echo(
             "no submissions match" if st.subs else "no submissions yet (`pseudorca sub add` or `kaggle sync`)"
         )
         return
@@ -1326,9 +1325,9 @@ def sub_list(ctx: Ctx, count: int, nb_ref: str | None, as_json: bool) -> None:
         for s in subs
     ]
     heads = ["ID", "DATE", "NOTEBOOK", "PUBLIC", "PRIVATE", "STATUS", "BY", "DESCRIPTION"]
-    click.echo(util.format_table(heads, rows))
+    echo(util.format_table(heads, rows))
     if total > len(subs):
-        click.echo(f"({_plural(total - len(subs), 'older submission')} not shown)")
+        echo(f"({_plural(total - len(subs), 'older submission')} not shown)")
 
 
 @sub_group.command("link")
@@ -1346,10 +1345,10 @@ def sub_link(ctx: Ctx, sub_id: str, nb_ref: str) -> None:
         nb = st.resolve_nb(nb_ref)
     ref = f"{nb.label} {util.short(nb.id)}"
     if sub.nb == nb.id:
-        click.echo(f"submission {sub_id} is already linked to {ref}")
+        echo(f"submission {sub_id} is already linked to {ref}")
         return
     store.append("sub.upsert", {"id": sub_id, "nb": nb.id})
-    click.echo(f"linked submission {sub_id} to {ref}")
+    echo(f"linked submission {sub_id} to {ref}")
 
 
 # ----- log -----------------------------------------------------------------------------------------
@@ -1391,7 +1390,7 @@ def log_cmd(ctx: Ctx, count: int, event_type: str | None, actor: str | None, as_
         _echo_json([{**e.to_json(), "summary": _event_summary(e, st)} for e in events])
         return
     if not events:
-        click.echo("no events")
+        echo("no events")
         return
     rows = [[_minute(e.time), e.actor, e.type, _event_summary(e, st)] for e in events]
-    click.echo(util.format_table(["TIME", "ACTOR", "TYPE", "SUMMARY"], rows, max_width=90))
+    echo(util.format_table(["TIME", "ACTOR", "TYPE", "SUMMARY"], rows, max_width=90))

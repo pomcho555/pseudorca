@@ -421,12 +421,188 @@ the sections and `passed`.
 - **LB noise:** scored submissions are grouped by notebook. The pooled SD comes from groups with at least
   2 scored submissions. Scores that are not finite numbers are skipped.
 
+## Effects (`pseudorca.effects`)
+`effects` answers two questions: which ideas each submission has, and what each idea adds to the score.
+It fits an additive model, `score = baseline + Σ effect(idea in it) + noise`, by least squares.
+
+- **Rows:**
+  - **Leaderboard:** every submission, oldest first (date as an instant, then numeric id). A submission
+    is used when it has a finite score (public, or private with `--private`) and its notebook is
+    registered. With submissions from several competitions, `--competition` must choose one; a
+    competition no submission has is an error.
+  - **Local runs:** the runs of one protocol; each protocol is fitted separately (`--protocol` keeps
+    one). A run is used when its notebook is registered and its table has finite values of the metric.
+    A results table recorded more than once counts once, through its first run that can be used, so a
+    table added again with `--nb` after a first copy without one is used. A run's value is its mean,
+    over the items every used run has, of each item's mean over draws.
+- **Which ideas a row has:** the effective verdict on its notebook. `present` is 1 and `absent` is 0.
+  `partial`, `unknown`, `conflict` and no verdict count as missing. Stale verdicts are used, and a note
+  counts them once per notebook and idea; stale human verdicts need a new `verdict`, not an audit.
+- **Which ideas are modelled:**
+  - Parked ideas are left out, as on the board, unless `--all` is given.
+  - By default, the ideas with a present/absent verdict on every usable row.
+  - An idea with gaps is left out (`excluded`), with the rows that lack a verdict and how to fill them:
+    an audit for a missing verdict, `pseudorca verdict` for an inconclusive one (partial, unknown,
+    conflict: another audit would say the same). When it varies among the other rows, a note says that
+    leaving it out may bias the others.
+  - With `--idea`, exactly those ideas are modelled (a parked one too). Rows without a present/absent
+    verdict for one of them are not used, and the reason is shown. Notes name the other ideas that vary among the rows:
+    one that always comes and goes with a chosen idea is counted as that idea's effect, and others go
+    into the residuals.
+- **The design:**
+  - An idea in every used row (`always`) or in none (`never`) cannot be measured, and is listed as
+    such.
+  - Ideas with identical columns, that is, always in or out together, form one bundle with one effect.
+  - The model is `X = [1 | bundle columns]`. It is solved through a QR decomposition and the SVD of
+    `R`, and residuals are taken through an orthonormal basis of X's columns, so no `n × n` matrix is
+    ever built. A contrast `c` is estimable when it is orthogonal to the
+    null space of `X`. Its estimate is then `c·b̂ = w·y` with `w = (X⁺)ᵀc`, the same for every
+    least-squares solution.
+  - Contrasts between bundles never involve the intercept, so what they cannot see is the bundle part
+    of the null space, made orthonormal (`P`). A bundle that is not estimable is grouped with the
+    bundles in the support of `P·e_j`. Through the intercept, two unrelated choices (one idea of a set
+    in every row) would look mixed; leaving it out keeps them apart, and `P` is block-diagonal over the
+    groups.
+  - Within a group, differences between two bundles are reported when they are estimable. Two bundles
+    never used in the same row are a swap, "A instead of B", with the newer choice first: the one in the
+    latest row that has one of them but not the other. Two that are also used together are "A vs B",
+    the one that first appeared later first. Pairs are tried with the latest choices first, so that a
+    choice among several is set against each alternative, and picked greedily, so that none is a
+    combination of the others. Bundles that no difference covers are `tangled`, and their note names
+    the bundles of their group. Nothing that is not estimable is ever given a number.
+  - An estimate or bound within rounding of 0 (`1000·ε·Σ|wᵢyᵢ|`) is 0, and a residual sum of squares
+    within the rows' rounding is 0, so an idea with no effect is never `helps` by rounding.
+- **Leaderboard intervals:**
+  - The noise is the residual SD, `sqrt(RSS / (n − rank))` with `n − rank` degrees of freedom, and the
+    interval uses Student's t. Resubmissions are rows with the same columns, so they supply degrees of
+    freedom.
+  - `--noise SD` (or `[effects] noise` in `config.toml`) uses a known SD and the normal distribution.
+  - With `n = rank` and no known noise, there is no noise estimate. Effects are shown without intervals,
+    and their verdict is `unknown`. The same holds when the residuals are exactly 0 (resubmissions that
+    repeat their scores, and a model that fits every submission): that says nothing about the noise
+    between notebooks, so a note asks for a known noise SD instead of printing zero-width intervals.
+  - The pooled resubmission SD (as in `lb`) is shown for comparison.
+  - **Lack of fit:** when resubmissions give pure-error degrees of freedom and other rows give more, an
+    F test compares the residuals beyond the resubmissions with the resubmissions' own spread:
+    `F = (SS_lof / df_lof) / (SS_pure / df_pure)`, whatever the source of the noise used for the
+    intervals. When its p-value is below 1 − confidence, a note suggests interactions, an untracked
+    change, or ideas left out by `--idea`.
+- **Local intervals:** a two-stage bootstrap. Items are resampled with replacement, the same items for
+  every run so that the runs stay paired; then draws are resampled within each item and run. Each
+  resample gives run means `y*`, and the estimate's distribution is `w·y*`. The interval is the
+  percentile interval, and the SE is the SD of the resampled estimates. The bootstrap is seeded and
+  drawn as in `compare`, so with two runs (given in the order they were recorded) the interval is
+  exactly `compare`'s. With fewer items than `min_items(confidence)`, the verdict is `too few items`.
+  - **Run-to-run noise:** the item/draw bootstrap knows nothing of noise shared by a whole run (another
+    machine, a cache, a nondeterministic server). Runs with the same modelled ideas reveal it: their
+    spread around their own mean, `SS_rep` with `df_rep` degrees of freedom. Its expectation without run
+    noise comes from resampling the items alone, each item keeping its mean over draws (resampling the
+    draws as well would count their noise twice). The part beyond it, per degree of freedom, is the
+    run-to-run variance `τ²`. As `τ` is estimated from `df_rep` degrees of freedom, `N(0, (k·τ)²)` per run
+    is added to every resample of the intervals, with `k = t(1 − α/2, df_rep) / z(1 − α/2)`. When
+    `SS_rep` is beyond the resampled ones (p below 1 − confidence), a note says so. In simulations the
+    95% intervals then cover about 95% of the time with 2 or more degrees of freedom, and about 90% with
+    one. With no two runs sharing their ideas, `τ` cannot be measured, the intervals assume it is 0, and
+    the output says so.
+  - **Lack of fit:** the rest of the residuals (`df − df_rep` degrees of freedom) is how far runs with
+    different ideas stray from the additive model. It is tested against the same item resamples plus the
+    run noise, and a p-value below 1 − confidence adds a note: ideas may interact, or a change no idea
+    describes matters (or, without repeated runs, runs have noise of their own).
+- **Verdicts:** `helps` or `hurts` when the interval excludes 0 (by `--lower-is-better`), `within noise`
+  otherwise, and `unknown` without an interval. On local runs a winner also needs the sign-flip
+  p-value of the per-item contrasts (`means_i · w`) below 1 − confidence, as in `compare`; otherwise
+  the verdict is `within noise` and the note says why. Measured lines are sorted by effect, best first.
+- **MDE80:** the effect the test finds 80% of the time: `(t(1 − α/2, df) + t(0.8, df))·SE` with
+  Student's t intervals, and `(z(1 − α/2) + z(0.8))·SE` with a known noise or the bootstrap. It is an
+  approximation (the exact one inverts the noncentral t).
+- **Breakdown (`--sub`, `--base`):**
+  - It starts at the base's fitted score and ends at the target's.
+  - There is one step for each bundle that differs whose contrast is estimable: `+` added, `−`
+    removed, with a bundle in parentheses, `+ (a + b)`. The rest is one step per group of bundles that
+    mix with each other. Each such step is estimable: the difference of two rows always is, so `P·d = 0`,
+    and as `P` is block-diagonal over the groups, each group's part is 0 too.
+  - The steps add up exactly to the difference of the fitted scores. The observed scores are shown
+    beside the fitted ones.
+  - Ideas outside the model whose verdicts differ between the two, or are unknown on one of them, are
+    listed: the breakdown cannot account for them.
+  - By default it goes from the first used submission to the best one.
+- **Changes:** a row's changes are the ideas that came in or left since the latest earlier row with a
+  present/absent verdict for them, so a row without verdicts in between hides nothing.
+- **Configuration:** `config.toml` may hold the competition's direction and a known noise, read by
+  `effects` and `report`. Flags override them; a key a flag overrides is not read, so a bad value there
+  does not stop the command (the report shows a bad value as a note):
+
+  ```toml
+  [effects]
+  lower_is_better = false   # true when a lower score is better
+  noise = 0.012             # a known LB noise SD (default: from the residuals)
+  ```
+- **Assumptions:**
+  - Effects add up; ideas do not interact.
+  - Notebooks with the same ideas score alike. On the leaderboard, a change that no idea describes goes
+    into the residuals; on local runs, into `τ` when runs with the same ideas show it.
+  - The noise is independent between submissions.
+  - At 95%, about one measured line in twenty excludes 0 by chance, when the noise is measured: local
+    runs without repeats cannot show run-to-run noise, and their intervals leave it out.
+- **Terminal output (`commands/effects.py`):**
+  - The submissions table lists the latest `-n` rows (also in `--json`, where each fit has a `total`);
+    the model always uses all of them. CHANGES reads `not used: …; resubmits 103; +new −old`.
+  - Notebooks that would show the same label get their short sha. IDEA labels longer than 40 columns
+    get a `[k]` marker and are printed in full under the table; NOTE and CHANGES are never cut.
+  - The interval sketch puts 0 at `|`, the interval at `[…]` and the estimate at `*`; rounding to
+    columns never moves an interval across 0.
+  - The breakdown's numbers are running totals rounded once, so the printed column adds up exactly
+    (the report rounds them the same way). Its target is called the best "in the model": submissions
+    the model does not use may have scored higher.
+    With no modelled idea that differs it says `(no modelled idea differs)`; ideas outside the model
+    that differ, or may, are listed. Without any idea in the model there is no default breakdown.
+  - A protocol with nothing to compare lists its runs grouped by why they are not used.
+  - The local runs' noise lines say whether a run-to-run SD was measured and used.
+  - When the bootstrap would draw more than 3e8 values, a line on stderr names `--resamples` and
+    `--no-runs` first.
+  - Parked ideas with verdicts on the shown notebooks are counted in a `--all` hint.
+- **`audit --submitted`** audits every registered notebook that a submission links to, so that
+  `effects` has verdicts for all of them.
+  - Notebooks come in the order of their oldest submission (`effects.sub_order`), each once, with the
+    same `--idea`, `--status`, LLM options, `--force` and `--dry-run` as a single audit. The LLM
+    endpoint and its remote guard are set up once.
+  - Skipped with one warning each, and listed under `skipped` in `--json` by reason: `no_notebook` (a
+    submission without one: `sub link`), `not_registered` (`nb add`, `kaggle pull` or `sub link`),
+    `not_stored` (no bytes in this store and nothing to stand in for them) and `unreadable` (a blob that
+    fails its sha256 check, such as a Git LFS pointer, or bytes that are not a notebook). Readability
+    follows `extract.tree_for`, so a fresh cached tree stands in for missing or damaged bytes. Bad
+    bytes are found before the run; a notebook the extractor cannot read during it is skipped too, and
+    the run goes on. Any other error stops the run and names the notebook; verdicts recorded before it
+    stay.
+  - Text output is one line per notebook and a total, each ending with `; N LLM errors` when the LLM
+    failed. Each distinct LLM error is warned about once with the number of notebooks it hit (the five
+    most frequent; the rest are counted, and `--json` has each one). `--json` gives `{"dry_run",
+    "notebooks": [the object of `audit NB --json`], "skipped", "totals"}`, counting audited notebooks
+    only.
+- **Report:** `report` shows the same model as a submissions × ideas matrix (outlined cells changed
+  since the latest earlier verdict), a leaderboard chart with the fitted scores and a noise band, forest
+  plots of the effects (the leaderboard, then each protocol), and the breakdown, as inline SVG without
+  scripts.
+  - It fits public scores with `effects`' defaults, the direction and noise from `[effects]`, and
+    `--metric`, `--resamples` (10,000 by default, as in `effects`) and `--all` for the runs and ideas.
+    With submissions from several competitions it shows the store's competition, else a note.
+  - A bad `[effects]` value, or a part that cannot be computed or drawn (overflow, recursion, a missing
+    blob), becomes a note; the rest of the report is still written.
+  - Notes point to `pseudorca effects` options or `config.toml`, never to flags `report` lacks.
+
 ## Display conventions
 - Times are shown in the viewer's time zone. A bare date stays as written. Times are compared as instants,
   never as strings.
 - `-n N` means the latest N, and `-n 0` means all.
 - `--json` keeps the stored ISO times.
 - `log --json` prints events as stored, plus a one-line summary.
+- Strings from the ledger, and lines of notebooks, are printed through `util.clean` (`_common.echo`,
+  `warn`, `format_table`, and the one-line errors): control characters (all but tab) and bidirectional
+  overrides become `?`. JSON output is left as it is. The ledger comes through git and may be hand-edited, and such
+  characters could otherwise move the cursor, recolour, retitle or rewrite the terminal.
+- Numbers: scores to 6 significant digits; effects and intervals with decimals from the interval widths
+  (about two significant digits), plus more when a bound that excludes 0 would print as 0; magnitudes
+  of 1e6 and more in compact form (`2.5e+30`). Negative numbers use a Unicode minus.
 
 ## Module map
 
@@ -439,7 +615,8 @@ the sections and `passed`.
 | `llm/` | LLM judge, backends, redaction |
 | `kaggle_api.py`, `commands/kaggle_cmd.py` | `kaggle sync`, `kaggle pull` |
 | `results.py`, `stats.py`, `commands/results.py` | `run`, `compare`, `lb` |
-| `report.py`, `commands/report.py` | `report` (single-file HTML, no external resources) |
+| `effects.py`, `commands/effects.py` | `effects` (the report's effects section uses `effects.py`) |
+| `report.py`, `charts.py`, `commands/report.py` | `report` (single-file HTML, no external resources; inline SVG charts) |
 
 Heavy imports (`numpy`, `openai`, `anthropic`, `kaggle`) happen inside the functions that need them.
 
